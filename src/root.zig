@@ -27,6 +27,8 @@ pub const PayloadLayout = core.payload.PayloadLayout;
 pub const LoadedPayload = core.payload.LoadedPayload;
 pub const clearLastLinkDiagnostic = core.payload.clearLastLinkDiagnostic;
 pub const lastLinkDiagnosticMessage = core.payload.lastLinkDiagnosticMessage;
+pub const clearLastRewriteDiagnostic = core.rewriter.clearLastRewriteDiagnostic;
+pub const lastRewriteDiagnosticMessage = core.rewriter.lastRewriteDiagnosticMessage;
 
 pub const Rewriter = core.rewriter.Rewriter;
 pub const InstrumentHookSpec = core.rewriter.InstrumentHookSpec;

@@ -2,6 +2,8 @@ const std = @import("std");
 const bundle = @import("../core/bundle.zig");
 const apply = @import("../core/apply.zig");
 const payload = @import("../core/payload/root.zig");
+const pattern_locator = @import("../core/pattern_locator.zig");
+const rewriter = @import("../core/rewriter.zig");
 const ElfView = @import("../format/elf/root.zig").View;
 
 pub fn main() !void {
@@ -14,6 +16,9 @@ pub fn main() !void {
 
     dispatchCommand(allocator, args) catch |err| {
         if (payload.lastLinkDiagnosticMessage()) |message| {
+            std.log.err("{s}", .{message});
+        }
+        if (rewriter.lastRewriteDiagnosticMessage()) |message| {
             std.log.err("{s}", .{message});
         }
         return err;
@@ -70,6 +75,9 @@ fn commandBundle(allocator: std.mem.Allocator, args: []const []const u8) !void {
         } else if (std.mem.eql(u8, flag, "--log-message")) {
             index += 1;
             pending_hook.log_message = args[index];
+        } else if (std.mem.eql(u8, flag, "--expected-bytes")) {
+            index += 1;
+            pending_hook.expected_bytes = args[index];
         } else if (std.mem.eql(u8, flag, "--stolen-instructions")) {
             index += 1;
             pending_hook.stolen_instruction_count = try parseStolenInstructionCount(args[index]);
@@ -85,6 +93,12 @@ fn commandBundle(allocator: std.mem.Allocator, args: []const []const u8) !void {
         } else if (std.mem.eql(u8, flag, "--target-file-offset")) {
             index += 1;
             try pending_hook.locator.setFileOffset(try parseInteger(args[index]));
+        } else if (std.mem.eql(u8, flag, "--target-pattern")) {
+            index += 1;
+            try pending_hook.locator.setPattern(args[index]);
+        } else if (std.mem.eql(u8, flag, "--target-pattern-offset")) {
+            index += 1;
+            try pending_hook.locator.setPatternOffset(try parseInteger(args[index]));
         } else if (std.mem.eql(u8, flag, "--next-hook")) {
             try pending_hook.appendTo(allocator, &hooks);
         } else if (std.mem.eql(u8, flag, "--target-os")) {
@@ -203,6 +217,9 @@ fn commandRewriteShortcut(allocator: std.mem.Allocator, args: []const []const u8
         } else if (std.mem.eql(u8, flag, "--log-message")) {
             index += 1;
             pending_hook.log_message = args[index];
+        } else if (std.mem.eql(u8, flag, "--expected-bytes")) {
+            index += 1;
+            pending_hook.expected_bytes = args[index];
         } else if (std.mem.eql(u8, flag, "--stolen-instructions")) {
             index += 1;
             pending_hook.stolen_instruction_count = try parseStolenInstructionCount(args[index]);
@@ -218,6 +235,12 @@ fn commandRewriteShortcut(allocator: std.mem.Allocator, args: []const []const u8
         } else if (std.mem.eql(u8, flag, "--target-file-offset")) {
             index += 1;
             try pending_hook.locator.setFileOffset(try parseInteger(args[index]));
+        } else if (std.mem.eql(u8, flag, "--target-pattern")) {
+            index += 1;
+            try pending_hook.locator.setPattern(args[index]);
+        } else if (std.mem.eql(u8, flag, "--target-pattern-offset")) {
+            index += 1;
+            try pending_hook.locator.setPatternOffset(try parseInteger(args[index]));
         } else if (std.mem.eql(u8, flag, "--next-hook")) {
             try pending_hook.appendTo(allocator, &hooks);
         } else {
@@ -273,7 +296,8 @@ fn commandRewriteShortcut(allocator: std.mem.Allocator, args: []const []const u8
 
 fn commandInspect(allocator: std.mem.Allocator, args: []const []const u8) !void {
     var input_path: ?[]const u8 = null;
-    var symbol_name: ?[]const u8 = null;
+    var locator: ParsedLocator = .{};
+    var pattern_bytes: usize = 16;
 
     var index: usize = 0;
     while (index < args.len) : (index += 1) {
@@ -283,7 +307,22 @@ fn commandInspect(allocator: std.mem.Allocator, args: []const []const u8) !void 
             input_path = args[index];
         } else if (std.mem.eql(u8, flag, "--symbol")) {
             index += 1;
-            symbol_name = args[index];
+            try locator.setSymbol(args[index]);
+        } else if (std.mem.eql(u8, flag, "--vaddr")) {
+            index += 1;
+            try locator.setVirtualAddress(try parseInteger(args[index]));
+        } else if (std.mem.eql(u8, flag, "--file-offset")) {
+            index += 1;
+            try locator.setFileOffset(try parseInteger(args[index]));
+        } else if (std.mem.eql(u8, flag, "--pattern")) {
+            index += 1;
+            try locator.setPattern(args[index]);
+        } else if (std.mem.eql(u8, flag, "--pattern-offset")) {
+            index += 1;
+            try locator.setPatternOffset(try parseInteger(args[index]));
+        } else if (std.mem.eql(u8, flag, "--pattern-bytes")) {
+            index += 1;
+            pattern_bytes = @intCast(try parseInteger(args[index]));
         } else {
             return error.InvalidArgument;
         }
@@ -293,14 +332,103 @@ fn commandInspect(allocator: std.mem.Allocator, args: []const []const u8) !void 
     defer allocator.free(bytes);
 
     const view = try ElfView.parse(bytes);
-    const address = try view.resolveSymbolAddress(symbol_name orelse return error.MissingTargetSymbol);
-    const file_offset = try view.addressToOffset(address);
+    const resolved = try resolveInspectLocation(allocator, view, try locator.toHookLocator());
 
-    std.debug.print("symbol={s}\nvirtual_address=0x{x}\nfile_offset=0x{x}\n", .{
-        symbol_name.?,
-        address,
-        file_offset,
+    const exact_len = @min(pattern_bytes, bytes.len - resolved.file_offset);
+    const expected_len = @min(@as(usize, 4), exact_len);
+    const exact_pattern_hex = try hexStringAlloc(allocator, bytes[resolved.file_offset .. resolved.file_offset + exact_len]);
+    defer allocator.free(exact_pattern_hex);
+    const expected_hex = try hexStringAlloc(allocator, bytes[resolved.file_offset .. resolved.file_offset + expected_len]);
+    defer allocator.free(expected_hex);
+
+    const exact_pattern = try pattern_locator.parseHexPattern(allocator, exact_pattern_hex);
+    defer allocator.free(exact_pattern);
+    const exact_matches = try pattern_locator.findMatchesInExecutableSegments(allocator, view, exact_pattern, 2);
+    defer allocator.free(exact_matches);
+
+    std.debug.print("virtual_address=0x{x}\nfile_offset=0x{x}\n", .{
+        resolved.address,
+        resolved.file_offset,
     });
+    if (resolved.symbol_name) |symbol_name| {
+        std.debug.print("symbol={s}\n", .{symbol_name});
+    }
+    std.debug.print(
+        "expected_bytes={s}\npattern_exact={s}\npattern_exact_match_count={s}\n",
+        .{
+            expected_hex,
+            exact_pattern_hex,
+            if (exact_matches.len >= 2) ">=2" else "1",
+        },
+    );
+    std.debug.print(
+        \\meta_target_pattern={{"kind":"pattern","pattern":"{s}","pattern_offset":"0x0"}}
+        \\meta_hook_snippet={{
+        \\  "kind":"instrument",
+        \\  "target":{{"kind":"pattern","pattern":"{s}","pattern_offset":"0x0"}},
+        \\  "expected_bytes":"{s}",
+        \\  "handler_symbol":"<fill-me>"
+        \\}}
+        \\
+    ,
+        .{ exact_pattern_hex, exact_pattern_hex, expected_hex },
+    );
+}
+
+const InspectLocation = struct {
+    address: u64,
+    file_offset: usize,
+    symbol_name: ?[]const u8 = null,
+};
+
+fn resolveInspectLocation(
+    allocator: std.mem.Allocator,
+    view: ElfView,
+    locator: bundle.HookLocator,
+) !InspectLocation {
+    return switch (locator.kind) {
+        .symbol => .{
+            .address = try view.resolveSymbolAddress(locator.symbol),
+            .file_offset = try view.addressToOffset(try view.resolveSymbolAddress(locator.symbol)),
+            .symbol_name = locator.symbol,
+        },
+        .virtual_address => .{
+            .address = locator.virtual_address,
+            .file_offset = try view.addressToOffset(locator.virtual_address),
+        },
+        .file_offset => .{
+            .address = try view.offsetToAddress(locator.file_offset),
+            .file_offset = @intCast(locator.file_offset),
+        },
+        .pattern => blk: {
+            const parsed_pattern = try pattern_locator.parseHexPattern(allocator, locator.pattern);
+            defer allocator.free(parsed_pattern);
+
+            if (locator.pattern_offset >= parsed_pattern.len) return error.InvalidPatternOffset;
+            const matches = try pattern_locator.findMatchesInExecutableSegments(allocator, view, parsed_pattern, 2);
+            defer allocator.free(matches);
+
+            if (matches.len == 0) return error.PatternNotFound;
+            if (matches.len > 1) return error.PatternNotUnique;
+
+            break :blk .{
+                .address = matches[0].address + locator.pattern_offset,
+                .file_offset = matches[0].file_offset + @as(usize, @intCast(locator.pattern_offset)),
+            };
+        },
+    };
+}
+
+fn hexStringAlloc(allocator: std.mem.Allocator, bytes: []const u8) ![]u8 {
+    const digits = "0123456789abcdef";
+    const out = try allocator.alloc(u8, bytes.len * 2);
+    errdefer allocator.free(out);
+
+    for (bytes, 0..) |byte, index| {
+        out[index * 2] = digits[byte >> 4];
+        out[index * 2 + 1] = digits[byte & 0xF];
+    }
+    return out;
 }
 
 fn parseArchitecture(value: []const u8) !bundle.Architecture {
@@ -368,8 +496,31 @@ const ParsedLocator = struct {
         self.locator = bundle.HookLocator.fromFileOffset(value);
     }
 
+    fn setPattern(self: *ParsedLocator, value: []const u8) !void {
+        if (self.seen and self.locator.kind != .pattern) return error.MultipleTargetLocators;
+        self.seen = true;
+        if (self.locator.kind != .pattern) {
+            self.locator = bundle.HookLocator.fromPattern(value, 0);
+        } else {
+            self.locator.pattern = value;
+        }
+    }
+
+    fn setPatternOffset(self: *ParsedLocator, value: u64) !void {
+        if (self.seen and self.locator.kind != .pattern) return error.MultipleTargetLocators;
+        self.seen = true;
+        if (self.locator.kind != .pattern) {
+            self.locator = bundle.HookLocator.fromPattern("", value);
+        } else {
+            self.locator.pattern_offset = value;
+        }
+    }
+
     fn toHookLocator(self: ParsedLocator) !bundle.HookLocator {
         if (!self.seen) return error.MissingTargetLocator;
+        if (self.locator.kind == .pattern and self.locator.pattern.len == 0) {
+            return error.MissingTargetLocator;
+        }
         return self.locator;
     }
 };
@@ -379,11 +530,13 @@ const PendingHook = struct {
     locator: ParsedLocator = .{},
     handler_symbol: ?[]const u8 = null,
     log_message: []const u8 = "",
+    expected_bytes: []const u8 = "",
     stolen_instruction_count: u8 = 1,
 
     fn hasAnyField(self: PendingHook) bool {
         return self.handler_symbol != null or
             self.log_message.len != 0 or
+            self.expected_bytes.len != 0 or
             self.locator.seen or
             self.kind != .instrument or
             self.stolen_instruction_count != 1;
@@ -401,6 +554,7 @@ const PendingHook = struct {
             .target = try self.locator.toHookLocator(),
             .handler_symbol = self.handler_symbol orelse return error.MissingHandlerSymbol,
             .log_message = self.log_message,
+            .expected_bytes = self.expected_bytes,
             .stolen_instruction_count = self.stolen_instruction_count,
         });
         self.* = .{};
@@ -440,10 +594,14 @@ fn printUsage() void {
         \\                 [--meta <bundle.meta.json>]
         \\                 [--hook-kind instrument|replace]
         \\                 [--stolen-instructions <count>]
-        \\                 (--target-symbol <symbol> | --target-vaddr <addr> | --target-file-offset <off>)
+        \\                 [--expected-bytes <hex>]
+        \\                 (--target-symbol <symbol> | --target-vaddr <addr> | --target-file-offset <off> |
+        \\                  --target-pattern <hex> [--target-pattern-offset <off>])
         \\                 [--next-hook --handler-symbol <symbol> [--hook-kind instrument|replace]
         \\                             [--stolen-instructions <count>]
-        \\                             (--target-symbol <symbol> | --target-vaddr <addr> | --target-file-offset <off>)
+        \\                             [--expected-bytes <hex>]
+        \\                             (--target-symbol <symbol> | --target-vaddr <addr> | --target-file-offset <off> |
+        \\                              --target-pattern <hex> [--target-pattern-offset <off>])
         \\                             [--log-message <message>]]
         \\                 [--log-message <message>] [--target-arch aarch64|x86_64]
         \\                 [--target-os linux|macos] [--target-format elf|macho]
@@ -454,13 +612,20 @@ fn printUsage() void {
         \\                  --handler-symbol <symbol>
         \\                  [--hook-kind instrument|replace]
         \\                  [--stolen-instructions <count>]
-        \\                  (--target-symbol <symbol> | --target-vaddr <addr> | --target-file-offset <off>)
+        \\                  [--expected-bytes <hex>]
+        \\                  (--target-symbol <symbol> | --target-vaddr <addr> | --target-file-offset <off> |
+        \\                   --target-pattern <hex> [--target-pattern-offset <off>])
         \\                  [--next-hook --handler-symbol <symbol> [--hook-kind instrument|replace]
         \\                              [--stolen-instructions <count>]
-        \\                              (--target-symbol <symbol> | --target-vaddr <addr> | --target-file-offset <off>)
+        \\                              [--expected-bytes <hex>]
+        \\                              (--target-symbol <symbol> | --target-vaddr <addr> | --target-file-offset <off> |
+        \\                               --target-pattern <hex> [--target-pattern-offset <off>])
         \\                              [--log-message <message>]]
         \\                  [--log-message <message>]
-        \\  zrwrite inspect --input <binary> --symbol <symbol>
+        \\  zrwrite inspect --input <binary>
+        \\                  (--symbol <symbol> | --vaddr <addr> | --file-offset <off> |
+        \\                   --pattern <hex> [--pattern-offset <off>])
+        \\                  [--pattern-bytes <count>]
         \\
     , .{});
 }

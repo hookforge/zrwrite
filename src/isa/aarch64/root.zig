@@ -7,7 +7,9 @@ const replay = @import("replay_plan.zig");
 
 pub const original_trampoline_size: usize = 20;
 pub const nop_instruction: u32 = 0xD503_201F;
-pub const max_stolen_instruction_count: usize = 4;
+pub const bti_c_instruction: u32 = 0xD503_245F;
+pub const bti_jc_instruction: u32 = 0xD503_24DF;
+pub const max_stolen_instruction_count: usize = replay.max_window_instruction_count;
 pub const long_detour_size: usize = 16;
 /// Legacy export name retained for compatibility with older callers/tests.
 pub const absolute_detour_size: usize = long_detour_size;
@@ -18,8 +20,12 @@ pub const ldr_x16_literal_8: u32 = ldr_x17_literal_8;
 /// Legacy export name retained for compatibility with older callers/tests.
 pub const br_x16: u32 = br_x17;
 pub const ReplayPlan = replay.ReplayPlan;
+pub const WindowPlan = replay.WindowPlan;
+pub const WindowStep = replay.WindowStep;
 pub const planReplay = replay.planReplay;
+pub const planWindow = replay.planWindow;
 pub const applyReplay = replay.applyReplay;
+pub const replayPlanName = replay.replayPlanName;
 
 /// Per-hook parameters used when synthesizing the injected AArch64 instrument
 /// bridge.
@@ -49,7 +55,18 @@ pub const InstrumentStubOptions = struct {
     callback_address: u64,
     trampoline_address: u64,
     stub_address: u64,
+    /// Legacy single-instruction replay descriptor retained so older callers
+    /// do not need to understand widened windows yet.
     replay_plan: ReplayPlan,
+    /// Optional widened replay description.
+    ///
+    /// When present, this supersedes `replay_plan` and lets the bridge replay a
+    /// mixed window instead of forcing the old "exactly one displaced
+    /// instruction" model.
+    window_plan: ?WindowPlan = null,
+    /// Emits BTI-compatible landing pads for injected entrypoints when the
+    /// target image advertises Branch Target Identification.
+    enable_bti: bool = false,
     log_message: []const u8,
 };
 
@@ -110,6 +127,35 @@ const DirectResumeBranch = struct {
     epilogue_offset: usize = 0,
     final_branch_offset: usize = 0,
 };
+
+fn effectiveWindowPlan(options: InstrumentStubOptions) WindowPlan {
+    if (options.window_plan) |window_plan| return window_plan;
+
+    var window_plan = WindowPlan{};
+    window_plan.count = 1;
+    window_plan.steps[0] = switch (options.replay_plan) {
+        .trampoline => .{ .raw = .{
+            .address = options.site_address,
+            .opcode = 0,
+        } },
+        else => .{ .semantic = options.replay_plan },
+    };
+    return window_plan;
+}
+
+fn windowNeedsRawTrampoline(window_plan: WindowPlan) bool {
+    for (window_plan.steps[0..window_plan.count]) |window_step| {
+        switch (window_step) {
+            .raw => return true,
+            .semantic => {},
+        }
+    }
+    return false;
+}
+
+fn trampolineEntryPrefixSize(enable_bti: bool) usize {
+    return if (enable_bti) @sizeOf(u32) else 0;
+}
 
 const InstrumentStubBuilder = struct {
     allocator: std.mem.Allocator,
@@ -251,6 +297,31 @@ pub fn buildOriginalTrampoline(
     return buffer;
 }
 
+pub fn buildOriginalTrampolineBytes(
+    allocator: std.mem.Allocator,
+    original_instruction: [4]u8,
+    trampoline_address: u64,
+    resume_pc: u64,
+    enable_bti: bool,
+) ![]u8 {
+    const prefix_size = trampolineEntryPrefixSize(enable_bti);
+    const total_size = prefix_size + original_trampoline_size;
+
+    var buffer = try allocator.alloc(u8, total_size);
+    errdefer allocator.free(buffer);
+
+    if (enable_bti) {
+        writeU32(buffer[0..4], bti_jc_instruction);
+    }
+    @memcpy(buffer[prefix_size .. prefix_size + 4], &original_instruction);
+    try writeResumeDetour(
+        buffer[prefix_size + 4 .. prefix_size + 20],
+        trampoline_address + prefix_size + 4,
+        resume_pc,
+    );
+    return buffer;
+}
+
 /// Builds a variable-sized raw trampoline for a widened straight-line patch
 /// window.
 ///
@@ -262,17 +333,22 @@ pub fn buildRawTrampoline(
     stolen_bytes: []const u8,
     trampoline_address: u64,
     resume_pc: u64,
+    enable_bti: bool,
 ) ![]u8 {
     if ((stolen_bytes.len & 0x3) != 0) return error.InvalidStolenInstructionBytes;
 
-    const total_size = stolen_bytes.len + long_detour_size;
+    const prefix_size = trampolineEntryPrefixSize(enable_bti);
+    const total_size = prefix_size + stolen_bytes.len + long_detour_size;
     var buffer = try allocator.alloc(u8, total_size);
     errdefer allocator.free(buffer);
 
-    @memcpy(buffer[0..stolen_bytes.len], stolen_bytes);
+    if (enable_bti) {
+        writeU32(buffer[0..4], bti_jc_instruction);
+    }
+    @memcpy(buffer[prefix_size .. prefix_size + stolen_bytes.len], stolen_bytes);
     try writeResumeDetour(
-        buffer[stolen_bytes.len .. stolen_bytes.len + long_detour_size],
-        trampoline_address + stolen_bytes.len,
+        buffer[prefix_size + stolen_bytes.len .. prefix_size + stolen_bytes.len + long_detour_size],
+        trampoline_address + prefix_size + stolen_bytes.len,
         resume_pc,
     );
     return buffer;
@@ -352,7 +428,8 @@ fn writeResumeDetour(
 /// as machine instructions, but the control-flow policy already mirrors the
 /// future runtime helper design.
 pub fn buildInstrumentStub(options: InstrumentStubOptions) ![]u8 {
-    if (options.replay_plan.requiresRawTrampoline() and options.trampoline_address == 0 and options.stub_address != 0) {
+    const window_plan = effectiveWindowPlan(options);
+    if (windowNeedsRawTrampoline(window_plan) and options.trampoline_address == 0 and options.stub_address != 0) {
         return error.MissingTrampolineAddress;
     }
     if (options.log_message.len > std.math.maxInt(u16)) return error.LogMessageTooLarge;
@@ -372,11 +449,12 @@ pub fn buildInstrumentStub(options: InstrumentStubOptions) ![]u8 {
         layout,
         options.site_address,
         runtime_anchor_literal_index,
+        options.enable_bti,
     );
     if (message_literal_index) |literal_index| {
         try emitDebugWrite(&builder, layout, literal_index, options.log_message.len);
     }
-    try emitCallbackInvocation(&builder, layout, options.callback_address);
+    try emitCallbackInvocation(&builder, layout, options.callback_address, options.stub_address);
 
     const skip_replay_branch = try emitReplayBypassGuard(&builder, layout);
     try emitReplaySequence(&builder, layout, options);
@@ -428,6 +506,10 @@ pub fn encodeBranchImmediate(from_address: u64, to_address: u64) !u32 {
     return 0x1400_0000 | (raw & 0x03FF_FFFF);
 }
 
+pub fn encodeBranchWithLinkImmediate(from_address: u64, to_address: u64) !u32 {
+    return 0x9400_0000 | (try encodeBranchImmediate(from_address, to_address) & 0x03FF_FFFF);
+}
+
 /// Emits the bridge prologue and initializes the public runtime metadata block.
 ///
 /// The important PIE detail is the load-bias derivation:
@@ -443,7 +525,11 @@ fn emitStubPrologue(
     layout: HookLayout,
     site_address: u64,
     runtime_anchor_literal_index: u32,
+    enable_bti: bool,
 ) !usize {
+    if (enable_bti) {
+        _ = try builder.emitU32(bti_jc_instruction);
+    }
     _ = try builder.emitU32(encodeSubImmediateSp(layout.frame_size));
 
     inline for (0..15) |pair_index| {
@@ -521,11 +607,21 @@ fn emitCallbackInvocation(
     builder: *InstrumentStubBuilder,
     layout: HookLayout,
     callback_address: u64,
+    stub_address: u64,
 ) !void {
     _ = try builder.emitU32(encodeLdrUnsigned64(0, 31, layout.runtime_site_runtime_address_offset));
     _ = try builder.emitU32(encodeAddImmediate(1, 31, 0));
-    try emitLoadRuntimeAddress(builder, layout, 16, callback_address, 9);
-    _ = try builder.emitU32(encodeBlr(16));
+
+    const call_offset = try builder.emitU32(nop);
+    if (callback_address != 0 and stub_address != 0) {
+        builder.patchU32(
+            call_offset,
+            try encodeBranchWithLinkImmediate(
+                stub_address + @as(u64, @intCast(call_offset)),
+                callback_address,
+            ),
+        );
+    }
 }
 
 fn emitReplayBypassGuard(
@@ -543,11 +639,85 @@ fn emitReplaySequence(
     layout: HookLayout,
     options: InstrumentStubOptions,
 ) !void {
-    const next_pc = options.site_address + 4;
+    const window_plan = effectiveWindowPlan(options);
 
-    switch (options.replay_plan) {
+    if (window_plan.count == 1) {
+        return switch (window_plan.step(0)) {
+            .raw => emitStoreContextPcLinkedAddress(builder, layout, options.trampoline_address),
+            .semantic => |plan| emitSemanticReplayPlanAt(builder, layout, options.site_address, plan),
+        };
+    }
+
+    if (window_plan.isFullyRawTrampolineSafe()) {
+        return emitStoreContextPcLinkedAddress(builder, layout, options.trampoline_address);
+    }
+
+    if (window_plan.supportsLinearSemanticPrefixReplay()) {
+        const semantic_prefix_len = window_plan.leadingSemanticStepCount();
+
+        for (0..semantic_prefix_len) |index| {
+            switch (window_plan.step(index)) {
+                .semantic => |plan| try emitSemanticReplayPlanAt(
+                    builder,
+                    layout,
+                    options.site_address + index * 4,
+                    plan,
+                ),
+                .raw => unreachable,
+            }
+        }
+
+        if (semantic_prefix_len < window_plan.count) {
+            // Entering the trampoline at a non-zero offset is correct here:
+            // the prefix replay already reproduced every PC-relative effect
+            // before that point, so the remaining raw suffix may execute from a
+            // copied trampoline slice exactly as if control had linearly
+            // reached that instruction in place.
+            return emitStoreContextPcLinkedAddress(
+                builder,
+                layout,
+                options.trampoline_address + trampolineEntryPrefixSize(options.enable_bti) + semantic_prefix_len * 4,
+            );
+        }
+        return;
+    }
+
+    if (window_plan.supportsSequentialSemanticReplay()) {
+        for (0..window_plan.count) |index| {
+            switch (window_plan.step(index)) {
+                .semantic => |plan| try emitSemanticReplayPlanAt(
+                    builder,
+                    layout,
+                    options.site_address + index * 4,
+                    plan,
+                ),
+                .raw => unreachable,
+            }
+        }
+        return;
+    }
+
+    return error.UnsupportedMultiInstructionPatchWindow;
+}
+
+/// Emits semantic replay for one displaced instruction at its original linked
+/// address.
+///
+/// The helper deliberately takes the instruction address explicitly instead of
+/// deriving it from `site_address`. Widened windows may replay several
+/// different instructions before resuming into a raw trampoline tail, and each
+/// semantic step must compute its own architectural fallthrough PC.
+fn emitSemanticReplayPlanAt(
+    builder: *InstrumentStubBuilder,
+    layout: HookLayout,
+    address: u64,
+    replay_plan: ReplayPlan,
+) !void {
+    const next_pc = address + 4;
+
+    switch (replay_plan) {
         .trampoline => {
-            try emitStoreContextPcLinkedAddress(builder, layout, options.trampoline_address);
+            return error.UnsupportedOriginalInstruction;
         },
         .adr => |op| {
             try emitStoreContextRegisterLinkedAddress(builder, layout, op.rd, op.absolute);
@@ -610,6 +780,47 @@ fn emitReplaySequence(
         .branch_with_link => |op| {
             try emitStoreContextRegisterLinkedAddress(builder, layout, 30, next_pc);
             try emitStoreContextPcLinkedAddress(builder, layout, op.target);
+        },
+        .compare_immediate => |op| {
+            if (op.is_64bit) {
+                _ = try builder.emitU32(encodeLdrUnsigned64(9, 31, xRegisterOffset(layout, op.rn)));
+            } else {
+                _ = try builder.emitU32(encodeLdrUnsigned32(9, 31, xRegisterOffset(layout, op.rn)));
+            }
+            _ = try builder.emitU32(encodeCmpImmediate(9, op.immediate, op.is_64bit));
+            _ = try builder.emitU32(encodeMrsNzcv(10));
+            _ = try builder.emitU32(encodeStrUnsigned32(10, 31, layout.cpsr_offset));
+            try emitStoreContextPcLinkedAddress(builder, layout, next_pc);
+        },
+        .compare_register => |op| {
+            const lhs_reg: u5 = if (op.rn == 31) 31 else 9;
+            const rhs_reg: u5 = if (op.rm == 31) 31 else 10;
+
+            if (op.rn != 31) {
+                if (op.is_64bit) {
+                    _ = try builder.emitU32(encodeLdrUnsigned64(9, 31, xRegisterOffset(layout, op.rn)));
+                } else {
+                    _ = try builder.emitU32(encodeLdrUnsigned32(9, 31, xRegisterOffset(layout, op.rn)));
+                }
+            }
+            if (op.rm != 31) {
+                if (op.is_64bit) {
+                    _ = try builder.emitU32(encodeLdrUnsigned64(10, 31, xRegisterOffset(layout, op.rm)));
+                } else {
+                    _ = try builder.emitU32(encodeLdrUnsigned32(10, 31, xRegisterOffset(layout, op.rm)));
+                }
+            }
+
+            _ = try builder.emitU32(encodeCmpShiftedRegister(
+                lhs_reg,
+                rhs_reg,
+                op.shift,
+                op.shift_amount,
+                op.is_64bit,
+            ));
+            _ = try builder.emitU32(encodeMrsNzcv(11));
+            _ = try builder.emitU32(encodeStrUnsigned32(11, 31, layout.cpsr_offset));
+            try emitStoreContextPcLinkedAddress(builder, layout, next_pc);
         },
         .conditional_branch => |op| {
             _ = try builder.emitU32(encodeLdrUnsigned32(9, 31, layout.cpsr_offset));
@@ -691,10 +902,65 @@ fn emitReplaySequence(
 
 fn collectDirectResumeTargets(options: InstrumentStubOptions) DirectResumeTargets {
     var targets = DirectResumeTargets{};
-    const next_pc = options.site_address + 4;
+    const window_plan = effectiveWindowPlan(options);
 
-    switch (options.replay_plan) {
-        .trampoline => targets.appendUnique(options.trampoline_address),
+    if (window_plan.count > 1) {
+        if (window_plan.isFullyRawTrampolineSafe()) {
+            targets.appendUnique(options.trampoline_address);
+            return targets;
+        }
+
+        if (window_plan.supportsLinearSemanticPrefixReplay()) {
+            const semantic_prefix_len = window_plan.leadingSemanticStepCount();
+            if (semantic_prefix_len < window_plan.count) {
+                // The dispatcher must recognize the synthetic mid-trampoline
+                // resume target used by widened semantic-prefix replay.
+                targets.appendUnique(options.trampoline_address + semantic_prefix_len * 4);
+                if (options.enable_bti) {
+                    targets.values[targets.count - 1] += trampolineEntryPrefixSize(options.enable_bti);
+                }
+            } else {
+                appendSemanticResumeTargets(
+                    &targets,
+                    options.site_address + (window_plan.count - 1) * 4,
+                    switch (window_plan.step(window_plan.count - 1)) {
+                        .semantic => |plan| plan,
+                        .raw => unreachable,
+                    },
+                );
+            }
+            return targets;
+        }
+
+        if (window_plan.supportsSequentialSemanticReplay()) {
+            appendSemanticResumeTargets(
+                &targets,
+                options.site_address + (window_plan.count - 1) * 4,
+                switch (window_plan.step(window_plan.count - 1)) {
+                    .semantic => |plan| plan,
+                    .raw => unreachable,
+                },
+            );
+            return targets;
+        }
+    }
+
+    switch (window_plan.step(0)) {
+        .raw => targets.appendUnique(options.trampoline_address),
+        .semantic => |replay_plan| appendSemanticResumeTargets(&targets, options.site_address, replay_plan),
+    }
+
+    return targets;
+}
+
+fn appendSemanticResumeTargets(
+    targets: *DirectResumeTargets,
+    address: u64,
+    replay_plan: ReplayPlan,
+) void {
+    const next_pc = address + 4;
+    switch (replay_plan) {
+        .trampoline => unreachable,
         .adr,
         .adrp,
         .ldr_literal_w,
@@ -704,6 +970,8 @@ fn collectDirectResumeTargets(options: InstrumentStubOptions) DirectResumeTarget
         .ldr_literal_q,
         .ldrsw_literal,
         .prfm_literal,
+        .compare_immediate,
+        .compare_register,
         => targets.appendUnique(next_pc),
         .branch => |op| targets.appendUnique(op.target),
         .branch_with_link => |op| targets.appendUnique(op.target),
@@ -720,8 +988,6 @@ fn collectDirectResumeTargets(options: InstrumentStubOptions) DirectResumeTarget
             targets.appendUnique(op.target);
         },
     }
-
-    return targets;
 }
 
 /// Emits the runtime resume dispatcher together with both epilogue forms.
@@ -1073,19 +1339,43 @@ fn encodeCmpRegister64(rn: u5, rm: u5) u32 {
     return 0xEB00_001F | (@as(u32, rm) << 16) | (@as(u32, rn) << 5);
 }
 
+fn encodeCmpImmediate(rn: u5, immediate: u64, is_64bit: bool) u32 {
+    const shifted = (immediate & 0xFFF) == 0 and immediate <= 0xFFF000;
+    const imm12: u12 = @intCast(if (shifted) immediate >> 12 else immediate);
+    std.debug.assert(@as(u64, imm12) << @as(u6, if (shifted) 12 else 0) == immediate);
+
+    const sf: u32 = if (is_64bit) 1 else 0;
+    const sh: u32 = if (shifted) 1 else 0;
+    return (sf << 31) |
+        0x7100_001F |
+        (sh << 22) |
+        (@as(u32, imm12) << 10) |
+        (@as(u32, rn) << 5);
+}
+
+fn encodeCmpShiftedRegister(rn: u5, rm: u5, shift: u2, shift_amount: u6, is_64bit: bool) u32 {
+    const sf: u32 = if (is_64bit) 1 else 0;
+    return (sf << 31) |
+        0x6B00_001F |
+        (@as(u32, shift) << 22) |
+        (@as(u32, rm) << 16) |
+        (@as(u32, shift_amount) << 10) |
+        (@as(u32, rn) << 5);
+}
+
 fn encodeLdrLiteralDelta(rt: u5, byte_offset: usize) u32 {
     std.debug.assert((byte_offset & 0x3) == 0);
     const imm19: u19 = @intCast(byte_offset / 4);
     return 0x5800_0000 | (@as(u32, imm19) << 5) | rt;
 }
 
-fn encodeConditionalBranchDelta(cond: u4, byte_offset: i64) !u32 {
+pub fn encodeConditionalBranchDelta(cond: u4, byte_offset: i64) !u32 {
     if ((byte_offset & 0x3) != 0) return error.UnalignedBranchTarget;
     const imm19 = try encodeSignedBranchImmediate(19, byte_offset);
     return 0x5400_0000 | (@as(u32, imm19) << 5) | cond;
 }
 
-fn encodeCompareAndBranchDelta(rt: u5, byte_offset: i64, nonzero: bool, is_64bit: bool) !u32 {
+pub fn encodeCompareAndBranchDelta(rt: u5, byte_offset: i64, nonzero: bool, is_64bit: bool) !u32 {
     if ((byte_offset & 0x3) != 0) return error.UnalignedBranchTarget;
     const imm19 = try encodeSignedBranchImmediate(19, byte_offset);
     const sf: u32 = if (is_64bit) 1 else 0;
@@ -1093,7 +1383,7 @@ fn encodeCompareAndBranchDelta(rt: u5, byte_offset: i64, nonzero: bool, is_64bit
     return (sf << 31) | 0x3400_0000 | (op << 24) | (@as(u32, imm19) << 5) | rt;
 }
 
-fn encodeTestBitAndBranchDelta(rt: u5, bit_index: u6, byte_offset: i64, nonzero: bool) !u32 {
+pub fn encodeTestBitAndBranchDelta(rt: u5, bit_index: u6, byte_offset: i64, nonzero: bool) !u32 {
     if ((byte_offset & 0x3) != 0) return error.UnalignedBranchTarget;
     const imm14 = try encodeSignedBranchImmediate(14, byte_offset);
     const op: u32 = if (nonzero) 1 else 0;

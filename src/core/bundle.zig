@@ -32,6 +32,7 @@ pub const HookTargetKind = enum {
     symbol,
     virtual_address,
     file_offset,
+    pattern,
 };
 
 pub const HookLocator = struct {
@@ -39,6 +40,8 @@ pub const HookLocator = struct {
     symbol: []const u8 = "",
     virtual_address: u64 = 0,
     file_offset: u64 = 0,
+    pattern: []const u8 = "",
+    pattern_offset: u64 = 0,
 
     pub fn fromSymbol(name: []const u8) HookLocator {
         return .{
@@ -58,6 +61,14 @@ pub const HookLocator = struct {
         return .{
             .kind = .file_offset,
             .file_offset = offset,
+        };
+    }
+
+    pub fn fromPattern(pattern: []const u8, pattern_offset: u64) HookLocator {
+        return .{
+            .kind = .pattern,
+            .pattern = pattern,
+            .pattern_offset = pattern_offset,
         };
     }
 };
@@ -82,6 +93,8 @@ pub const MetaHookLocator = struct {
     symbol: []const u8 = "",
     virtual_address: []const u8 = "",
     file_offset: []const u8 = "",
+    pattern: []const u8 = "",
+    pattern_offset: []const u8 = "",
 };
 
 pub const HookSpec = struct {
@@ -89,6 +102,14 @@ pub const HookSpec = struct {
     target: HookLocator,
     handler_symbol: []const u8,
     log_message: []const u8 = "",
+    /// Hex-encoded bytes that must already be present at the patch site before
+    /// rewriting proceeds.
+    ///
+    /// This is the first guardrail against silent version drift when hooks are
+    /// authored against stripped binaries or unstable offsets. The current
+    /// format is exact-match only; later milestones can add masks/wildcards on
+    /// top of the same manifest field family.
+    expected_bytes: []const u8 = "",
     /// Number of contiguous 32-bit instructions to steal starting at the hook
     /// site. `1` keeps the classic single-instruction detour behavior.
     ///
@@ -123,6 +144,7 @@ pub const MetaHookSpec = struct {
     target: MetaHookLocator,
     handler_symbol: []const u8,
     log_message: []const u8 = "",
+    expected_bytes: []const u8 = "",
     stolen_instruction_count: u8 = 1,
 };
 
@@ -213,6 +235,7 @@ pub fn loadBuildSpecFromMetaBytes(
             .target = try resolveMetaHookLocator(meta_hook.target),
             .handler_symbol = meta_hook.handler_symbol,
             .log_message = meta_hook.log_message,
+            .expected_bytes = meta_hook.expected_bytes,
             .stolen_instruction_count = meta_hook.stolen_instruction_count,
         };
     }
@@ -323,6 +346,13 @@ fn resolveMetaHookLocator(locator: MetaHookLocator) !HookLocator {
         .file_offset => HookLocator.fromFileOffset(
             try parseMetaInteger(locator.file_offset, error.MissingTargetLocator),
         ),
+        .pattern => blk: {
+            if (locator.pattern.len == 0) return error.MissingTargetLocator;
+            break :blk HookLocator.fromPattern(
+                locator.pattern,
+                try parseOptionalMetaInteger(locator.pattern_offset),
+            );
+        },
     };
 }
 
@@ -332,6 +362,11 @@ fn parseMetaInteger(value: []const u8, comptime missing_error: anyerror) !u64 {
         return std.fmt.parseUnsigned(u64, value[2..], 16);
     }
     return std.fmt.parseUnsigned(u64, value, 10);
+}
+
+fn parseOptionalMetaInteger(value: []const u8) !u64 {
+    if (value.len == 0) return 0;
+    return parseMetaInteger(value, error.InvalidPatternOffset);
 }
 
 fn writeHeader(dest: []u8, header: Header) void {

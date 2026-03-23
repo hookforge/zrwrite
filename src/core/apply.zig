@@ -53,12 +53,14 @@ pub fn applyLoadedBundleToPath(
                 .target = hook.target,
                 .handler_symbol = hook.handler_symbol,
                 .log_message = hook.log_message,
+                .expected_bytes = hook.expected_bytes,
                 .stolen_instruction_count = hook.stolen_instruction_count,
             }),
             .replace => try rw.addReplaceHookObject(.{
                 .payload_object_bytes = owned_bundle.payload_object,
                 .target = hook.target,
                 .replacement_symbol = hook.handler_symbol,
+                .expected_bytes = hook.expected_bytes,
             }),
         };
     }

@@ -4,12 +4,18 @@ const bundle = @import("bundle.zig");
 const aarch64 = @import("../isa/aarch64/root.zig");
 const ElfView = @import("../format/elf/root.zig").View;
 const payload = @import("payload/object.zig");
+const pattern_locator = @import("pattern_locator.zig");
+
+const rewrite_diagnostic_capacity = 1024;
+threadlocal var last_rewrite_diagnostic_buf: [rewrite_diagnostic_capacity]u8 = undefined;
+threadlocal var last_rewrite_diagnostic_len: usize = 0;
 
 pub const InstrumentHookSpec = struct {
     payload_object_path: []const u8,
     target: bundle.HookLocator,
     handler_symbol: []const u8,
     log_message: []const u8 = "",
+    expected_bytes: []const u8 = "",
     stolen_instruction_count: u8 = 1,
 };
 
@@ -18,6 +24,7 @@ pub const InstrumentObjectSpec = struct {
     target: bundle.HookLocator,
     handler_symbol: []const u8,
     log_message: []const u8 = "",
+    expected_bytes: []const u8 = "",
     stolen_instruction_count: u8 = 1,
 };
 
@@ -25,12 +32,14 @@ pub const ReplaceHookSpec = struct {
     payload_object_path: []const u8,
     target: bundle.HookLocator,
     replacement_symbol: []const u8,
+    expected_bytes: []const u8 = "",
 };
 
 pub const ReplaceObjectSpec = struct {
     payload_object_bytes: []const u8,
     target: bundle.HookLocator,
     replacement_symbol: []const u8,
+    expected_bytes: []const u8 = "",
 };
 
 pub const RewriteReport = struct {
@@ -46,9 +55,33 @@ pub const RewriteReport = struct {
 pub const InstrumentRewriteReport = RewriteReport;
 pub const ReplaceRewriteReport = RewriteReport;
 
+/// Clears the last rewrite diagnostic.
+///
+/// Patch planning failures often need more context than an error-set tag can
+/// provide on its own. For example:
+/// - expected-byte mismatches should say what bytes were found instead
+/// - widened-window failures should name the first unsupported instruction
+/// - incoming-branch rejections should say which source edge blocks the patch
+pub fn clearLastRewriteDiagnostic() void {
+    last_rewrite_diagnostic_len = 0;
+}
+
+/// Returns the most recent rewriter diagnostic, if any.
+pub fn lastRewriteDiagnosticMessage() ?[]const u8 {
+    if (last_rewrite_diagnostic_len == 0) return null;
+    return last_rewrite_diagnostic_buf[0..last_rewrite_diagnostic_len];
+}
+
 const ResolvedTarget = struct {
     address: u64,
     file_offset: usize,
+};
+
+const IncomingBranchRetarget = struct {
+    source_address: u64,
+    source_file_offset: usize,
+    replay_plan: aarch64.ReplayPlan,
+    target_index: usize,
 };
 
 const InjectionPlan = struct {
@@ -109,6 +142,7 @@ pub const Rewriter = struct {
     }
 
     pub fn addInstrumentHook(self: *Rewriter, spec: InstrumentHookSpec) !InstrumentRewriteReport {
+        clearLastRewriteDiagnostic();
         const payload_bytes = try std.fs.cwd().readFileAlloc(self.allocator, spec.payload_object_path, std.math.maxInt(usize));
         defer self.allocator.free(payload_bytes);
 
@@ -117,11 +151,13 @@ pub const Rewriter = struct {
             .target = spec.target,
             .handler_symbol = spec.handler_symbol,
             .log_message = spec.log_message,
+            .expected_bytes = spec.expected_bytes,
             .stolen_instruction_count = spec.stolen_instruction_count,
         });
     }
 
     pub fn addReplaceHook(self: *Rewriter, spec: ReplaceHookSpec) !ReplaceRewriteReport {
+        clearLastRewriteDiagnostic();
         const payload_bytes = try std.fs.cwd().readFileAlloc(self.allocator, spec.payload_object_path, std.math.maxInt(usize));
         defer self.allocator.free(payload_bytes);
 
@@ -129,24 +165,37 @@ pub const Rewriter = struct {
             .payload_object_bytes = payload_bytes,
             .target = spec.target,
             .replacement_symbol = spec.replacement_symbol,
+            .expected_bytes = spec.expected_bytes,
         });
     }
 
     pub fn addInstrumentHookObject(self: *Rewriter, spec: InstrumentObjectSpec) !InstrumentRewriteReport {
+        clearLastRewriteDiagnostic();
         const base_bytes = self.workingBytes();
         const input_view = try ElfView.parse(base_bytes);
-        const target = try resolveTargetLocation(input_view, spec.target);
+        const target = try resolveTargetLocation(self.allocator, input_view, spec.target);
         const stolen_instruction_count = try validateStolenInstructionCount(spec.stolen_instruction_count);
         const stolen_window_size = stolen_instruction_count * @sizeOf(u32);
         try validatePatchWindowMapping(input_view, target, stolen_instruction_count);
+        try validateExpectedBytes(self.allocator, base_bytes, target, spec.expected_bytes);
 
-        const replay_plan = try analyzeInstrumentReplayPlan(
-            input_view,
+        const window_plan = try analyzeInstrumentWindowPlan(
             base_bytes,
             target,
             stolen_instruction_count,
         );
-        const needs_raw_trampoline = stolen_instruction_count != 1 or replay_plan.requiresRawTrampoline();
+        const incoming_branches = try collectIncomingBranchRetargets(
+            self.allocator,
+            input_view,
+            target.address,
+            stolen_instruction_count,
+            window_plan,
+        );
+        defer self.allocator.free(incoming_branches);
+        const replay_plan = window_plan.singleReplayPlan() orelse aarch64.ReplayPlan{ .trampoline = {} };
+        const needs_raw_trampoline = windowNeedsRawTrampoline(window_plan);
+        const enable_bti = input_view.hasAarch64BtiProperty();
+        const bti_prefix_size: usize = if (enable_bti) @sizeOf(u32) else 0;
 
         // The mini-linker runs in two phases:
         // 1. analyze the object so we know how large the injected image must be
@@ -158,9 +207,9 @@ pub const Rewriter = struct {
         const trampoline_offset = std.mem.alignForward(usize, payload_layout.image_size, 8);
         const trampoline_size = if (needs_raw_trampoline)
             if (stolen_instruction_count == 1 and replay_plan.requiresRawTrampoline())
-                aarch64.original_trampoline_size
+                aarch64.original_trampoline_size + bti_prefix_size
             else
-                stolen_window_size + aarch64.long_detour_size
+                stolen_window_size + aarch64.long_detour_size + bti_prefix_size
         else
             0;
         const stub_offset = std.mem.alignForward(usize, trampoline_offset + trampoline_size, 8);
@@ -172,6 +221,8 @@ pub const Rewriter = struct {
             .trampoline_address = 0,
             .stub_address = 0,
             .replay_plan = replay_plan,
+            .window_plan = window_plan,
+            .enable_bti = enable_bti,
             .log_message = spec.log_message,
         });
         const stub_size = stub.len;
@@ -205,6 +256,8 @@ pub const Rewriter = struct {
             .trampoline_address = trampoline_address,
             .stub_address = stub_address,
             .replay_plan = replay_plan,
+            .window_plan = window_plan,
+            .enable_bti = enable_bti,
             .log_message = spec.log_message,
         });
         defer self.allocator.free(fixed_stub);
@@ -223,14 +276,17 @@ pub const Rewriter = struct {
             if (stolen_instruction_count == 1 and replay_plan.requiresRawTrampoline()) {
                 var original_instruction: [4]u8 = undefined;
                 @memcpy(&original_instruction, stolen_bytes);
-                const trampoline = try aarch64.buildOriginalTrampoline(
+                const trampoline = try aarch64.buildOriginalTrampolineBytes(
+                    self.allocator,
                     original_instruction,
                     trampoline_address,
                     target.address + 4,
+                    enable_bti,
                 );
+                defer self.allocator.free(trampoline);
                 @memcpy(
                     output[plan.injection_offset + trampoline_offset .. plan.injection_offset + trampoline_offset + trampoline.len],
-                    &trampoline,
+                    trampoline,
                 );
             } else {
                 const trampoline = try aarch64.buildRawTrampoline(
@@ -238,6 +294,7 @@ pub const Rewriter = struct {
                     stolen_bytes,
                     trampoline_address,
                     target.address + stolen_window_size,
+                    enable_bti,
                 );
                 defer self.allocator.free(trampoline);
                 @memcpy(
@@ -258,6 +315,15 @@ pub const Rewriter = struct {
             stub_address,
             stolen_instruction_count,
         );
+        if (incoming_branches.len != 0) {
+            try retargetIncomingBranches(
+                output,
+                incoming_branches,
+                window_plan,
+                trampoline_address,
+                enable_bti,
+            );
+        }
 
         self.installOutput(output);
 
@@ -273,9 +339,11 @@ pub const Rewriter = struct {
     }
 
     pub fn addReplaceHookObject(self: *Rewriter, spec: ReplaceObjectSpec) !ReplaceRewriteReport {
+        clearLastRewriteDiagnostic();
         const base_bytes = self.workingBytes();
         const input_view = try ElfView.parse(base_bytes);
-        const target = try resolveTargetLocation(input_view, spec.target);
+        const target = try resolveTargetLocation(self.allocator, input_view, spec.target);
+        try validateExpectedBytes(self.allocator, base_bytes, target, spec.expected_bytes);
 
         // Replace hooks reuse the same two-phase payload mini-linker pipeline as
         // instrument hooks; they simply do not need the extra trampoline/stub
@@ -303,7 +371,15 @@ pub const Rewriter = struct {
 
         try finalizeInjectedOutput(input_view, output, plan, true);
 
-        const branch_opcode = try aarch64.encodeBranchImmediate(target.address, payload_entry_address);
+        const branch_opcode = aarch64.encodeBranchImmediate(target.address, payload_entry_address) catch |err| {
+            if (err == error.BranchOutOfRange) {
+                recordRewriteDiagnostic(
+                    "replace hook target 0x{x} cannot reach replacement entry 0x{x} with a direct branch",
+                    .{ target.address, payload_entry_address },
+                );
+            }
+            return err;
+        };
         writeU32(output[target.file_offset .. target.file_offset + 4], branch_opcode);
 
         self.installOutput(output);
@@ -318,7 +394,110 @@ pub const Rewriter = struct {
     }
 };
 
-fn resolveTargetLocation(view: ElfView, target: bundle.HookLocator) !ResolvedTarget {
+fn recordRewriteDiagnostic(comptime fmt: []const u8, args: anytype) void {
+    const message = std.fmt.bufPrint(&last_rewrite_diagnostic_buf, fmt, args) catch |err| switch (err) {
+        error.NoSpaceLeft => blk: {
+            const fallback = "rewrite error (diagnostic truncated)";
+            @memcpy(last_rewrite_diagnostic_buf[0..fallback.len], fallback);
+            break :blk fallback;
+        },
+    };
+    last_rewrite_diagnostic_len = message.len;
+}
+
+fn validateExpectedBytes(
+    allocator: std.mem.Allocator,
+    base_bytes: []const u8,
+    target: ResolvedTarget,
+    expected_bytes_hex: []const u8,
+) !void {
+    if (expected_bytes_hex.len == 0) return;
+
+    const expected = try decodeExpectedBytesHex(allocator, expected_bytes_hex);
+    defer allocator.free(expected);
+
+    if (expected.len == 0) {
+        recordRewriteDiagnostic(
+            "expected-bytes guard at 0x{x} decoded to an empty byte string",
+            .{target.address},
+        );
+        return error.InvalidExpectedBytesHex;
+    }
+
+    if (target.file_offset + expected.len > base_bytes.len) {
+        recordRewriteDiagnostic(
+            "expected-bytes guard at 0x{x} extends past the end of the input image (need {d} bytes)",
+            .{ target.address, expected.len },
+        );
+        return error.ExpectedBytesMismatch;
+    }
+
+    const actual = base_bytes[target.file_offset .. target.file_offset + expected.len];
+    if (!std.mem.eql(u8, expected, actual)) {
+        var expected_hex: [256]u8 = undefined;
+        var actual_hex: [256]u8 = undefined;
+        recordRewriteDiagnostic(
+            "expected-bytes mismatch at 0x{x}: expected {s}, found {s}",
+            .{
+                target.address,
+                formatHexBytes(&expected_hex, expected),
+                formatHexBytes(&actual_hex, actual),
+            },
+        );
+        return error.ExpectedBytesMismatch;
+    }
+}
+
+fn decodeExpectedBytesHex(allocator: std.mem.Allocator, expected_bytes_hex: []const u8) ![]u8 {
+    var cleaned: std.ArrayList(u8) = .empty;
+    defer cleaned.deinit(allocator);
+
+    for (expected_bytes_hex) |char| {
+        if (std.ascii.isWhitespace(char) or char == '_' or char == ':') continue;
+        try cleaned.append(allocator, char);
+    }
+
+    if (cleaned.items.len == 0) return allocator.alloc(u8, 0);
+    if ((cleaned.items.len & 1) != 0) return error.InvalidExpectedBytesHex;
+
+    const decoded = try allocator.alloc(u8, cleaned.items.len / 2);
+    errdefer allocator.free(decoded);
+
+    for (decoded, 0..) |*byte, index| {
+        const hi = try parseHexNibble(cleaned.items[index * 2]);
+        const lo = try parseHexNibble(cleaned.items[index * 2 + 1]);
+        byte.* = (@as(u8, hi) << 4) | lo;
+    }
+
+    return decoded;
+}
+
+fn parseHexNibble(char: u8) !u8 {
+    return switch (char) {
+        '0'...'9' => char - '0',
+        'a'...'f' => char - 'a' + 10,
+        'A'...'F' => char - 'A' + 10,
+        else => error.InvalidExpectedBytesHex,
+    };
+}
+
+fn formatHexBytes(buffer: []u8, bytes: []const u8) []const u8 {
+    if (buffer.len == 0) return "";
+
+    const digits = "0123456789abcdef";
+    const max_bytes = @min(bytes.len, buffer.len / 2);
+    for (bytes[0..max_bytes], 0..) |byte, index| {
+        buffer[index * 2] = digits[byte >> 4];
+        buffer[index * 2 + 1] = digits[byte & 0xF];
+    }
+    return buffer[0 .. max_bytes * 2];
+}
+
+fn resolveTargetLocation(
+    allocator: std.mem.Allocator,
+    view: ElfView,
+    target: bundle.HookLocator,
+) !ResolvedTarget {
     return switch (target.kind) {
         .symbol => blk: {
             if (target.symbol.len == 0) return error.MissingTargetSymbol;
@@ -336,11 +515,63 @@ fn resolveTargetLocation(view: ElfView, target: bundle.HookLocator) !ResolvedTar
             .address = try view.offsetToAddress(target.file_offset),
             .file_offset = @intCast(target.file_offset),
         },
+        .pattern => try resolvePatternTargetLocation(allocator, view, target),
+    };
+}
+
+fn resolvePatternTargetLocation(
+    allocator: std.mem.Allocator,
+    view: ElfView,
+    target: bundle.HookLocator,
+) !ResolvedTarget {
+    if (target.pattern.len == 0) return error.MissingTargetLocator;
+
+    const parsed_pattern = try pattern_locator.parseHexPattern(allocator, target.pattern);
+    defer allocator.free(parsed_pattern);
+
+    if (target.pattern_offset >= parsed_pattern.len) {
+        recordRewriteDiagnostic(
+            "pattern locator offset {d} exceeds pattern length {d}",
+            .{ target.pattern_offset, parsed_pattern.len },
+        );
+        return error.InvalidPatternOffset;
+    }
+
+    const matches = try pattern_locator.findMatchesInExecutableSegments(allocator, view, parsed_pattern, 3);
+    defer allocator.free(matches);
+
+    if (matches.len == 0) {
+        recordRewriteDiagnostic(
+            "pattern locator did not match any executable bytes: {s}",
+            .{target.pattern},
+        );
+        return error.PatternNotFound;
+    }
+
+    if (matches.len > 1) {
+        recordRewriteDiagnostic(
+            "pattern locator matched multiple executable locations for {s}: 0x{x}, 0x{x}",
+            .{
+                target.pattern,
+                matches[0].address + target.pattern_offset,
+                matches[1].address + target.pattern_offset,
+            },
+        );
+        return error.PatternNotUnique;
+    }
+
+    return .{
+        .address = matches[0].address + target.pattern_offset,
+        .file_offset = matches[0].file_offset + @as(usize, @intCast(target.pattern_offset)),
     };
 }
 
 fn validateStolenInstructionCount(count: u8) !usize {
     if (count == 0 or count > aarch64.max_stolen_instruction_count) {
+        recordRewriteDiagnostic(
+            "unsupported stolen-instruction count {d}; current cap is {d}",
+            .{ count, aarch64.max_stolen_instruction_count },
+        );
         return error.UnsupportedStolenInstructionCount;
     }
     return count;
@@ -359,55 +590,90 @@ fn validatePatchWindowMapping(
         const address = target.address + index * 4;
         const expected_file_offset = target.file_offset + index * 4;
         if (try view.addressToOffset(address) != expected_file_offset) {
+            recordRewriteDiagnostic(
+                "patch window at 0x{x} is not a contiguous executable mapping at instruction index {d}",
+                .{ target.address, index },
+            );
             return error.NonContiguousPatchWindow;
         }
     }
 }
 
-fn analyzeInstrumentReplayPlan(
-    view: ElfView,
+fn analyzeInstrumentWindowPlan(
     base_bytes: []const u8,
     target: ResolvedTarget,
     stolen_instruction_count: usize,
-) !aarch64.ReplayPlan {
+) !aarch64.WindowPlan {
     if (target.file_offset + stolen_instruction_count * 4 > base_bytes.len) {
+        recordRewriteDiagnostic(
+            "patch window at 0x{x} with {d} instructions extends beyond the input image",
+            .{ target.address, stolen_instruction_count },
+        );
         return error.PatchWindowOutOfRange;
     }
 
-    if (stolen_instruction_count == 1) {
-        const opcode = readU32(base_bytes[target.file_offset .. target.file_offset + 4]);
-        return aarch64.planReplay(target.address, opcode);
-    }
-
-    try validateNoIncomingBranchesIntoPatchWindow(view, target.address, stolen_instruction_count);
-
+    var opcodes: [aarch64.max_stolen_instruction_count]u32 = undefined;
     for (0..stolen_instruction_count) |index| {
-        const address = target.address + index * 4;
         const file_offset = target.file_offset + index * 4;
-        const opcode = readU32(base_bytes[file_offset .. file_offset + 4]);
-        const plan = try aarch64.planReplay(address, opcode);
-        if (!plan.requiresRawTrampoline()) return error.UnsupportedMultiInstructionPatchWindow;
+        opcodes[index] = readU32(base_bytes[file_offset .. file_offset + 4]);
     }
 
-    return .{ .trampoline = {} };
+    const window_plan = try aarch64.planWindow(target.address, opcodes[0..stolen_instruction_count]);
+    if (stolen_instruction_count == 1) return window_plan;
+
+    if (window_plan.isFullyRawTrampolineSafe()) return window_plan;
+    if (window_plan.supportsLinearSemanticPrefixReplay()) return window_plan;
+    if (window_plan.supportsSequentialSemanticReplay()) return window_plan;
+
+    for (window_plan.steps[0..window_plan.count], 0..) |step, index| {
+        if (!step.usesSemanticReplay()) continue;
+
+        switch (step) {
+            .semantic => |replay_plan| {
+                recordRewriteDiagnostic(
+                    "unsupported widened patch window at 0x{x}: step {d} ({s}) is not yet supported for multi-instruction replay",
+                    .{
+                        target.address,
+                        index,
+                        aarch64.replayPlanName(replay_plan),
+                    },
+                );
+            },
+            .raw => unreachable,
+        }
+        break;
+    }
+    return error.UnsupportedMultiInstructionPatchWindow;
 }
 
-/// Reject widened windows that would leave a live branch target in the middle
-/// of the stolen instruction range.
+fn windowNeedsRawTrampoline(window_plan: aarch64.WindowPlan) bool {
+    for (window_plan.steps[0..window_plan.count]) |window_step| {
+        switch (window_step) {
+            .raw => return true,
+            .semantic => {},
+        }
+    }
+    return false;
+}
+
+/// Collects direct control-flow edges that land inside the widened patch
+/// window.
 ///
-/// The current widening implementation replays multi-instruction windows by
-/// copying the displaced bytes verbatim into one raw trampoline. That is only
-/// correct for linear entry into the window: if some other direct branch lands
-/// on instruction 2/3/4 of the overwritten range, patching would silently
-/// delete that entry point. We therefore scan executable segments and fail
-/// closed on any direct control-flow edge into the interior of the widened
-/// patch window.
-fn validateNoIncomingBranchesIntoPatchWindow(
+/// Today only interior entries that map to a relocated raw trampoline step are
+/// retargetable. Landing in a semantic-only step would require a dedicated
+/// entry stub that replays the remaining window from that instruction onward,
+/// which is left for a later milestone.
+fn collectIncomingBranchRetargets(
+    allocator: std.mem.Allocator,
     view: ElfView,
     window_start: u64,
     stolen_instruction_count: usize,
-) !void {
-    if (stolen_instruction_count <= 1) return;
+    window_plan: aarch64.WindowPlan,
+) ![]IncomingBranchRetarget {
+    if (stolen_instruction_count <= 1) return allocator.alloc(IncomingBranchRetarget, 0);
+
+    var incoming: std.ArrayList(IncomingBranchRetarget) = .empty;
+    defer incoming.deinit(allocator);
 
     const interior_start = window_start + 4;
     const window_end = window_start + stolen_instruction_count * 4;
@@ -426,9 +692,67 @@ fn validateNoIncomingBranchesIntoPatchWindow(
             const replay_plan = aarch64.planReplay(source_address, opcode) catch continue;
             const branch_target = replayBranchTarget(replay_plan) orelse continue;
             if (branch_target >= interior_start and branch_target < window_end) {
-                return error.IncomingBranchIntoPatchWindow;
+                const target_index: usize = @intCast((branch_target - window_start) / 4);
+                if (!windowStepSupportsInteriorRetarget(window_plan, target_index)) {
+                    recordRewriteDiagnostic(
+                        "incoming branch from 0x{x} targets semantic-only interior step {d} of widened patch window [0x{x}, 0x{x}) at 0x{x}",
+                        .{ source_address, target_index, window_start, window_end, branch_target },
+                    );
+                    return error.IncomingBranchIntoPatchWindow;
+                }
+                try incoming.append(allocator, .{
+                    .source_address = source_address,
+                    .source_file_offset = file_offset,
+                    .replay_plan = replay_plan,
+                    .target_index = target_index,
+                });
             }
         }
+    }
+
+    return incoming.toOwnedSlice(allocator);
+}
+
+fn windowStepSupportsInteriorRetarget(window_plan: aarch64.WindowPlan, index: usize) bool {
+    return switch (window_plan.step(index)) {
+        .raw => true,
+        .semantic => false,
+    };
+}
+
+fn retargetIncomingBranches(
+    output: []u8,
+    incoming_branches: []const IncomingBranchRetarget,
+    window_plan: aarch64.WindowPlan,
+    trampoline_address: u64,
+    enable_bti: bool,
+) !void {
+    const trampoline_prefix_size: u64 = if (enable_bti) @sizeOf(u32) else 0;
+
+    for (incoming_branches) |incoming_branch| {
+        const new_target_address = switch (window_plan.step(incoming_branch.target_index)) {
+            .raw => trampoline_address + trampoline_prefix_size + incoming_branch.target_index * 4,
+            .semantic => unreachable,
+        };
+
+        const replacement_opcode = encodeRetargetedBranch(
+            incoming_branch.source_address,
+            new_target_address,
+            incoming_branch.replay_plan,
+        ) catch |err| {
+            if (err == error.BranchOutOfRange) {
+                recordRewriteDiagnostic(
+                    "incoming branch at 0x{x} cannot be retargeted to relocated interior entry 0x{x}; branch encoding is out of range",
+                    .{ incoming_branch.source_address, new_target_address },
+                );
+            }
+            return err;
+        };
+
+        writeU32(
+            output[incoming_branch.source_file_offset .. incoming_branch.source_file_offset + 4],
+            replacement_opcode,
+        );
     }
 }
 
@@ -440,6 +764,29 @@ fn replayBranchTarget(plan: aarch64.ReplayPlan) ?u64 {
         .compare_and_branch => |op| op.target,
         .test_bit_and_branch => |op| op.target,
         else => null,
+    };
+}
+
+fn encodeRetargetedBranch(source_address: u64, new_target_address: u64, replay_plan: aarch64.ReplayPlan) !u32 {
+    const delta = @as(i64, @intCast(new_target_address)) - @as(i64, @intCast(source_address));
+
+    return switch (replay_plan) {
+        .branch => try aarch64.encodeBranchImmediate(source_address, new_target_address),
+        .branch_with_link => try aarch64.encodeBranchWithLinkImmediate(source_address, new_target_address),
+        .conditional_branch => |op| try aarch64.encodeConditionalBranchDelta(op.cond, delta),
+        .compare_and_branch => |op| try aarch64.encodeCompareAndBranchDelta(
+            op.rt,
+            delta,
+            !op.branch_on_zero,
+            op.is_64bit,
+        ),
+        .test_bit_and_branch => |op| try aarch64.encodeTestBitAndBranchDelta(
+            op.rt,
+            op.bit_index,
+            delta,
+            !op.branch_on_zero,
+        ),
+        else => error.UnsupportedIncomingBranchRetarget,
     };
 }
 
@@ -467,6 +814,10 @@ fn writeInstrumentDetourPatch(
     const branch_opcode = aarch64.encodeBranchImmediate(target_address, stub_address) catch |err| switch (err) {
         error.BranchOutOfRange => {
             if (stolen_window_size < aarch64.long_detour_size) {
+                recordRewriteDiagnostic(
+                    "instrument detour from 0x{x} to 0x{x} needs a 16-byte long detour but the stolen window is only {d} bytes",
+                    .{ target_address, stub_address, stolen_window_size },
+                );
                 return error.InsufficientPatchWindowForLongDetour;
             }
 

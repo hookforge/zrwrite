@@ -11,6 +11,8 @@ pub const ldr_x16_literal_8 = impl.ldr_x16_literal_8;
 pub const br_x16 = impl.br_x16;
 pub const InstrumentStubOptions = impl.InstrumentStubOptions;
 pub const ReplayPlan = impl.ReplayPlan;
+pub const WindowPlan = impl.WindowPlan;
+pub const WindowStep = impl.WindowStep;
 
 pub const validateTrampolineOpcode = impl.validateTrampolineOpcode;
 pub const buildOriginalTrampoline = impl.buildOriginalTrampoline;
@@ -21,4 +23,6 @@ pub const buildInstrumentStub = impl.buildInstrumentStub;
 pub const decodeBranchTarget = impl.decodeBranchTarget;
 pub const encodeBranchImmediate = impl.encodeBranchImmediate;
 pub const planReplay = impl.planReplay;
+pub const planWindow = impl.planWindow;
 pub const applyReplay = impl.applyReplay;
+pub const replayPlanName = impl.replayPlanName;
