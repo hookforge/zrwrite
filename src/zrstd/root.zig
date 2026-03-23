@@ -193,12 +193,228 @@ pub const FixedBuffer = struct {
     }
 };
 
+const FormatKind = enum {
+    default,
+    hex_lower,
+};
+
+const FormatSpec = struct {
+    kind: FormatKind = .default,
+    min_width: usize = 0,
+};
+
+/// Parses the tiny payload-safe formatter surface supported by `zrstd`.
+///
+/// Deliberately supported today:
+/// - `{}`
+/// - `{x}`
+/// - `{x:0>8}` style lowercase hex with zero-left-padding
+///
+/// We intentionally do not delegate to `std.fmt.bufPrint` here. The generic
+/// stdlib formatter pulls in `Io.Writer` plumbing that, in practice, causes
+/// Zig to materialize absolute function-pointer tables in `.rodata`. Those
+/// `ABS64` relocations are acceptable for ET_EXEC but break ET_DYN / PIE
+/// payloads, exactly the environment `zrwrite` wants to support.
+fn parseFormatSpec(comptime spec: []const u8) FormatSpec {
+    if (spec.len == 0) return .{};
+    if (std.mem.eql(u8, spec, "x")) return .{ .kind = .hex_lower };
+
+    if (std.mem.startsWith(u8, spec, "x:0>")) {
+        if (spec.len == 4) @compileError("zrstd format width must contain at least one decimal digit.");
+
+        comptime var width: usize = 0;
+        inline for (spec[4..]) |digit| {
+            if (digit < '0' or digit > '9') {
+                @compileError("zrstd only supports decimal widths in {x:0>...} format specifiers.");
+            }
+            width = width * 10 + (digit - '0');
+        }
+        return .{
+            .kind = .hex_lower,
+            .min_width = width,
+        };
+    }
+
+    @compileError("unsupported zrstd format specifier; supported forms are {}, {x}, and {x:0>width}.");
+}
+
+fn placeholderEnd(comptime fmt_str: []const u8, comptime start: usize) usize {
+    comptime var index = start;
+    inline while (index < fmt_str.len) : (index += 1) {
+        if (fmt_str[index] == '}') return index;
+        if (fmt_str[index] == '{') {
+            @compileError("nested '{' is not supported in zrstd format strings.");
+        }
+    }
+    @compileError("unterminated '{' in zrstd format string.");
+}
+
+fn formatIntoWriter(writer: *FixedBuffer, comptime fmt_str: []const u8, args: anytype) !void {
+    const fields = std.meta.fields(@TypeOf(args));
+
+    comptime var cursor: usize = 0;
+    comptime var literal_start: usize = 0;
+    comptime var arg_index: usize = 0;
+
+    inline while (cursor < fmt_str.len) {
+        switch (fmt_str[cursor]) {
+            '{' => {
+                if (cursor + 1 < fmt_str.len and fmt_str[cursor + 1] == '{') {
+                    if (literal_start < cursor) try writer.writeAll(fmt_str[literal_start..cursor]);
+                    try writer.writeByte('{');
+                    cursor += 2;
+                    literal_start = cursor;
+                    continue;
+                }
+
+                if (literal_start < cursor) try writer.writeAll(fmt_str[literal_start..cursor]);
+
+                if (arg_index >= fields.len) {
+                    @compileError("zrstd format string expects more arguments than were provided.");
+                }
+
+                const end = comptime placeholderEnd(fmt_str, cursor + 1);
+                const field_name = fields[arg_index].name;
+                try writeFormattedValue(writer, fmt_str[cursor + 1 .. end], @field(args, field_name));
+
+                arg_index += 1;
+                cursor = end + 1;
+                literal_start = cursor;
+            },
+            '}' => {
+                if (cursor + 1 < fmt_str.len and fmt_str[cursor + 1] == '}') {
+                    if (literal_start < cursor) try writer.writeAll(fmt_str[literal_start..cursor]);
+                    try writer.writeByte('}');
+                    cursor += 2;
+                    literal_start = cursor;
+                    continue;
+                }
+                @compileError("unmatched '}' in zrstd format string.");
+            },
+            else => cursor += 1,
+        }
+    }
+
+    if (literal_start < fmt_str.len) try writer.writeAll(fmt_str[literal_start..]);
+    if (arg_index != fields.len) {
+        @compileError("zrstd received more arguments than the format string consumes.");
+    }
+}
+
+fn writeFormattedValue(writer: *FixedBuffer, comptime spec_text: []const u8, value: anytype) !void {
+    const spec = comptime parseFormatSpec(spec_text);
+    switch (spec.kind) {
+        .default => try writeDefaultValue(writer, value),
+        .hex_lower => try writeHexValue(writer, value, spec.min_width),
+    }
+}
+
+fn writeDefaultValue(writer: *FixedBuffer, value: anytype) !void {
+    const T = @TypeOf(value);
+    switch (@typeInfo(T)) {
+        .int => |info| {
+            if (info.bits > 64) {
+                @compileError("zrstd default integer formatting currently supports widths up to 64 bits.");
+            }
+            if (info.signedness == .signed) {
+                const signed_value: i64 = @intCast(value);
+                try writeSignedDecimal(writer, signed_value);
+            } else {
+                const unsigned_value: u64 = @intCast(value);
+                try writeUnsignedDecimal(writer, unsigned_value);
+            }
+        },
+        .comptime_int => {
+            if (value < 0) {
+                try writeSignedDecimal(writer, @as(i64, value));
+            } else {
+                try writeUnsignedDecimal(writer, @as(u64, value));
+            }
+        },
+        .bool => try writer.writeAll(if (value) "true" else "false"),
+        .pointer => |pointer| switch (pointer.size) {
+            .slice => {
+                if (pointer.child != u8) {
+                    @compileError("zrstd default formatting supports only byte slices, booleans, and integers.");
+                }
+                try writer.writeAll(value);
+            },
+            .one => switch (@typeInfo(pointer.child)) {
+                .array => |array| {
+                    if (array.child != u8) {
+                        @compileError("zrstd default formatting supports only byte arrays, booleans, and integers.");
+                    }
+                    try writer.writeAll(value[0..]);
+                },
+                else => @compileError("zrstd default formatting supports only byte slices, booleans, and integers."),
+            },
+            else => @compileError("zrstd default formatting supports only byte slices, booleans, and integers."),
+        },
+        .array => |array| {
+            if (array.child != u8) {
+                @compileError("zrstd default formatting supports only byte slices, booleans, and integers.");
+            }
+            try writer.writeAll(value[0..]);
+        },
+        else => @compileError("zrstd default formatting supports only byte slices, booleans, and integers."),
+    }
+}
+
+fn writeHexValue(writer: *FixedBuffer, value: anytype, min_width: usize) !void {
+    const T = @TypeOf(value);
+    const unsigned_value: u64 = switch (@typeInfo(T)) {
+        .int => |info| blk: {
+            if (info.bits > 64) @compileError("zrstd {x} formatting currently supports integer widths up to 64 bits.");
+            if (info.signedness == .signed) {
+                if (value < 0) @compileError("zrstd {x} formatting does not accept negative integers.");
+                break :blk @intCast(value);
+            }
+            break :blk @intCast(value);
+        },
+        .comptime_int => blk: {
+            if (value < 0) @compileError("zrstd {x} formatting does not accept negative integers.");
+            break :blk @intCast(value);
+        },
+        else => @compileError("zrstd {x} formatting supports integers only."),
+    };
+
+    try writer.writeHexU64Lower(unsigned_value, min_width);
+}
+
+fn writeUnsignedDecimal(writer: *FixedBuffer, value: u64) !void {
+    var scratch: [20]u8 = undefined;
+    var cursor = scratch.len;
+    var remaining = value;
+
+    while (true) {
+        cursor -= 1;
+        scratch[cursor] = @as(u8, '0') + @as(u8, @intCast(remaining % 10));
+        remaining /= 10;
+        if (remaining == 0) break;
+    }
+
+    try writer.writeAll(scratch[cursor..]);
+}
+
+fn writeSignedDecimal(writer: *FixedBuffer, value: i64) !void {
+    if (value < 0) {
+        try writer.writeByte('-');
+        const magnitude = @as(u64, @intCast(-(value + 1))) + 1;
+        try writeUnsignedDecimal(writer, magnitude);
+        return;
+    }
+
+    try writeUnsignedDecimal(writer, @intCast(value));
+}
+
 /// Formats into a caller-owned buffer without performing allocation.
 ///
 /// This is the recommended lower-level primitive when a payload needs to build
 /// a string first and then reuse it across multiple output or transport paths.
 pub fn formatInto(buffer: []u8, comptime fmt_str: []const u8, args: anytype) ![]const u8 {
-    return std.fmt.bufPrint(buffer, fmt_str, args);
+    var writer = FixedBuffer.init(buffer);
+    try formatIntoWriter(&writer, fmt_str, args);
+    return writer.written();
 }
 
 /// Writes the full byte slice to the requested file descriptor via raw Linux
@@ -310,6 +526,17 @@ test "fixed buffer supports mixed print and hex appends" {
     try writer.writeHexBytesLower(&.{ 0xCA, 0xFE });
 
     try std.testing.expectEqualStrings("x0=0042 cafe", writer.written());
+}
+
+test "formatInto supports payload-safe decimal and padded hex formatting" {
+    var storage: [96]u8 = undefined;
+    const rendered = try formatInto(
+        &storage,
+        "trace block={} word={} out=0x{x:0>8} ok={}",
+        .{ @as(usize, 3), @as(u32, 2), @as(u32, 0xABCD), true },
+    );
+
+    try std.testing.expectEqualStrings("trace block=3 word=2 out=0x0000abcd ok=true", rendered);
 }
 
 test "mem helpers keep payload buffers explicit and bounded" {

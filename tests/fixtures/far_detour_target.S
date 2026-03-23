@@ -3,7 +3,7 @@
 // The huge `.bss` tail forces the injected payload blob to land more than
 // ±128 MiB away from the hook site, so a plain `b stub` can no longer reach
 // the instrument bridge. `zrwrite` must therefore fall back to a 16-byte
-// absolute detour at the patch site.
+// page-relative long detour at the patch site.
 
 .text
 .p2align 2

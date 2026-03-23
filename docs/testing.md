@@ -88,8 +88,9 @@ real Linux/AArch64 hardware.
 
 `orb_long_detour_demo.sh` is the widened-window range-escape smoke. It forces
 the injected bridge more than ±128 MiB away from the hook site and validates
-that `zrwrite` falls back to a 16-byte absolute detour at the patch site while
-still replaying the stolen instructions correctly on Orb.
+that `zrwrite` falls back to a 16-byte PIE-safe long detour (`adrp/add/br/nop`)
+at the patch site while still replaying the stolen instructions correctly on
+Orb.
 
 `orb_condbr_demo.sh` is the dedicated runtime smoke for
 `R_AARCH64_CONDBR19`. It proves that a payload whose callback contains a

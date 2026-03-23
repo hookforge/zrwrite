@@ -1059,7 +1059,7 @@ test "bundle -> apply rejects widened patch windows with incoming interior branc
     );
 }
 
-test "bundle -> apply falls back to an absolute detour when stub is out of branch range" {
+test "bundle -> apply falls back to a PIE-safe long detour when stub is out of branch range" {
     const allocator = std.testing.allocator;
 
     var tmp = std.testing.tmpDir(.{});
@@ -1144,12 +1144,13 @@ test "bundle -> apply falls back to an absolute detour when stub is out of branc
     const target_file_offset = try input_view.addressToOffset(target_address);
 
     try std.testing.expect(report.stub_address.? - report.target_address > 0x07FF_FFFC);
-    try std.testing.expectEqual(zrwrite.aarch64.ldr_x17_literal_8, try readLeU32(output_bytes, target_file_offset + 0));
-    try std.testing.expectEqual(zrwrite.aarch64.br_x17, try readLeU32(output_bytes, target_file_offset + 4));
 
-    const literal_ptr: *const [8]u8 = @ptrCast(output_bytes[target_file_offset + 8 .. target_file_offset + 16].ptr);
-    const literal_target = std.mem.readInt(u64, literal_ptr, .little);
-    try std.testing.expectEqual(report.stub_address.?, literal_target);
+    const expected_detour = try zrwrite.aarch64.buildLongDetour(target_address, report.stub_address.?);
+    try std.testing.expectEqualSlices(
+        u8,
+        &expected_detour,
+        output_bytes[target_file_offset .. target_file_offset + zrwrite.aarch64.long_detour_size],
+    );
 }
 
 test "bundle -> apply resolves external target symbols for Zig payload calls" {
@@ -1322,6 +1323,75 @@ test "bundle -> apply resolves external target data symbols for Zig payload load
     try std.testing.expectEqual(report.stub_address.?, branch_target);
     try std.testing.expect(report.trampoline_address != null);
     try std.testing.expect(std.mem.indexOf(u8, output_bytes, "zrwrite zig external data hit\n") != null);
+}
+
+test "payload linker rejects GOT-style external data relocations for ET_DYN targets" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const tmp_dir_path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(tmp_dir_path);
+
+    const input_path = try std.fs.path.join(allocator, &.{ tmp_dir_path, "zig_external_data_target_pie" });
+    defer allocator.free(input_path);
+    const payload_path = try std.fs.path.join(allocator, &.{ tmp_dir_path, "zig_external_data_runtime.o" });
+    defer allocator.free(payload_path);
+
+    try runCommand(allocator, &.{
+        "zig",
+        "cc",
+        "-target",
+        "aarch64-linux-musl",
+        "-O0",
+        "-g0",
+        "-fPIE",
+        "-pie",
+        "-fno-stack-protector",
+        "-fno-sanitize=undefined",
+        "-fno-asynchronous-unwind-tables",
+        "tests/fixtures/zig_external_data_target.S",
+        "tests/fixtures/zig_external_data_main.c",
+        "-o",
+        input_path,
+    });
+
+    const emit_bin_arg = try std.fmt.allocPrint(allocator, "-femit-bin={s}", .{payload_path});
+    defer allocator.free(emit_bin_arg);
+
+    try runCommand(allocator, &.{
+        "zig",
+        "build-obj",
+        "-target",
+        "aarch64-linux-musl",
+        "-O",
+        "ReleaseSmall",
+        "-fstrip",
+        "-I",
+        "include",
+        emit_bin_arg,
+        "tests/fixtures/zig_external_data_runtime.zig",
+    });
+
+    const input_bytes = try std.fs.cwd().readFileAlloc(allocator, input_path, std.math.maxInt(usize));
+    defer allocator.free(input_bytes);
+    const target_view = try zrwrite.elf.View.parse(@constCast(input_bytes));
+    try std.testing.expectEqual(std.elf.ET.DYN, target_view.ehdr.e_type);
+
+    const payload_bytes = try std.fs.cwd().readFileAlloc(allocator, payload_path, std.math.maxInt(usize));
+    defer allocator.free(payload_bytes);
+
+    zrwrite.clearLastLinkDiagnostic();
+    try std.testing.expectError(
+        error.UnsupportedPayloadRelocation,
+        zrwrite.payload.linkObjectBytes(allocator, payload_bytes, "on_hit", 0x7000_0000, target_view),
+    );
+
+    const diagnostic = zrwrite.lastLinkDiagnosticMessage() orelse return error.MissingDiagnostic;
+    try std.testing.expect(std.mem.indexOf(u8, diagnostic, "ADR_GOT_PAGE") != null);
+    try std.testing.expect(std.mem.indexOf(u8, diagnostic, "target_value") != null);
+    try std.testing.expect(std.mem.indexOf(u8, diagnostic, "ET_DYN") != null);
 }
 
 test "payload mini-linker patches cross-section CONDBR19 relocations" {

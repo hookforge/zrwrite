@@ -160,7 +160,7 @@ pub const Rewriter = struct {
             if (stolen_instruction_count == 1 and replay_plan.requiresRawTrampoline())
                 aarch64.original_trampoline_size
             else
-                stolen_window_size + aarch64.absolute_detour_size
+                stolen_window_size + aarch64.long_detour_size
         else
             0;
         const stub_offset = std.mem.alignForward(usize, trampoline_offset + trampoline_size, 8);
@@ -451,11 +451,11 @@ fn replayBranchTarget(plan: aarch64.ReplayPlan) ?u64 {
 ///
 /// Fallback:
 /// - if the hook already widened the patch window to at least 16 bytes, emit a
-///   literal long jump (`ldr x17, #8; br x17; .quad stub_address`)
+///   page-relative long detour (`adrp/add/br/nop`)
 ///
 /// This keeps the existing compact encoding for common nearby injections while
-/// finally allowing large in-image distances without forcing the payload blob to
-/// remain branch-reachable from the original hook site.
+/// allowing larger in-image distances without baking a slide-sensitive absolute
+/// pointer into the patched target image.
 fn writeInstrumentDetourPatch(
     output: []u8,
     target_file_offset: usize,
@@ -466,17 +466,17 @@ fn writeInstrumentDetourPatch(
     const stolen_window_size = stolen_instruction_count * 4;
     const branch_opcode = aarch64.encodeBranchImmediate(target_address, stub_address) catch |err| switch (err) {
         error.BranchOutOfRange => {
-            if (stolen_window_size < aarch64.absolute_detour_size) {
+            if (stolen_window_size < aarch64.long_detour_size) {
                 return error.InsufficientPatchWindowForLongDetour;
             }
 
-            const detour = aarch64.buildAbsoluteDetour(stub_address);
+            const detour = try aarch64.buildLongDetour(target_address, stub_address);
             @memcpy(
-                output[target_file_offset .. target_file_offset + aarch64.absolute_detour_size],
+                output[target_file_offset .. target_file_offset + aarch64.long_detour_size],
                 &detour,
             );
 
-            for (aarch64.absolute_detour_size / 4..stolen_instruction_count) |index| {
+            for (aarch64.long_detour_size / 4..stolen_instruction_count) |index| {
                 writeU32(
                     output[target_file_offset + index * 4 .. target_file_offset + (index + 1) * 4],
                     aarch64.nop_instruction,

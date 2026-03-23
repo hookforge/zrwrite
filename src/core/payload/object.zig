@@ -57,6 +57,14 @@ const GotSlotKey = struct {
 /// `output_offset` is the byte offset of the 8-byte slot within the final
 /// payload image. The slot contents are written during linking once the target
 /// image and payload base address are known.
+///
+/// Important limitation:
+/// - the current mini-linker materializes each slot as one final absolute
+///   pointer value
+/// - that is acceptable for ET_EXEC targets, where link-time VAs are also the
+///   runtime VAs
+/// - it is not acceptable for ET_DYN / PIE targets, where every absolute
+///   pointer cell would need an extra rebasing story at runtime
 const GotSlot = struct {
     key: GotSlotKey,
     output_offset: usize,
@@ -403,6 +411,11 @@ fn initializeGotSlots(
     image_base_address: u64,
     target_image: ?ElfView,
 ) !void {
+    if (targetImageRequiresPieSafeRelocations(target_image) and prepared.got_slots.len != 0) {
+        try noteEtDynGotSlotFailure(view, prepared.got_slots[0]);
+        return error.UnsupportedPayloadRelocation;
+    }
+
     for (prepared.got_slots) |slot| {
         if (slot.key.symtab_section_index >= view.shdrs.len) return error.InvalidPayloadRelocationSymtab;
         const symtab_shdr = view.shdrs[slot.key.symtab_section_index];
@@ -468,6 +481,15 @@ fn applyRelocations(
 
         for (relas) |rela| {
             const patch_offset = try patchOffset(target_output_section, rela);
+            try ensureRelocationIsSupportedForTargetImage(
+                view,
+                shstrtab,
+                symbols,
+                strtab,
+                rela,
+                target_section_name,
+                target_image,
+            );
             const symbol_address = resolveRelocationSymbolAddress(
                 prepared.section_map,
                 prepared.output_sections,
@@ -616,6 +638,109 @@ fn recordLinkDiagnostic(comptime fmt: []const u8, args: anytype) void {
         },
     };
     last_link_diagnostic_len = message.len;
+}
+
+/// Returns whether the target image will be rebased by the loader.
+///
+/// For ET_DYN binaries the static patcher only knows linked virtual addresses,
+/// while the runtime loader will choose the final load bias later. Any payload
+/// relocation that writes a full absolute address into code or data is
+/// therefore unsafe unless we also provide a runtime rebasing mechanism.
+fn targetImageRequiresPieSafeRelocations(target_image: ?ElfView) bool {
+    return target_image != null and target_image.?.ehdr.e_type == elf.ET.DYN;
+}
+
+/// Relocations in this bucket directly materialize a slide-sensitive absolute
+/// address.
+///
+/// They are safe for ET_EXEC, where the final runtime VA equals the linked VA,
+/// but must be rejected for ET_DYN until the payload runtime grows its own
+/// rebasing support.
+fn relocationEncodesAbsoluteAddress(relocation_type: u32) bool {
+    return switch (relocation_type) {
+        @intFromEnum(elf.R_AARCH64.ABS64),
+        @intFromEnum(elf.R_AARCH64.ABS32),
+        @intFromEnum(elf.R_AARCH64.ABS16),
+        @intFromEnum(elf.R_AARCH64.MOVW_UABS_G0),
+        @intFromEnum(elf.R_AARCH64.MOVW_UABS_G0_NC),
+        @intFromEnum(elf.R_AARCH64.MOVW_UABS_G1),
+        @intFromEnum(elf.R_AARCH64.MOVW_UABS_G1_NC),
+        @intFromEnum(elf.R_AARCH64.MOVW_UABS_G2),
+        @intFromEnum(elf.R_AARCH64.MOVW_UABS_G2_NC),
+        @intFromEnum(elf.R_AARCH64.MOVW_UABS_G3),
+        => true,
+        else => false,
+    };
+}
+
+/// `ADR_GOT_PAGE + LD64_GOT_LO12_NC` is currently unsafe for ET_DYN for a more
+/// subtle reason than the raw relocation names suggest: the instruction pair
+/// itself is page-relative, but the synthetic GOT slot it loads from contains a
+/// fully resolved absolute pointer.
+fn relocationUsesSyntheticGotSlot(relocation_type: u32) bool {
+    return switch (relocation_type) {
+        @intFromEnum(elf.R_AARCH64.ADR_GOT_PAGE),
+        @intFromEnum(elf.R_AARCH64.LD64_GOT_LO12_NC),
+        => true,
+        else => false,
+    };
+}
+
+/// Note that some relocation names still contain `ABS` even when they are safe
+/// for ET_DYN in practice.
+///
+/// Example: `ADD_ABS_LO12_NC` and `LDST*_ABS_LO12_NC` only inject the target's
+/// low 12 bits. In the standard PIC sequence those low bits are paired with an
+/// `ADRP`-derived page base, and a PIE slide does not perturb them.
+fn ensureRelocationIsSupportedForTargetImage(
+    view: ElfView,
+    shstrtab: []const u8,
+    symbols: []align(1) const elf.Elf64_Sym,
+    strtab: []const u8,
+    rela: elf.Elf64_Rela,
+    target_section_name: []const u8,
+    target_image: ?ElfView,
+) !void {
+    if (!targetImageRequiresPieSafeRelocations(target_image)) return;
+
+    const symbol_name = relocationSymbolName(view, shstrtab, symbols, strtab, rela.r_sym());
+
+    if (relocationUsesSyntheticGotSlot(rela.r_type())) {
+        recordLinkDiagnostic(
+            "unsupported AArch64 payload relocation {s} for symbol {s} in section {s} when linking into ET_DYN: current synthetic GOT slots store absolute addresses and are not PIE-safe",
+            .{
+                relocationNameString(rela.r_type()),
+                symbol_name,
+                target_section_name,
+            },
+        );
+        return error.UnsupportedPayloadRelocation;
+    }
+
+    if (relocationEncodesAbsoluteAddress(rela.r_type())) {
+        recordLinkDiagnostic(
+            "unsupported AArch64 payload relocation {s} for symbol {s} in section {s} when linking into ET_DYN: relocation materializes a slide-sensitive absolute address",
+            .{
+                relocationNameString(rela.r_type()),
+                symbol_name,
+                target_section_name,
+            },
+        );
+        return error.UnsupportedPayloadRelocation;
+    }
+}
+
+fn noteEtDynGotSlotFailure(view: ElfView, slot: GotSlot) !void {
+    if (slot.key.symtab_section_index >= view.shdrs.len) return error.InvalidPayloadRelocationSymtab;
+    const symtab_shdr = view.shdrs[slot.key.symtab_section_index];
+    const symbols = try symbolTable(view, symtab_shdr);
+    const strtab = try linkedStringTable(view, symtab_shdr);
+    const symbol_name = relocationSymbolName(view, try sectionStringTable(view), symbols, strtab, slot.key.symbol_index);
+
+    recordLinkDiagnostic(
+        "unsupported AArch64 payload relocation ADR_GOT_PAGE/LD64_GOT_LO12_NC for symbol {s} when linking into ET_DYN: current synthetic GOT slots store absolute addresses and are not PIE-safe",
+        .{symbol_name},
+    );
 }
 
 const RelocationOperands = struct {

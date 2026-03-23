@@ -8,7 +8,9 @@ const replay = @import("replay_plan.zig");
 pub const original_trampoline_size: usize = 20;
 pub const nop_instruction: u32 = 0xD503_201F;
 pub const max_stolen_instruction_count: usize = 4;
-pub const absolute_detour_size: usize = 16;
+pub const long_detour_size: usize = 16;
+/// Legacy export name retained for compatibility with older callers/tests.
+pub const absolute_detour_size: usize = long_detour_size;
 pub const ldr_x17_literal_8: u32 = 0x5800_0051;
 pub const br_x17: u32 = 0xD61F_0220;
 /// Legacy export name retained for compatibility with older callers/tests.
@@ -263,26 +265,50 @@ pub fn buildRawTrampoline(
 ) ![]u8 {
     if ((stolen_bytes.len & 0x3) != 0) return error.InvalidStolenInstructionBytes;
 
-    const total_size = stolen_bytes.len + absolute_detour_size;
+    const total_size = stolen_bytes.len + long_detour_size;
     var buffer = try allocator.alloc(u8, total_size);
     errdefer allocator.free(buffer);
 
     @memcpy(buffer[0..stolen_bytes.len], stolen_bytes);
     try writeResumeDetour(
-        buffer[stolen_bytes.len .. stolen_bytes.len + absolute_detour_size],
+        buffer[stolen_bytes.len .. stolen_bytes.len + long_detour_size],
         trampoline_address + stolen_bytes.len,
         resume_pc,
     );
     return buffer;
 }
 
-/// Builds a patch-site detour that can reach any 64-bit address without being
-/// limited by the ±128 MiB range of AArch64 `b`.
+/// Builds a 16-byte page-relative detour that remains valid after a PIE / ASLR
+/// slide.
 ///
-/// Layout:
-/// 1. `ldr x17, #8`
-/// 2. `br  x17`
-/// 3. embedded 64-bit target address literal
+/// The sequence is:
+/// 1. `adrp x17, target`
+/// 2. `add  x17, x17, :lo12:target`
+/// 3. `br   x17`
+/// 4. `nop`
+///
+/// Why this is PIE-safe:
+/// - the runtime loader adds the same page-aligned load bias to both the hook
+///   site and the injected payload blob
+/// - the `adrp` page delta therefore stays invariant under the slide
+/// - the low 12 bits consumed by the `add` are also invariant because page
+///   alignment guarantees that ASLR does not perturb them
+///
+/// This detour is still intended for in-image control flow, not for arbitrary
+/// unrelated 64-bit addresses. `adrp` carries a signed 21-bit page delta, so
+/// the target must stay within roughly ±4 GiB of the detour site.
+pub fn buildLongDetour(from_address: u64, target_address: u64) ![long_detour_size]u8 {
+    var buffer: [long_detour_size]u8 = undefined;
+    writeU32(buffer[0..4], try encodeAdrpTarget(17, from_address, target_address));
+    writeU32(buffer[4..8], encodeAddLo12Immediate(17, 17, target_address));
+    writeU32(buffer[8..12], encodeBr(17));
+    writeU32(buffer[12..16], nop);
+    return buffer;
+}
+
+/// Legacy literal detour retained for compatibility with older experiments and
+/// tests. The current rewriter prefers `buildLongDetour` because the embedded
+/// absolute pointer emitted here is not PIE-safe.
 pub fn buildAbsoluteDetour(target_address: u64) [absolute_detour_size]u8 {
     var buffer: [absolute_detour_size]u8 = undefined;
     writeU32(buffer[0..4], ldr_x17_literal_8);
@@ -296,11 +322,11 @@ fn writeResumeDetour(
     from_address: u64,
     target_address: u64,
 ) !void {
-    std.debug.assert(dest.len == absolute_detour_size);
+    std.debug.assert(dest.len == long_detour_size);
 
     const branch_opcode = encodeBranchImmediate(from_address, target_address) catch |err| switch (err) {
         error.BranchOutOfRange => {
-            const detour = buildAbsoluteDetour(target_address);
+            const detour = try buildLongDetour(from_address, target_address);
             @memcpy(dest, &detour);
             return;
         },
@@ -1004,10 +1030,39 @@ fn encodeMovZ(rd: u5, imm16: u16) u32 {
     return 0xD280_0000 | (@as(u32, imm16) << 5) | rd;
 }
 
+/// Encodes `adrp rd, target`.
+///
+/// `adrp` does not carry a full address. It carries a signed page delta from
+/// the instruction's own page to the target page. That is exactly what we want
+/// for the long-detour fallback because the runtime loader slides both pages by
+/// the same load bias.
+fn encodeAdrpTarget(rd: u5, from_address: u64, target_address: u64) !u32 {
+    const from_page = from_address & ~@as(u64, 0xFFF);
+    const target_page = target_address & ~@as(u64, 0xFFF);
+    const page_delta = @as(i128, @intCast(target_page)) - @as(i128, @intCast(from_page));
+    if (page_delta < std.math.minInt(i64) or page_delta > std.math.maxInt(i64)) {
+        return error.BranchOutOfRange;
+    }
+
+    const raw = try encodeSignedPcImmediate(21, @intCast(page_delta), 12);
+    return 0x9000_0000 |
+        ((raw & 0x3) << 29) |
+        (((raw >> 2) & 0x7FFFF) << 5) |
+        rd;
+}
+
+/// Encodes the low-12-bit half of an `adrp`+`add` address materialization.
+///
+/// Only the target's low page offset is inserted here. The corresponding page
+/// base already comes from `adrp`, which is why this instruction stays valid
+/// after the image is slid as a whole.
+fn encodeAddLo12Immediate(rd: u5, rn: u5, target_address: u64) u32 {
+    const imm12: u32 = @intCast(target_address & 0xFFF);
+    return 0x9100_0000 | (imm12 << 10) | (@as(u32, rn) << 5) | rd;
+}
+
 fn encodeAdrDelta(rd: u5, byte_offset: i64) !u32 {
-    if (byte_offset < -0x10_0000 or byte_offset > 0x0f_ffff) return error.BranchOutOfRange;
-    const signed: i32 = @intCast(byte_offset);
-    const raw: u32 = @bitCast(signed);
+    const raw = try encodeSignedPcImmediate(21, byte_offset, 0);
     return 0x1000_0000 |
         ((raw & 0x3) << 29) |
         (((raw >> 2) & 0x7FFFF) << 5) |
@@ -1056,6 +1111,27 @@ fn encodeBranchDelta(byte_offset: i64) !u32 {
     if ((byte_offset & 0x3) != 0) return error.UnalignedBranchTarget;
     const imm26 = try encodeSignedBranchImmediate(26, byte_offset);
     return 0x1400_0000 | imm26;
+}
+
+/// Encodes the signed immediate field shared by `adr` / `adrp`.
+///
+/// `shift` is the architectural scale applied after decoding:
+/// - `0` for `adr`
+/// - `12` for `adrp`
+fn encodeSignedPcImmediate(comptime bits: u6, byte_offset: i64, shift: u6) !u32 {
+    if (shift != 0) {
+        const alignment_mask = (@as(i64, 1) << shift) - 1;
+        if ((byte_offset & alignment_mask) != 0) return error.UnalignedBranchTarget;
+    }
+
+    const scaled = byte_offset >> shift;
+    const min = -(@as(i64, 1) << (bits - 1));
+    const max = (@as(i64, 1) << (bits - 1)) - 1;
+    if (scaled < min or scaled > max) return error.BranchOutOfRange;
+
+    const signed: i32 = @intCast(scaled);
+    const raw: u32 = @bitCast(signed);
+    return raw & ((@as(u32, 1) << bits) - 1);
 }
 
 fn encodeSignedBranchImmediate(comptime bits: u6, byte_offset: i64) !u32 {
@@ -1132,7 +1208,22 @@ test "original trampoline resumes with a direct branch" {
     try std.testing.expectEqual(nop, std.mem.readInt(u32, trampoline[16..20], .little));
 }
 
-test "absolute detour stores a literal 64-bit target" {
+test "page-relative long detour stays stable across a PIE load bias" {
+    const linked_from: u64 = 0x1000_8000;
+    const linked_target: u64 = 0x1812_3456;
+    const slide: u64 = 0x0234_5000;
+
+    const linked = try buildLongDetour(linked_from, linked_target);
+    const runtime = try buildLongDetour(linked_from + slide, linked_target + slide);
+
+    try std.testing.expectEqualSlices(u8, &linked, &runtime);
+    try std.testing.expectEqual(try encodeAdrpTarget(17, linked_from, linked_target), std.mem.readInt(u32, linked[0..4], .little));
+    try std.testing.expectEqual(encodeAddLo12Immediate(17, 17, linked_target), std.mem.readInt(u32, linked[4..8], .little));
+    try std.testing.expectEqual(encodeBr(17), std.mem.readInt(u32, linked[8..12], .little));
+    try std.testing.expectEqual(nop, std.mem.readInt(u32, linked[12..16], .little));
+}
+
+test "legacy absolute detour helper stores a literal 64-bit target" {
     const target_address: u64 = 0x1122_3344_5566_7788;
     const detour = buildAbsoluteDetour(target_address);
 
