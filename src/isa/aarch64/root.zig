@@ -5,6 +5,7 @@ const replay = @import("replay_plan.zig");
 pub const original_trampoline_size: usize = 20;
 pub const nop_instruction: u32 = 0xD503_201F;
 pub const max_stolen_instruction_count: usize = 4;
+pub const absolute_detour_size: usize = 16;
 pub const ldr_x17_literal_8: u32 = 0x5800_0051;
 pub const br_x17: u32 = 0xD61F_0220;
 /// Legacy export name retained for compatibility with older callers/tests.
@@ -231,10 +232,9 @@ pub fn buildOriginalTrampoline(
 ) ![original_trampoline_size]u8 {
     var buffer: [original_trampoline_size]u8 = undefined;
     @memcpy(buffer[0..4], &original_instruction);
-    writeU32(buffer[4..8], try encodeBranchImmediate(trampoline_address + 4, resume_pc));
-    writeU32(buffer[8..12], nop);
-    writeU32(buffer[12..16], nop);
-    writeU32(buffer[16..20], nop);
+    writeResumeDetour(buffer[4..20], trampoline_address + 4, resume_pc) catch |err| switch (err) {
+        else => return err,
+    };
     return buffer;
 }
 
@@ -252,16 +252,54 @@ pub fn buildRawTrampoline(
 ) ![]u8 {
     if ((stolen_bytes.len & 0x3) != 0) return error.InvalidStolenInstructionBytes;
 
-    const total_size = stolen_bytes.len + @sizeOf(u32);
+    const total_size = stolen_bytes.len + absolute_detour_size;
     var buffer = try allocator.alloc(u8, total_size);
     errdefer allocator.free(buffer);
 
     @memcpy(buffer[0..stolen_bytes.len], stolen_bytes);
-    writeU32(
-        buffer[stolen_bytes.len .. stolen_bytes.len + 4],
-        try encodeBranchImmediate(trampoline_address + stolen_bytes.len, resume_pc),
+    try writeResumeDetour(
+        buffer[stolen_bytes.len .. stolen_bytes.len + absolute_detour_size],
+        trampoline_address + stolen_bytes.len,
+        resume_pc,
     );
     return buffer;
+}
+
+/// Builds a patch-site detour that can reach any 64-bit address without being
+/// limited by the ±128 MiB range of AArch64 `b`.
+///
+/// Layout:
+/// 1. `ldr x17, #8`
+/// 2. `br  x17`
+/// 3. embedded 64-bit target address literal
+pub fn buildAbsoluteDetour(target_address: u64) [absolute_detour_size]u8 {
+    var buffer: [absolute_detour_size]u8 = undefined;
+    writeU32(buffer[0..4], ldr_x17_literal_8);
+    writeU32(buffer[4..8], br_x17);
+    writeU64(buffer[8..16], target_address);
+    return buffer;
+}
+
+fn writeResumeDetour(
+    dest: []u8,
+    from_address: u64,
+    target_address: u64,
+) !void {
+    std.debug.assert(dest.len == absolute_detour_size);
+
+    const branch_opcode = encodeBranchImmediate(from_address, target_address) catch |err| switch (err) {
+        error.BranchOutOfRange => {
+            const detour = buildAbsoluteDetour(target_address);
+            @memcpy(dest, &detour);
+            return;
+        },
+        else => return err,
+    };
+
+    writeU32(dest[0..4], branch_opcode);
+    writeU32(dest[4..8], nop);
+    writeU32(dest[8..12], nop);
+    writeU32(dest[12..16], nop);
 }
 
 /// Builds the injected AArch64 instrument bridge.
@@ -993,4 +1031,13 @@ test "original trampoline resumes with a direct branch" {
     try std.testing.expectEqual(nop, std.mem.readInt(u32, trampoline[8..12], .little));
     try std.testing.expectEqual(nop, std.mem.readInt(u32, trampoline[12..16], .little));
     try std.testing.expectEqual(nop, std.mem.readInt(u32, trampoline[16..20], .little));
+}
+
+test "absolute detour stores a literal 64-bit target" {
+    const target_address: u64 = 0x1122_3344_5566_7788;
+    const detour = buildAbsoluteDetour(target_address);
+
+    try std.testing.expectEqual(ldr_x17_literal_8, std.mem.readInt(u32, detour[0..4], .little));
+    try std.testing.expectEqual(br_x17, std.mem.readInt(u32, detour[4..8], .little));
+    try std.testing.expectEqual(target_address, std.mem.readInt(u64, detour[8..16], .little));
 }

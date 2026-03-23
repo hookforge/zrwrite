@@ -1059,6 +1059,99 @@ test "bundle -> apply rejects widened patch windows with incoming interior branc
     );
 }
 
+test "bundle -> apply falls back to an absolute detour when stub is out of branch range" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const tmp_dir_path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(tmp_dir_path);
+
+    const input_path = try std.fs.path.join(allocator, &.{ tmp_dir_path, "far_detour_target" });
+    defer allocator.free(input_path);
+    const payload_path = try std.fs.path.join(allocator, &.{ tmp_dir_path, "far_detour_payload.o" });
+    defer allocator.free(payload_path);
+    const bundle_path = try std.fs.path.join(allocator, &.{ tmp_dir_path, "far_detour_payload.zrpb" });
+    defer allocator.free(bundle_path);
+    const output_path = try std.fs.path.join(allocator, &.{ tmp_dir_path, "far_detour_target.patched" });
+    defer allocator.free(output_path);
+
+    try runCommand(allocator, &.{
+        "zig",
+        "cc",
+        "-target",
+        "aarch64-linux-musl",
+        "-O0",
+        "-g0",
+        "-static",
+        "-fno-pic",
+        "-no-pie",
+        "-fno-stack-protector",
+        "-fno-sanitize=undefined",
+        "-fno-asynchronous-unwind-tables",
+        "tests/fixtures/far_detour_target.S",
+        "tests/fixtures/far_detour_main.c",
+        "-o",
+        input_path,
+    });
+
+    try runCommand(allocator, &.{
+        "zig",
+        "cc",
+        "-target",
+        "aarch64-linux-musl",
+        "-c",
+        "-fPIC",
+        "-g0",
+        "-fno-stack-protector",
+        "-fno-sanitize=undefined",
+        "-fno-asynchronous-unwind-tables",
+        "-I",
+        "include",
+        "tests/fixtures/payload.c",
+        "-o",
+        payload_path,
+    });
+
+    try zrwrite.bundle.writeToPath(allocator, bundle_path, .{
+        .target = .{
+            .arch = .aarch64,
+            .os = .linux,
+            .binary_format = .elf,
+        },
+        .payload_object_path = payload_path,
+        .payload_object_format = .elf,
+        .hooks = &.{
+            .{
+                .kind = .instrument,
+                .target = zrwrite.bundle.HookLocator.fromSymbol("far_patchpoint"),
+                .handler_symbol = "on_hit",
+                .stolen_instruction_count = 4,
+            },
+        },
+    });
+
+    const report = try zrwrite.apply.applyBundleFileToPath(allocator, bundle_path, input_path, output_path);
+
+    const output_bytes = try std.fs.cwd().readFileAlloc(allocator, output_path, std.math.maxInt(usize));
+    defer allocator.free(output_bytes);
+    const input_bytes = try std.fs.cwd().readFileAlloc(allocator, input_path, std.math.maxInt(usize));
+    defer allocator.free(input_bytes);
+
+    const input_view = try zrwrite.elf.View.parse(@constCast(input_bytes));
+    const target_address = try input_view.resolveSymbolAddress("far_patchpoint");
+    const target_file_offset = try input_view.addressToOffset(target_address);
+
+    try std.testing.expect(report.stub_address.? - report.target_address > 0x07FF_FFFC);
+    try std.testing.expectEqual(zrwrite.aarch64.ldr_x17_literal_8, try readLeU32(output_bytes, target_file_offset + 0));
+    try std.testing.expectEqual(zrwrite.aarch64.br_x17, try readLeU32(output_bytes, target_file_offset + 4));
+
+    const literal_ptr: *const [8]u8 = @ptrCast(output_bytes[target_file_offset + 8 .. target_file_offset + 16].ptr);
+    const literal_target = std.mem.readInt(u64, literal_ptr, .little);
+    try std.testing.expectEqual(report.stub_address.?, literal_target);
+}
+
 test "bundle -> apply resolves external target symbols for Zig payload calls" {
     const allocator = std.testing.allocator;
 

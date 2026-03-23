@@ -160,7 +160,7 @@ pub const Rewriter = struct {
             if (stolen_instruction_count == 1 and replay_plan.requiresRawTrampoline())
                 aarch64.original_trampoline_size
             else
-                stolen_window_size + @sizeOf(u32)
+                stolen_window_size + aarch64.absolute_detour_size
         else
             0;
         const stub_offset = std.mem.alignForward(usize, trampoline_offset + trampoline_size, 8);
@@ -251,14 +251,13 @@ pub const Rewriter = struct {
 
         try finalizeInjectedOutput(input_view, output, plan, true);
 
-        const branch_opcode = try aarch64.encodeBranchImmediate(target.address, stub_address);
-        writeU32(output[target.file_offset .. target.file_offset + 4], branch_opcode);
-        for (1..stolen_instruction_count) |index| {
-            writeU32(
-                output[target.file_offset + index * 4 .. target.file_offset + (index + 1) * 4],
-                aarch64.nop_instruction,
-            );
-        }
+        try writeInstrumentDetourPatch(
+            output,
+            target.file_offset,
+            target.address,
+            stub_address,
+            stolen_instruction_count,
+        );
 
         self.installOutput(output);
 
@@ -442,6 +441,59 @@ fn replayBranchTarget(plan: aarch64.ReplayPlan) ?u64 {
         .test_bit_and_branch => |op| op.target,
         else => null,
     };
+}
+
+/// Emits the final patch-site detour.
+///
+/// Fast path:
+/// - use the classic single-word `b stub` when the injected bridge stays within
+///   AArch64's ±128 MiB immediate-branch range
+///
+/// Fallback:
+/// - if the hook already widened the patch window to at least 16 bytes, emit a
+///   literal long jump (`ldr x17, #8; br x17; .quad stub_address`)
+///
+/// This keeps the existing compact encoding for common nearby injections while
+/// finally allowing large in-image distances without forcing the payload blob to
+/// remain branch-reachable from the original hook site.
+fn writeInstrumentDetourPatch(
+    output: []u8,
+    target_file_offset: usize,
+    target_address: u64,
+    stub_address: u64,
+    stolen_instruction_count: usize,
+) !void {
+    const stolen_window_size = stolen_instruction_count * 4;
+    const branch_opcode = aarch64.encodeBranchImmediate(target_address, stub_address) catch |err| switch (err) {
+        error.BranchOutOfRange => {
+            if (stolen_window_size < aarch64.absolute_detour_size) {
+                return error.InsufficientPatchWindowForLongDetour;
+            }
+
+            const detour = aarch64.buildAbsoluteDetour(stub_address);
+            @memcpy(
+                output[target_file_offset .. target_file_offset + aarch64.absolute_detour_size],
+                &detour,
+            );
+
+            for (aarch64.absolute_detour_size / 4..stolen_instruction_count) |index| {
+                writeU32(
+                    output[target_file_offset + index * 4 .. target_file_offset + (index + 1) * 4],
+                    aarch64.nop_instruction,
+                );
+            }
+            return;
+        },
+        else => return err,
+    };
+
+    writeU32(output[target_file_offset .. target_file_offset + 4], branch_opcode);
+    for (1..stolen_instruction_count) |index| {
+        writeU32(
+            output[target_file_offset + index * 4 .. target_file_offset + (index + 1) * 4],
+            aarch64.nop_instruction,
+        );
+    }
 }
 
 /// Chooses where the injected payload blob will live inside the output image.

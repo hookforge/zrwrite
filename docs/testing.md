@@ -60,6 +60,7 @@ Useful remote smoke scripts:
 bash scripts/orb_encrypt_replace_demo.sh
 bash scripts/orb_semantic_instrument_demo.sh
 bash scripts/orb_condbr_demo.sh
+bash scripts/orb_long_detour_demo.sh
 bash scripts/orb_tstbr_demo.sh
 bash scripts/orb_x16_resume_demo.sh
 bash scripts/orb_x17_resume_demo.sh
@@ -84,6 +85,11 @@ state on real Linux/AArch64 hardware.
 that `zrwrite` can steal and replay a 4-instruction straight-line window, patch
 the extra overwritten instructions with `nop`, and still resume correctly on
 real Linux/AArch64 hardware.
+
+`orb_long_detour_demo.sh` is the widened-window range-escape smoke. It forces
+the injected bridge more than ±128 MiB away from the hook site and validates
+that `zrwrite` falls back to a 16-byte absolute detour at the patch site while
+still replaying the stolen instructions correctly on Orb.
 
 `orb_condbr_demo.sh` is the dedicated runtime smoke for
 `R_AARCH64_CONDBR19`. It proves that a payload whose callback contains a
