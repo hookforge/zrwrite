@@ -20,6 +20,7 @@ pub const FpRegistersNamed = sdk_mod.FpRegistersNamed;
 pub const FpRegisters = sdk_mod.FpRegisters;
 pub const HookContext = sdk_mod.HookContext;
 pub const InstrumentCallback = sdk_mod.InstrumentCallback;
+pub const PayloadLayout = core.payload.PayloadLayout;
 
 pub const Rewriter = core.rewriter.Rewriter;
 pub const InstrumentHookSpec = core.rewriter.InstrumentHookSpec;

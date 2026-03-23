@@ -61,6 +61,9 @@ bash scripts/orb_encrypt_replace_demo.sh
 bash scripts/orb_semantic_instrument_demo.sh
 bash scripts/orb_x16_resume_demo.sh
 bash scripts/orb_x17_resume_demo.sh
+bash scripts/orb_zig_payload_demo.sh
+bash scripts/orb_zig_external_call_demo.sh
+bash scripts/orb_zig_external_data_demo.sh
 ```
 
 `orb_x16_resume_demo.sh` is the dedicated runtime regression for the resume
@@ -72,3 +75,16 @@ machine.
 when the callback leaves `ctx.sp` / `ctx.pc` on the bridge-owned replay path, a
 callback write to `ctx.regs.x17` now also survives back into live execution
 state on real Linux/AArch64 hardware.
+
+`orb_zig_payload_demo.sh` is the first end-to-end ELF/AArch64 mini-linker smoke
+for a real Zig-authored payload object. It exercises `.rodata`, `.data`, `.bss`
+layout plus relocation fixups before validating runtime behavior on Orb.
+
+`orb_zig_external_call_demo.sh` extends that coverage to undefined-symbol
+resolution against the target ELF image itself, including a direct `CALL26`
+relocation and a relocated function pointer stored in payload `.data`.
+
+`orb_zig_external_data_demo.sh` extends the undefined-symbol coverage to Zig
+`extern var` data accesses. That path now exercises synthetic payload-local GOT
+slots plus `ADR_GOT_PAGE` / `LD64_GOT_LO12_NC` relocations before validating
+real Linux/AArch64 runtime behavior on Orb.

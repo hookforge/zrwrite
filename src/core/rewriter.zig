@@ -131,11 +131,14 @@ pub const Rewriter = struct {
         const original_opcode = readU32(original_instruction[0..]);
         const replay_plan = try aarch64.planReplay(target.address, original_opcode);
 
-        const loaded_payload = try payload.loadTextOnlyObjectBytes(self.allocator, spec.payload_object_bytes, spec.handler_symbol);
-        defer self.allocator.free(loaded_payload.text);
+        // The mini-linker runs in two phases:
+        // 1. analyze the object so we know how large the injected image must be
+        // 2. after the final injection VA is chosen, link/relocate the payload
+        //    against that concrete base address and the target ELF symbol set
+        const payload_layout = try payload.analyzeObjectBytes(self.allocator, spec.payload_object_bytes, spec.handler_symbol);
 
         const callback_offset = 0;
-        const trampoline_offset = std.mem.alignForward(usize, loaded_payload.text.len, 8);
+        const trampoline_offset = std.mem.alignForward(usize, payload_layout.image_size, 8);
         const trampoline_size = if (replay_plan.requiresRawTrampoline()) aarch64.original_trampoline_size else 0;
         const stub_offset = std.mem.alignForward(usize, trampoline_offset + trampoline_size, 8);
 
@@ -154,12 +157,23 @@ pub const Rewriter = struct {
 
         const injected_size = stub_offset + stub_size;
         const plan = try planInjection(input_view, injected_size);
-        const callback_address = plan.payload_base_address + callback_offset + loaded_payload.entry_offset;
+        const callback_address = plan.payload_base_address + callback_offset + payload_layout.entry_offset;
         const trampoline_address = if (replay_plan.requiresRawTrampoline())
             plan.payload_base_address + trampoline_offset
         else
             0;
         const stub_address = plan.payload_base_address + stub_offset;
+
+        const loaded_payload = try payload.linkObjectBytes(
+            self.allocator,
+            spec.payload_object_bytes,
+            spec.handler_symbol,
+            plan.payload_base_address + callback_offset,
+            input_view,
+        );
+        defer self.allocator.free(loaded_payload.image);
+        std.debug.assert(loaded_payload.entry_offset == payload_layout.entry_offset);
+        std.debug.assert(loaded_payload.image.len == payload_layout.image_size);
 
         const fixed_stub = try aarch64.buildInstrumentStub(.{
             .allocator = self.allocator,
@@ -176,7 +190,10 @@ pub const Rewriter = struct {
         const output = try allocateInjectedOutput(self, plan);
         errdefer self.allocator.free(output);
 
-        @memcpy(output[plan.injection_offset + callback_offset .. plan.injection_offset + callback_offset + loaded_payload.text.len], loaded_payload.text);
+        @memcpy(
+            output[plan.injection_offset + callback_offset .. plan.injection_offset + callback_offset + loaded_payload.image.len],
+            loaded_payload.image,
+        );
 
         if (replay_plan.requiresRawTrampoline()) {
             const trampoline = try aarch64.buildOriginalTrampoline(
@@ -213,16 +230,29 @@ pub const Rewriter = struct {
         const input_view = try ElfView.parse(self.input_bytes);
         const target = try resolveTargetLocation(input_view, spec.target);
 
-        const loaded_payload = try payload.loadTextOnlyObjectBytes(self.allocator, spec.payload_object_bytes, spec.replacement_symbol);
-        defer self.allocator.free(loaded_payload.text);
+        // Replace hooks reuse the same two-phase payload mini-linker pipeline as
+        // instrument hooks; they simply do not need the extra trampoline/stub
+        // regions that wrap the linked payload image.
+        const payload_layout = try payload.analyzeObjectBytes(self.allocator, spec.payload_object_bytes, spec.replacement_symbol);
 
-        const injected_size = loaded_payload.text.len;
+        const injected_size = payload_layout.image_size;
         const plan = try planInjection(input_view, injected_size);
-        const payload_entry_address = plan.payload_base_address + loaded_payload.entry_offset;
+        const payload_entry_address = plan.payload_base_address + payload_layout.entry_offset;
+
+        const loaded_payload = try payload.linkObjectBytes(
+            self.allocator,
+            spec.payload_object_bytes,
+            spec.replacement_symbol,
+            plan.payload_base_address,
+            input_view,
+        );
+        defer self.allocator.free(loaded_payload.image);
+        std.debug.assert(loaded_payload.entry_offset == payload_layout.entry_offset);
+        std.debug.assert(loaded_payload.image.len == payload_layout.image_size);
 
         const output = try allocateInjectedOutput(self, plan);
         errdefer self.allocator.free(output);
-        @memcpy(output[plan.injection_offset .. plan.injection_offset + loaded_payload.text.len], loaded_payload.text);
+        @memcpy(output[plan.injection_offset .. plan.injection_offset + loaded_payload.image.len], loaded_payload.image);
 
         try finalizeInjectedOutput(input_view, output, plan, true);
 

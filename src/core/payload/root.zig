@@ -1,4 +1,9 @@
 pub const object = @import("object.zig");
+pub const PayloadLayout = object.PayloadLayout;
 pub const LoadedPayload = object.LoadedPayload;
+pub const analyzeObject = object.analyzeObject;
+pub const analyzeObjectBytes = object.analyzeObjectBytes;
+pub const linkObject = object.linkObject;
+pub const linkObjectBytes = object.linkObjectBytes;
 pub const loadTextOnlyObject = object.loadTextOnlyObject;
 pub const loadTextOnlyObjectBytes = object.loadTextOnlyObjectBytes;
