@@ -37,25 +37,32 @@ pub fn applyLoadedBundleToPath(
     if (manifest.target.arch != .aarch64) return error.UnsupportedBundleArchitecture;
     if (manifest.target.binary_format != .elf) return error.UnsupportedBundleBinaryFormat;
     if (manifest.payload.object_format != .elf) return error.UnsupportedPayloadObjectFormat;
-    if (manifest.hooks.len != 1) return error.MultipleHooksUnsupported;
+    if (manifest.hooks.len == 0) return error.MissingBundleHooks;
 
-    const hook = manifest.hooks[0];
     var rw = try rewriter.Rewriter.initPath(allocator, input_path);
     defer rw.deinit();
 
-    const report = switch (hook.kind) {
-        .instrument => try rw.addInstrumentHookObject(.{
-            .payload_object_bytes = owned_bundle.payload_object,
-            .target = hook.target,
-            .handler_symbol = hook.handler_symbol,
-            .log_message = hook.log_message,
-        }),
-        .replace => try rw.addReplaceHookObject(.{
-            .payload_object_bytes = owned_bundle.payload_object,
-            .target = hook.target,
-            .replacement_symbol = hook.handler_symbol,
-        }),
-    };
+    // `applyBundle*ToPath` historically returned one `RewriteReport`. Keep that
+    // surface stable by returning the final hook's report while still applying
+    // every hook in manifest order to the same evolving output image.
+    var report: ?ApplyReport = null;
+    for (manifest.hooks) |hook| {
+        report = switch (hook.kind) {
+            .instrument => try rw.addInstrumentHookObject(.{
+                .payload_object_bytes = owned_bundle.payload_object,
+                .target = hook.target,
+                .handler_symbol = hook.handler_symbol,
+                .log_message = hook.log_message,
+                .stolen_instruction_count = hook.stolen_instruction_count,
+            }),
+            .replace => try rw.addReplaceHookObject(.{
+                .payload_object_bytes = owned_bundle.payload_object,
+                .target = hook.target,
+                .replacement_symbol = hook.handler_symbol,
+            }),
+        };
+    }
+
     try rw.writeToPath(output_path);
-    return report;
+    return report.?;
 }

@@ -6,6 +6,13 @@ Static instrumentation works by displacing one instruction and redirecting
 control flow into an out-of-line helper. That only stays correct when the
 displaced instruction is safe to execute away from its original address.
 
+The current widening work extends that model to small straight-line windows,
+but only under an explicitly narrower policy:
+
+- multi-instruction windows must currently be raw-trampoline-safe
+- no direct branch may target the interior of the widened window
+- otherwise the patch must still fail closed
+
 Many AArch64 instructions are fine in a raw trampoline. Common PC-relative
 instructions are not.
 

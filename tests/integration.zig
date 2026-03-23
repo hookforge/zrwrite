@@ -205,6 +205,246 @@ test "bundle -> apply supports replace hook via virtual address locator" {
     try std.testing.expect(output_bytes.len > input_bytes.len);
 }
 
+test "bundle -> apply supports multiple instrument hooks in one ELF rewrite" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const tmp_dir_path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(tmp_dir_path);
+
+    const input_path = try std.fs.path.join(allocator, &.{ tmp_dir_path, "compute_pair" });
+    defer allocator.free(input_path);
+    const payload_path = try std.fs.path.join(allocator, &.{ tmp_dir_path, "payload.o" });
+    defer allocator.free(payload_path);
+    const bundle_path = try std.fs.path.join(allocator, &.{ tmp_dir_path, "compute_pair.zrpb" });
+    defer allocator.free(bundle_path);
+    const output_path = try std.fs.path.join(allocator, &.{ tmp_dir_path, "compute_pair.patched" });
+    defer allocator.free(output_path);
+
+    try runCommand(allocator, &.{
+        "zig",
+        "cc",
+        "-target",
+        "aarch64-linux-musl",
+        "-O0",
+        "-g0",
+        "-fno-pic",
+        "-no-pie",
+        "-fno-stack-protector",
+        "-fno-sanitize=undefined",
+        "-fno-asynchronous-unwind-tables",
+        "tests/fixtures/compute_pair.c",
+        "-o",
+        input_path,
+    });
+
+    try runCommand(allocator, &.{
+        "zig",
+        "cc",
+        "-target",
+        "aarch64-linux-musl",
+        "-c",
+        "-fPIC",
+        "-g0",
+        "-fno-stack-protector",
+        "-fno-sanitize=undefined",
+        "-fno-asynchronous-unwind-tables",
+        "-I",
+        "include",
+        "tests/fixtures/payload.c",
+        "-o",
+        payload_path,
+    });
+
+    try zrwrite.bundle.writeToPath(allocator, bundle_path, .{
+        .target = .{
+            .arch = .aarch64,
+            .os = .linux,
+            .binary_format = .elf,
+        },
+        .payload_object_path = payload_path,
+        .payload_object_format = .elf,
+        .hooks = &.{
+            .{
+                .kind = .instrument,
+                .target = zrwrite.bundle.HookLocator.fromSymbol("compute_left"),
+                .handler_symbol = "on_hit",
+                .log_message = "zrwrite: pair hit\n",
+            },
+            .{
+                .kind = .instrument,
+                .target = zrwrite.bundle.HookLocator.fromSymbol("compute_right"),
+                .handler_symbol = "on_hit",
+                .log_message = "zrwrite: pair hit\n",
+            },
+        },
+    });
+
+    var loaded_bundle = try zrwrite.bundle.loadFromPath(allocator, bundle_path);
+    defer loaded_bundle.deinit();
+    try std.testing.expectEqual(@as(usize, 2), loaded_bundle.manifest().hooks.len);
+
+    const report = try zrwrite.apply.applyBundleFileToPath(allocator, bundle_path, input_path, output_path);
+
+    const input_bytes = try std.fs.cwd().readFileAlloc(allocator, input_path, std.math.maxInt(usize));
+    defer allocator.free(input_bytes);
+    const output_bytes = try std.fs.cwd().readFileAlloc(allocator, output_path, std.math.maxInt(usize));
+    defer allocator.free(output_bytes);
+
+    const input_view = try zrwrite.elf.View.parse(@constCast(input_bytes));
+    const left_address = try input_view.resolveSymbolAddress("compute_left");
+    const right_address = try input_view.resolveSymbolAddress("compute_right");
+    const left_file_offset = try input_view.addressToOffset(left_address);
+    const right_file_offset = try input_view.addressToOffset(right_address);
+
+    const left_branch_opcode = try readLeU32(output_bytes, left_file_offset);
+    const right_branch_opcode = try readLeU32(output_bytes, right_file_offset);
+    const left_branch_target = try zrwrite.aarch64.decodeBranchTarget(left_branch_opcode, left_address);
+    const right_branch_target = try zrwrite.aarch64.decodeBranchTarget(right_branch_opcode, right_address);
+
+    try std.testing.expect(left_branch_target != right_branch_target);
+    try std.testing.expect(left_branch_target > left_address);
+    try std.testing.expect(right_branch_target > right_address);
+    try std.testing.expectEqual(report.stub_address.?, right_branch_target);
+    try std.testing.expectEqual(2, countOccurrences(output_bytes, "zrwrite: pair hit\n"));
+    try std.testing.expect(output_bytes.len > input_bytes.len);
+}
+
+test "bundle meta json supports multiple hooks and resolves payload paths relative to the meta file" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makePath("payloads");
+    try tmp.dir.makePath("meta");
+
+    const tmp_dir_path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(tmp_dir_path);
+
+    const input_path = try std.fs.path.join(allocator, &.{ tmp_dir_path, "compute_pair" });
+    defer allocator.free(input_path);
+    const payload_path = try std.fs.path.join(allocator, &.{ tmp_dir_path, "payloads", "payload.o" });
+    defer allocator.free(payload_path);
+    const meta_path = try std.fs.path.join(allocator, &.{ tmp_dir_path, "meta", "bundle.meta.json" });
+    defer allocator.free(meta_path);
+    const bundle_path = try std.fs.path.join(allocator, &.{ tmp_dir_path, "compute_pair.meta.zrpb" });
+    defer allocator.free(bundle_path);
+    const output_path = try std.fs.path.join(allocator, &.{ tmp_dir_path, "compute_pair.meta.patched" });
+    defer allocator.free(output_path);
+
+    try runCommand(allocator, &.{
+        "zig",
+        "cc",
+        "-target",
+        "aarch64-linux-musl",
+        "-O0",
+        "-g0",
+        "-fno-pic",
+        "-no-pie",
+        "-fno-stack-protector",
+        "-fno-sanitize=undefined",
+        "-fno-asynchronous-unwind-tables",
+        "tests/fixtures/compute_pair.c",
+        "-o",
+        input_path,
+    });
+
+    try runCommand(allocator, &.{
+        "zig",
+        "cc",
+        "-target",
+        "aarch64-linux-musl",
+        "-c",
+        "-fPIC",
+        "-g0",
+        "-fno-stack-protector",
+        "-fno-sanitize=undefined",
+        "-fno-asynchronous-unwind-tables",
+        "-I",
+        "include",
+        "tests/fixtures/payload.c",
+        "-o",
+        payload_path,
+    });
+
+    const input_bytes = try std.fs.cwd().readFileAlloc(allocator, input_path, std.math.maxInt(usize));
+    defer allocator.free(input_bytes);
+    const input_view = try zrwrite.elf.View.parse(@constCast(input_bytes));
+    const left_address = try input_view.resolveSymbolAddress("compute_left");
+    const right_address = try input_view.resolveSymbolAddress("compute_right");
+    const meta_json = try std.fmt.allocPrint(
+        allocator,
+        \\{{
+        \\  "target": {{
+        \\    "arch": "aarch64",
+        \\    "os": "linux",
+        \\    "binary_format": "elf"
+        \\  }},
+        \\  "payload": {{
+        \\    "object_path": "../payloads/payload.o",
+        \\    "object_format": "elf"
+        \\  }},
+        \\  "hooks": [
+        \\    {{
+        \\      "kind": "instrument",
+        \\      "target": {{
+        \\        "kind": "virtual_address",
+        \\        "virtual_address": "0x{x}"
+        \\      }},
+        \\      "handler_symbol": "on_hit",
+        \\      "log_message": "zrwrite: meta hit\n"
+        \\    }},
+        \\    {{
+        \\      "kind": "instrument",
+        \\      "target": {{
+        \\        "kind": "virtual_address",
+        \\        "virtual_address": "0x{x}"
+        \\      }},
+        \\      "handler_symbol": "on_hit",
+        \\      "log_message": "zrwrite: meta hit\n"
+        \\    }}
+        \\  ]
+        \\}}
+    ,
+        .{ left_address, right_address },
+    );
+    defer allocator.free(meta_json);
+
+    try tmp.dir.writeFile(.{
+        .sub_path = "meta/bundle.meta.json",
+        .data = meta_json,
+    });
+
+    var owned_spec = try zrwrite.bundle.loadBuildSpecFromMetaPath(allocator, meta_path);
+    defer owned_spec.deinit();
+
+    const expected_payload_path = try std.fs.path.join(allocator, &.{ tmp_dir_path, "meta", "../payloads/payload.o" });
+    defer allocator.free(expected_payload_path);
+
+    try std.testing.expectEqualStrings(expected_payload_path, owned_spec.build_spec.payload_object_path);
+    try std.testing.expectEqual(@as(usize, 2), owned_spec.build_spec.hooks.len);
+
+    try zrwrite.bundle.writeToPath(allocator, bundle_path, owned_spec.build_spec);
+    _ = try zrwrite.apply.applyBundleFileToPath(allocator, bundle_path, input_path, output_path);
+
+    const output_bytes = try std.fs.cwd().readFileAlloc(allocator, output_path, std.math.maxInt(usize));
+    defer allocator.free(output_bytes);
+
+    const left_file_offset = try input_view.addressToOffset(left_address);
+    const right_file_offset = try input_view.addressToOffset(right_address);
+
+    const left_branch_opcode = try readLeU32(output_bytes, left_file_offset);
+    const right_branch_opcode = try readLeU32(output_bytes, right_file_offset);
+    const left_branch_target = try zrwrite.aarch64.decodeBranchTarget(left_branch_opcode, left_address);
+    const right_branch_target = try zrwrite.aarch64.decodeBranchTarget(right_branch_opcode, right_address);
+
+    try std.testing.expect(left_branch_target != right_branch_target);
+    try std.testing.expectEqual(2, countOccurrences(output_bytes, "zrwrite: meta hit\n"));
+}
+
 test "bundle -> apply accepts semantic replay instrument hook for linker-relaxed adr patchpoints" {
     const allocator = std.testing.allocator;
 
@@ -553,6 +793,272 @@ test "bundle -> apply links Zig payload sections and relocations into instrument
     try std.testing.expect(std.mem.indexOf(u8, output_bytes, "zrwrite zig payload hit\n") != null);
 }
 
+test "bundle -> apply supports public zrwrite + zrstd imports in Zig payloads" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const tmp_dir_path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(tmp_dir_path);
+
+    const input_path = try std.fs.path.join(allocator, &.{ tmp_dir_path, "zig_zrstd_target" });
+    defer allocator.free(input_path);
+    const payload_path = try std.fs.path.join(allocator, &.{ tmp_dir_path, "zig_zrstd_runtime.o" });
+    defer allocator.free(payload_path);
+    const bundle_path = try std.fs.path.join(allocator, &.{ tmp_dir_path, "zig_zrstd_runtime.zrpb" });
+    defer allocator.free(bundle_path);
+    const output_path = try std.fs.path.join(allocator, &.{ tmp_dir_path, "zig_zrstd_target.patched" });
+    defer allocator.free(output_path);
+
+    try runCommand(allocator, &.{
+        "zig",
+        "cc",
+        "-target",
+        "aarch64-linux-musl",
+        "-O0",
+        "-g0",
+        "-static",
+        "-fno-pic",
+        "-no-pie",
+        "-fno-stack-protector",
+        "-fno-sanitize=undefined",
+        "-fno-asynchronous-unwind-tables",
+        "tests/fixtures/zig_payload_target.S",
+        "tests/fixtures/zig_payload_main.c",
+        "-o",
+        input_path,
+    });
+
+    const emit_bin_arg = try std.fmt.allocPrint(allocator, "-femit-bin={s}", .{payload_path});
+    defer allocator.free(emit_bin_arg);
+
+    try runCommand(allocator, &.{
+        "zig",
+        "build-obj",
+        "-target",
+        "aarch64-linux-musl",
+        "-O",
+        "ReleaseSmall",
+        "-fstrip",
+        "--dep",
+        "zrwrite",
+        "--dep",
+        "zrstd",
+        "-Mroot=tests/fixtures/zig_zrstd_runtime.zig",
+        "-Mzrwrite=src/root.zig",
+        "-Mzrstd=src/zrstd/root.zig",
+        emit_bin_arg,
+    });
+
+    try zrwrite.bundle.writeToPath(allocator, bundle_path, .{
+        .target = .{
+            .arch = .aarch64,
+            .os = .linux,
+            .binary_format = .elf,
+        },
+        .payload_object_path = payload_path,
+        .payload_object_format = .elf,
+        .hooks = &.{
+            .{
+                .kind = .instrument,
+                .target = zrwrite.bundle.HookLocator.fromSymbol("zig_payload_patchpoint"),
+                .handler_symbol = "on_hit",
+                .log_message = "zrwrite zrstd payload hit\n",
+            },
+        },
+    });
+
+    const report = try zrwrite.apply.applyBundleFileToPath(allocator, bundle_path, input_path, output_path);
+
+    const output_bytes = try std.fs.cwd().readFileAlloc(allocator, output_path, std.math.maxInt(usize));
+    defer allocator.free(output_bytes);
+
+    const branch_ptr: *const [4]u8 = @ptrCast(output_bytes[report.target_file_offset .. report.target_file_offset + 4].ptr);
+    const branch_opcode = std.mem.readInt(u32, branch_ptr, .little);
+    const branch_target = try zrwrite.aarch64.decodeBranchTarget(branch_opcode, report.target_address);
+
+    try std.testing.expectEqual(report.stub_address.?, branch_target);
+    try std.testing.expect(report.trampoline_address != null);
+    try std.testing.expect(std.mem.indexOf(u8, output_bytes, "zrstd helper hit @0x") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output_bytes, "zrwrite zrstd payload hit\n") != null);
+}
+
+test "bundle -> apply replays widened straight-line patch windows" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const tmp_dir_path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(tmp_dir_path);
+
+    const input_path = try std.fs.path.join(allocator, &.{ tmp_dir_path, "wide_window_target" });
+    defer allocator.free(input_path);
+    const payload_path = try std.fs.path.join(allocator, &.{ tmp_dir_path, "wide_window_payload.o" });
+    defer allocator.free(payload_path);
+    const bundle_path = try std.fs.path.join(allocator, &.{ tmp_dir_path, "wide_window_payload.zrpb" });
+    defer allocator.free(bundle_path);
+    const output_path = try std.fs.path.join(allocator, &.{ tmp_dir_path, "wide_window_target.patched" });
+    defer allocator.free(output_path);
+
+    try runCommand(allocator, &.{
+        "zig",
+        "cc",
+        "-target",
+        "aarch64-linux-musl",
+        "-O0",
+        "-g0",
+        "-static",
+        "-fno-pic",
+        "-no-pie",
+        "-fno-stack-protector",
+        "-fno-sanitize=undefined",
+        "-fno-asynchronous-unwind-tables",
+        "tests/fixtures/wide_window_target.S",
+        "tests/fixtures/wide_window_main.c",
+        "-o",
+        input_path,
+    });
+
+    try runCommand(allocator, &.{
+        "zig",
+        "cc",
+        "-target",
+        "aarch64-linux-musl",
+        "-c",
+        "-fPIC",
+        "-g0",
+        "-fno-stack-protector",
+        "-fno-sanitize=undefined",
+        "-fno-asynchronous-unwind-tables",
+        "-I",
+        "include",
+        "tests/fixtures/payload.c",
+        "-o",
+        payload_path,
+    });
+
+    try zrwrite.bundle.writeToPath(allocator, bundle_path, .{
+        .target = .{
+            .arch = .aarch64,
+            .os = .linux,
+            .binary_format = .elf,
+        },
+        .payload_object_path = payload_path,
+        .payload_object_format = .elf,
+        .hooks = &.{
+            .{
+                .kind = .instrument,
+                .target = zrwrite.bundle.HookLocator.fromSymbol("wide_patchpoint"),
+                .handler_symbol = "on_hit",
+                .log_message = "zrwrite widened window hit\n",
+                .stolen_instruction_count = 4,
+            },
+        },
+    });
+
+    const report = try zrwrite.apply.applyBundleFileToPath(allocator, bundle_path, input_path, output_path);
+
+    const output_bytes = try std.fs.cwd().readFileAlloc(allocator, output_path, std.math.maxInt(usize));
+    defer allocator.free(output_bytes);
+
+    const input_bytes = try std.fs.cwd().readFileAlloc(allocator, input_path, std.math.maxInt(usize));
+    defer allocator.free(input_bytes);
+    const input_view = try zrwrite.elf.View.parse(@constCast(input_bytes));
+    const target_address = try input_view.resolveSymbolAddress("wide_patchpoint");
+    const target_file_offset = try input_view.addressToOffset(target_address);
+    const branch_ptr: *const [4]u8 = @ptrCast(output_bytes[target_file_offset .. target_file_offset + 4].ptr);
+    const branch_opcode = std.mem.readInt(u32, branch_ptr, .little);
+    const branch_target = try zrwrite.aarch64.decodeBranchTarget(branch_opcode, target_address);
+
+    try std.testing.expectEqual(report.stub_address.?, branch_target);
+    try std.testing.expect(report.trampoline_address != null);
+    try std.testing.expectEqual(zrwrite.aarch64.nop_instruction, try readLeU32(output_bytes, target_file_offset + 4));
+    try std.testing.expectEqual(zrwrite.aarch64.nop_instruction, try readLeU32(output_bytes, target_file_offset + 8));
+    try std.testing.expectEqual(zrwrite.aarch64.nop_instruction, try readLeU32(output_bytes, target_file_offset + 12));
+    try std.testing.expect(std.mem.indexOf(u8, output_bytes, "zrwrite widened window hit\n") != null);
+}
+
+test "bundle -> apply rejects widened patch windows with incoming interior branches" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const tmp_dir_path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(tmp_dir_path);
+
+    const input_path = try std.fs.path.join(allocator, &.{ tmp_dir_path, "wide_window_branch_target" });
+    defer allocator.free(input_path);
+    const payload_path = try std.fs.path.join(allocator, &.{ tmp_dir_path, "wide_window_branch_payload.o" });
+    defer allocator.free(payload_path);
+    const bundle_path = try std.fs.path.join(allocator, &.{ tmp_dir_path, "wide_window_branch_payload.zrpb" });
+    defer allocator.free(bundle_path);
+    const output_path = try std.fs.path.join(allocator, &.{ tmp_dir_path, "wide_window_branch_target.patched" });
+    defer allocator.free(output_path);
+
+    try runCommand(allocator, &.{
+        "zig",
+        "cc",
+        "-target",
+        "aarch64-linux-musl",
+        "-O0",
+        "-g0",
+        "-static",
+        "-fno-pic",
+        "-no-pie",
+        "-fno-stack-protector",
+        "-fno-sanitize=undefined",
+        "-fno-asynchronous-unwind-tables",
+        "tests/fixtures/wide_window_branch_target.S",
+        "tests/fixtures/wide_window_branch_main.c",
+        "-o",
+        input_path,
+    });
+
+    try runCommand(allocator, &.{
+        "zig",
+        "cc",
+        "-target",
+        "aarch64-linux-musl",
+        "-c",
+        "-fPIC",
+        "-g0",
+        "-fno-stack-protector",
+        "-fno-sanitize=undefined",
+        "-fno-asynchronous-unwind-tables",
+        "-I",
+        "include",
+        "tests/fixtures/payload.c",
+        "-o",
+        payload_path,
+    });
+
+    try zrwrite.bundle.writeToPath(allocator, bundle_path, .{
+        .target = .{
+            .arch = .aarch64,
+            .os = .linux,
+            .binary_format = .elf,
+        },
+        .payload_object_path = payload_path,
+        .payload_object_format = .elf,
+        .hooks = &.{
+            .{
+                .kind = .instrument,
+                .target = zrwrite.bundle.HookLocator.fromSymbol("wide_branch_patchpoint"),
+                .handler_symbol = "on_hit",
+                .stolen_instruction_count = 4,
+            },
+        },
+    });
+
+    try std.testing.expectError(
+        error.IncomingBranchIntoPatchWindow,
+        zrwrite.apply.applyBundleFileToPath(allocator, bundle_path, input_path, output_path),
+    );
+}
+
 test "bundle -> apply resolves external target symbols for Zig payload calls" {
     const allocator = std.testing.allocator;
 
@@ -800,6 +1306,174 @@ test "payload mini-linker patches cross-section TSTBR14 relocations" {
     try std.testing.expectEqual(image_base_address + 8, branch_target);
 }
 
+test "bundle -> apply supports composite Zig payload with external data, external call, and internal bss" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const tmp_dir_path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(tmp_dir_path);
+
+    const input_path = try std.fs.path.join(allocator, &.{ tmp_dir_path, "zig_composite_target" });
+    defer allocator.free(input_path);
+    const payload_path = try std.fs.path.join(allocator, &.{ tmp_dir_path, "zig_composite_runtime.o" });
+    defer allocator.free(payload_path);
+    const bundle_path = try std.fs.path.join(allocator, &.{ tmp_dir_path, "zig_composite_runtime.zrpb" });
+    defer allocator.free(bundle_path);
+    const output_path = try std.fs.path.join(allocator, &.{ tmp_dir_path, "zig_composite_target.patched" });
+    defer allocator.free(output_path);
+
+    try runCommand(allocator, &.{
+        "zig",
+        "cc",
+        "-target",
+        "aarch64-linux-musl",
+        "-O0",
+        "-g0",
+        "-static",
+        "-fno-pic",
+        "-no-pie",
+        "-fno-stack-protector",
+        "-fno-sanitize=undefined",
+        "-fno-asynchronous-unwind-tables",
+        "tests/fixtures/zig_composite_target.S",
+        "tests/fixtures/zig_composite_main.c",
+        "-o",
+        input_path,
+    });
+
+    const emit_bin_arg = try std.fmt.allocPrint(allocator, "-femit-bin={s}", .{payload_path});
+    defer allocator.free(emit_bin_arg);
+
+    try runCommand(allocator, &.{
+        "zig",
+        "build-obj",
+        "-target",
+        "aarch64-linux-musl",
+        "-O",
+        "ReleaseSmall",
+        "-fstrip",
+        "-I",
+        "include",
+        emit_bin_arg,
+        "tests/fixtures/zig_composite_runtime.zig",
+    });
+
+    try zrwrite.bundle.writeToPath(allocator, bundle_path, .{
+        .target = .{
+            .arch = .aarch64,
+            .os = .linux,
+            .binary_format = .elf,
+        },
+        .payload_object_path = payload_path,
+        .payload_object_format = .elf,
+        .hooks = &.{
+            .{
+                .kind = .instrument,
+                .target = zrwrite.bundle.HookLocator.fromSymbol("zig_composite_patchpoint"),
+                .handler_symbol = "on_hit",
+                .log_message = "zrwrite zig composite hit\n",
+            },
+        },
+    });
+
+    const report = try zrwrite.apply.applyBundleFileToPath(allocator, bundle_path, input_path, output_path);
+
+    const output_bytes = try std.fs.cwd().readFileAlloc(allocator, output_path, std.math.maxInt(usize));
+    defer allocator.free(output_bytes);
+
+    const branch_ptr: *const [4]u8 = @ptrCast(output_bytes[report.target_file_offset .. report.target_file_offset + 4].ptr);
+    const branch_opcode = std.mem.readInt(u32, branch_ptr, .little);
+    const branch_target = try zrwrite.aarch64.decodeBranchTarget(branch_opcode, report.target_address);
+
+    try std.testing.expectEqual(report.stub_address.?, branch_target);
+    try std.testing.expect(report.trampoline_address != null);
+    try std.testing.expect(std.mem.indexOf(u8, output_bytes, "zrwrite zig composite hit\n") != null);
+}
+
+test "payload mini-linker patches MOVW_UABS relocation sequences" {
+    const allocator = std.testing.allocator;
+
+    const source =
+        \\.text
+        \\.p2align 2
+        \\.global on_hit
+        \\.type on_hit,%function
+        \\on_hit:
+        \\    movz x0, #:abs_g3:helper
+        \\    movk x0, #:abs_g2_nc:helper
+        \\    movk x0, #:abs_g1_nc:helper
+        \\    movk x0, #:abs_g0_nc:helper
+        \\    ret
+        \\.size on_hit, .-on_hit
+        \\
+        \\.section .text.helper,"ax",@progbits
+        \\.p2align 2
+        \\.global helper
+        \\.type helper,%function
+        \\helper:
+        \\    ret
+        \\.size helper, .-helper
+        \\
+    ;
+
+    const object_bytes = try compileAarch64AssemblyObject(allocator, "movw_payload.S", source);
+    defer allocator.free(object_bytes);
+
+    const image_base_address: u64 = 0x6000_0000;
+    const loaded = try zrwrite.payload.linkObjectBytes(allocator, object_bytes, "on_hit", image_base_address, null);
+    defer allocator.free(loaded.image);
+
+    const g3 = extractMovWideImmediate(try readLeU32(loaded.image, 0));
+    const g2 = extractMovWideImmediate(try readLeU32(loaded.image, 4));
+    const g1 = extractMovWideImmediate(try readLeU32(loaded.image, 8));
+    const g0 = extractMovWideImmediate(try readLeU32(loaded.image, 12));
+    const materialized_address = (@as(u64, g3) << 48) |
+        (@as(u64, g2) << 32) |
+        (@as(u64, g1) << 16) |
+        @as(u64, g0);
+
+    try std.testing.expectEqual(image_base_address + 20, materialized_address);
+}
+
+test "payload linker stores unsupported relocation diagnostics with relocation and symbol names" {
+    const allocator = std.testing.allocator;
+
+    const source =
+        \\.text
+        \\.p2align 2
+        \\.global on_hit
+        \\.type on_hit,%function
+        \\on_hit:
+        \\    movz x0, #:prel_g0:helper
+        \\    ret
+        \\.size on_hit, .-on_hit
+        \\
+        \\.section .text.helper,"ax",@progbits
+        \\.p2align 2
+        \\.global helper
+        \\.type helper,%function
+        \\helper:
+        \\    ret
+        \\.size helper, .-helper
+        \\
+    ;
+
+    const object_bytes = try compileAarch64AssemblyObject(allocator, "unsupported_prel_movw.S", source);
+    defer allocator.free(object_bytes);
+
+    zrwrite.clearLastLinkDiagnostic();
+    try std.testing.expectError(
+        error.UnsupportedPayloadRelocation,
+        zrwrite.payload.linkObjectBytes(allocator, object_bytes, "on_hit", 0x7000_0000, null),
+    );
+
+    const diagnostic = zrwrite.lastLinkDiagnosticMessage() orelse return error.MissingDiagnostic;
+    try std.testing.expect(std.mem.indexOf(u8, diagnostic, "MOVW_PREL_G0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, diagnostic, "helper") != null);
+}
+
 fn compileAarch64AssemblyObject(
     allocator: std.mem.Allocator,
     source_name: []const u8,
@@ -845,6 +1519,22 @@ fn readLeU32(bytes: []const u8, offset: usize) !u32 {
     if (offset + @sizeOf(u32) > bytes.len) return error.EndOfStream;
     const ptr: *const [4]u8 = @ptrCast(bytes[offset .. offset + 4].ptr);
     return std.mem.readInt(u32, ptr, .little);
+}
+
+fn countOccurrences(haystack: []const u8, needle: []const u8) usize {
+    if (needle.len == 0) return 0;
+
+    var count: usize = 0;
+    var cursor: usize = 0;
+    while (std.mem.indexOfPos(u8, haystack, cursor, needle)) |index| {
+        count += 1;
+        cursor = index + needle.len;
+    }
+    return count;
+}
+
+fn extractMovWideImmediate(opcode: u32) u16 {
+    return @intCast((opcode >> 5) & 0xFFFF);
 }
 
 fn decodePcRelativeTarget(opcode: u32, site_address: u64, imm_bits: u6) !u64 {

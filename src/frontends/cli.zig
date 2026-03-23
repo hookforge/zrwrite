@@ -1,6 +1,7 @@
 const std = @import("std");
 const bundle = @import("../core/bundle.zig");
 const apply = @import("../core/apply.zig");
+const payload = @import("../core/payload/root.zig");
 const ElfView = @import("../format/elf/root.zig").View;
 
 pub fn main() !void {
@@ -11,6 +12,15 @@ pub fn main() !void {
     const args = try std.process.argsAlloc(allocator);
     defer std.process.argsFree(allocator, args);
 
+    dispatchCommand(allocator, args) catch |err| {
+        if (payload.lastLinkDiagnosticMessage()) |message| {
+            std.log.err("{s}", .{message});
+        }
+        return err;
+    };
+}
+
+fn dispatchCommand(allocator: std.mem.Allocator, args: []const []const u8) !void {
     if (args.len < 2) {
         printUsage();
         return;
@@ -32,15 +42,15 @@ pub fn main() !void {
 
 fn commandBundle(allocator: std.mem.Allocator, args: []const []const u8) !void {
     var output_path: ?[]const u8 = null;
+    var meta_path: ?[]const u8 = null;
     var payload_path: ?[]const u8 = null;
-    var handler_symbol: ?[]const u8 = null;
-    var log_message: []const u8 = "";
     var target_os = bundle.OperatingSystem.linux;
     var target_format = bundle.BinaryFormat.elf;
     var target_arch = bundle.Architecture.aarch64;
     var payload_format = bundle.ObjectFormat.elf;
-    var hook_kind = bundle.HookKind.instrument;
-    var locator = ParsedLocator{};
+    var hooks: std.ArrayList(bundle.HookSpec) = .empty;
+    defer hooks.deinit(allocator);
+    var pending_hook = PendingHook{};
 
     var index: usize = 0;
     while (index < args.len) : (index += 1) {
@@ -48,27 +58,35 @@ fn commandBundle(allocator: std.mem.Allocator, args: []const []const u8) !void {
         if (std.mem.eql(u8, flag, "--output")) {
             index += 1;
             output_path = args[index];
+        } else if (std.mem.eql(u8, flag, "--meta")) {
+            index += 1;
+            meta_path = args[index];
         } else if (std.mem.eql(u8, flag, "--payload")) {
             index += 1;
             payload_path = args[index];
         } else if (std.mem.eql(u8, flag, "--handler-symbol")) {
             index += 1;
-            handler_symbol = args[index];
+            pending_hook.handler_symbol = args[index];
         } else if (std.mem.eql(u8, flag, "--log-message")) {
             index += 1;
-            log_message = args[index];
+            pending_hook.log_message = args[index];
+        } else if (std.mem.eql(u8, flag, "--stolen-instructions")) {
+            index += 1;
+            pending_hook.stolen_instruction_count = try parseStolenInstructionCount(args[index]);
         } else if (std.mem.eql(u8, flag, "--hook-kind")) {
             index += 1;
-            hook_kind = try parseHookKind(args[index]);
+            pending_hook.kind = try parseHookKind(args[index]);
         } else if (std.mem.eql(u8, flag, "--target-symbol")) {
             index += 1;
-            try locator.setSymbol(args[index]);
+            try pending_hook.locator.setSymbol(args[index]);
         } else if (std.mem.eql(u8, flag, "--target-vaddr")) {
             index += 1;
-            try locator.setVirtualAddress(try parseInteger(args[index]));
+            try pending_hook.locator.setVirtualAddress(try parseInteger(args[index]));
         } else if (std.mem.eql(u8, flag, "--target-file-offset")) {
             index += 1;
-            try locator.setFileOffset(try parseInteger(args[index]));
+            try pending_hook.locator.setFileOffset(try parseInteger(args[index]));
+        } else if (std.mem.eql(u8, flag, "--next-hook")) {
+            try pending_hook.appendTo(allocator, &hooks);
         } else if (std.mem.eql(u8, flag, "--target-os")) {
             index += 1;
             target_os = try parseOs(args[index]);
@@ -86,6 +104,33 @@ fn commandBundle(allocator: std.mem.Allocator, args: []const []const u8) !void {
         }
     }
 
+    if (meta_path) |path| {
+        if (bundleInlineSpecPresent(
+            payload_path,
+            target_os,
+            target_format,
+            target_arch,
+            payload_format,
+            hooks.items.len,
+            pending_hook,
+        )) return error.MixedMetaAndInlineBundleFlags;
+
+        var owned_spec = try bundle.loadBuildSpecFromMetaPath(allocator, path);
+        defer owned_spec.deinit();
+        try bundle.writeToPath(
+            allocator,
+            output_path orelse return error.MissingOutputPath,
+            owned_spec.build_spec,
+        );
+        return;
+    }
+
+    if (pending_hook.hasAnyField()) {
+        try pending_hook.appendTo(allocator, &hooks);
+    } else if (hooks.items.len == 0) {
+        return error.MissingHookSpecification;
+    }
+
     try bundle.writeToPath(allocator, output_path orelse return error.MissingOutputPath, .{
         .target = .{
             .arch = target_arch,
@@ -94,14 +139,7 @@ fn commandBundle(allocator: std.mem.Allocator, args: []const []const u8) !void {
         },
         .payload_object_path = payload_path orelse return error.MissingPayloadPath,
         .payload_object_format = payload_format,
-        .hooks = &.{
-            .{
-                .kind = hook_kind,
-                .target = try locator.toHookLocator(),
-                .handler_symbol = handler_symbol orelse return error.MissingHandlerSymbol,
-                .log_message = log_message,
-            },
-        },
+        .hooks = hooks.items,
     });
 }
 
@@ -138,11 +176,11 @@ fn commandApply(allocator: std.mem.Allocator, args: []const []const u8) !void {
 fn commandRewriteShortcut(allocator: std.mem.Allocator, args: []const []const u8) !void {
     var input_path: ?[]const u8 = null;
     var output_path: ?[]const u8 = null;
+    var meta_path: ?[]const u8 = null;
     var payload_path: ?[]const u8 = null;
-    var handler_symbol: ?[]const u8 = null;
-    var log_message: []const u8 = "";
-    var hook_kind = bundle.HookKind.instrument;
-    var locator = ParsedLocator{};
+    var hooks: std.ArrayList(bundle.HookSpec) = .empty;
+    defer hooks.deinit(allocator);
+    var pending_hook = PendingHook{};
 
     var index: usize = 0;
     while (index < args.len) : (index += 1) {
@@ -153,30 +191,64 @@ fn commandRewriteShortcut(allocator: std.mem.Allocator, args: []const []const u8
         } else if (std.mem.eql(u8, flag, "--output")) {
             index += 1;
             output_path = args[index];
+        } else if (std.mem.eql(u8, flag, "--meta")) {
+            index += 1;
+            meta_path = args[index];
         } else if (std.mem.eql(u8, flag, "--payload")) {
             index += 1;
             payload_path = args[index];
         } else if (std.mem.eql(u8, flag, "--handler-symbol")) {
             index += 1;
-            handler_symbol = args[index];
+            pending_hook.handler_symbol = args[index];
         } else if (std.mem.eql(u8, flag, "--log-message")) {
             index += 1;
-            log_message = args[index];
+            pending_hook.log_message = args[index];
+        } else if (std.mem.eql(u8, flag, "--stolen-instructions")) {
+            index += 1;
+            pending_hook.stolen_instruction_count = try parseStolenInstructionCount(args[index]);
         } else if (std.mem.eql(u8, flag, "--hook-kind")) {
             index += 1;
-            hook_kind = try parseHookKind(args[index]);
+            pending_hook.kind = try parseHookKind(args[index]);
         } else if (std.mem.eql(u8, flag, "--target-symbol")) {
             index += 1;
-            try locator.setSymbol(args[index]);
+            try pending_hook.locator.setSymbol(args[index]);
         } else if (std.mem.eql(u8, flag, "--target-vaddr")) {
             index += 1;
-            try locator.setVirtualAddress(try parseInteger(args[index]));
+            try pending_hook.locator.setVirtualAddress(try parseInteger(args[index]));
         } else if (std.mem.eql(u8, flag, "--target-file-offset")) {
             index += 1;
-            try locator.setFileOffset(try parseInteger(args[index]));
+            try pending_hook.locator.setFileOffset(try parseInteger(args[index]));
+        } else if (std.mem.eql(u8, flag, "--next-hook")) {
+            try pending_hook.appendTo(allocator, &hooks);
         } else {
             return error.InvalidArgument;
         }
+    }
+
+    if (meta_path) |path| {
+        if (rewriteInlineSpecPresent(payload_path, hooks.items.len, pending_hook)) {
+            return error.MixedMetaAndInlineBundleFlags;
+        }
+
+        var owned_spec = try bundle.loadBuildSpecFromMetaPath(allocator, path);
+        defer owned_spec.deinit();
+
+        const bundle_bytes = try bundle.createBytes(allocator, owned_spec.build_spec);
+        defer allocator.free(bundle_bytes);
+
+        _ = try apply.applyBundleBytesToPath(
+            allocator,
+            bundle_bytes,
+            input_path orelse return error.MissingInputPath,
+            output_path orelse return error.MissingOutputPath,
+        );
+        return;
+    }
+
+    if (pending_hook.hasAnyField()) {
+        try pending_hook.appendTo(allocator, &hooks);
+    } else if (hooks.items.len == 0) {
+        return error.MissingHookSpecification;
     }
 
     const bundle_bytes = try bundle.createBytes(allocator, .{
@@ -187,14 +259,7 @@ fn commandRewriteShortcut(allocator: std.mem.Allocator, args: []const []const u8
         },
         .payload_object_path = payload_path orelse return error.MissingPayloadPath,
         .payload_object_format = .elf,
-        .hooks = &.{
-            .{
-                .kind = hook_kind,
-                .target = try locator.toHookLocator(),
-                .handler_symbol = handler_symbol orelse return error.MissingHandlerSymbol,
-                .log_message = log_message,
-            },
-        },
+        .hooks = hooks.items,
     });
     defer allocator.free(bundle_bytes);
 
@@ -275,6 +340,12 @@ fn parseInteger(value: []const u8) !u64 {
     return std.fmt.parseUnsigned(u64, value, 10);
 }
 
+fn parseStolenInstructionCount(value: []const u8) !u8 {
+    const parsed = try parseInteger(value);
+    if (parsed == 0 or parsed > std.math.maxInt(u8)) return error.InvalidStolenInstructionCount;
+    return @intCast(parsed);
+}
+
 const ParsedLocator = struct {
     seen: bool = false,
     locator: bundle.HookLocator = .{},
@@ -303,20 +374,91 @@ const ParsedLocator = struct {
     }
 };
 
+const PendingHook = struct {
+    kind: bundle.HookKind = .instrument,
+    locator: ParsedLocator = .{},
+    handler_symbol: ?[]const u8 = null,
+    log_message: []const u8 = "",
+    stolen_instruction_count: u8 = 1,
+
+    fn hasAnyField(self: PendingHook) bool {
+        return self.handler_symbol != null or
+            self.log_message.len != 0 or
+            self.locator.seen or
+            self.kind != .instrument or
+            self.stolen_instruction_count != 1;
+    }
+
+    fn appendTo(
+        self: *PendingHook,
+        allocator: std.mem.Allocator,
+        hooks: *std.ArrayList(bundle.HookSpec),
+    ) !void {
+        if (!self.hasAnyField()) return error.MissingHookSpecification;
+
+        try hooks.append(allocator, .{
+            .kind = self.kind,
+            .target = try self.locator.toHookLocator(),
+            .handler_symbol = self.handler_symbol orelse return error.MissingHandlerSymbol,
+            .log_message = self.log_message,
+            .stolen_instruction_count = self.stolen_instruction_count,
+        });
+        self.* = .{};
+    }
+};
+
+fn bundleInlineSpecPresent(
+    payload_path: ?[]const u8,
+    target_os: bundle.OperatingSystem,
+    target_format: bundle.BinaryFormat,
+    target_arch: bundle.Architecture,
+    payload_format: bundle.ObjectFormat,
+    hooks_len: usize,
+    pending_hook: PendingHook,
+) bool {
+    return payload_path != null or
+        target_os != .linux or
+        target_format != .elf or
+        target_arch != .aarch64 or
+        payload_format != .elf or
+        hooks_len != 0 or
+        pending_hook.hasAnyField();
+}
+
+fn rewriteInlineSpecPresent(
+    payload_path: ?[]const u8,
+    hooks_len: usize,
+    pending_hook: PendingHook,
+) bool {
+    return payload_path != null or hooks_len != 0 or pending_hook.hasAnyField();
+}
+
 fn printUsage() void {
     std.debug.print(
         \\usage:
         \\  zrwrite bundle --output <patch.zrpb> --payload <handler.o> --handler-symbol <symbol>
+        \\                 [--meta <bundle.meta.json>]
         \\                 [--hook-kind instrument|replace]
+        \\                 [--stolen-instructions <count>]
         \\                 (--target-symbol <symbol> | --target-vaddr <addr> | --target-file-offset <off>)
+        \\                 [--next-hook --handler-symbol <symbol> [--hook-kind instrument|replace]
+        \\                             [--stolen-instructions <count>]
+        \\                             (--target-symbol <symbol> | --target-vaddr <addr> | --target-file-offset <off>)
+        \\                             [--log-message <message>]]
         \\                 [--log-message <message>] [--target-arch aarch64|x86_64]
         \\                 [--target-os linux|macos] [--target-format elf|macho]
         \\                 [--payload-format elf|macho]
         \\  zrwrite apply --bundle <patch.zrpb> --input <binary> --output <binary>
         \\  zrwrite rewrite --input <binary> --output <binary> --payload <handler.o>
+        \\                  [--meta <bundle.meta.json>]
         \\                  --handler-symbol <symbol>
         \\                  [--hook-kind instrument|replace]
+        \\                  [--stolen-instructions <count>]
         \\                  (--target-symbol <symbol> | --target-vaddr <addr> | --target-file-offset <off>)
+        \\                  [--next-hook --handler-symbol <symbol> [--hook-kind instrument|replace]
+        \\                              [--stolen-instructions <count>]
+        \\                              (--target-symbol <symbol> | --target-vaddr <addr> | --target-file-offset <off>)
+        \\                              [--log-message <message>]]
         \\                  [--log-message <message>]
         \\  zrwrite inspect --input <binary> --symbol <symbol>
         \\

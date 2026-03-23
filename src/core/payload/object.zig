@@ -3,6 +3,10 @@ const elf = std.elf;
 const ElfView = @import("../../format/elf/root.zig").View;
 const getString = @import("../../format/elf/root.zig").getString;
 
+const link_diagnostic_capacity = 1024;
+threadlocal var last_link_diagnostic_buf: [link_diagnostic_capacity]u8 = undefined;
+threadlocal var last_link_diagnostic_len: usize = 0;
+
 pub const PayloadLayout = struct {
     image_size: usize,
     entry_offset: usize,
@@ -12,6 +16,22 @@ pub const LoadedPayload = struct {
     image: []u8,
     entry_offset: usize,
 };
+
+/// Clears the last payload-linker diagnostic.
+///
+/// The mini-linker stores a short human-readable explanation for the most
+/// recent structured link failure (for example an unsupported relocation).
+/// Frontends can query this after a call fails and surface a more useful error
+/// than Zig's bare error-set tag alone.
+pub fn clearLastLinkDiagnostic() void {
+    last_link_diagnostic_len = 0;
+}
+
+/// Returns the most recent payload-linker diagnostic, if any.
+pub fn lastLinkDiagnosticMessage() ?[]const u8 {
+    if (last_link_diagnostic_len == 0) return null;
+    return last_link_diagnostic_buf[0..last_link_diagnostic_len];
+}
 
 const OutputSection = struct {
     input_index: usize,
@@ -83,6 +103,7 @@ pub fn analyzeObjectBytes(
     object_bytes: []const u8,
     handler_symbol: []const u8,
 ) !PayloadLayout {
+    clearLastLinkDiagnostic();
     const mutable_bytes = @constCast(object_bytes);
     const view = try ElfView.parse(mutable_bytes);
     var prepared = try prepareObjectLayout(allocator, view, handler_symbol);
@@ -122,6 +143,7 @@ pub fn linkObjectBytes(
     image_base_address: u64,
     target_image: ?ElfView,
 ) !LoadedPayload {
+    clearLastLinkDiagnostic();
     const mutable_bytes = @constCast(object_bytes);
     const view = try ElfView.parse(mutable_bytes);
     var prepared = try prepareObjectLayout(allocator, view, handler_symbol);
@@ -416,6 +438,8 @@ fn applyRelocations(
     image_base_address: u64,
     target_image: ?ElfView,
 ) !void {
+    const shstrtab = try sectionStringTable(view);
+
     for (view.shdrs) |shdr| {
         if (shdr.sh_type != elf.SHT_RELA and shdr.sh_type != elf.SHT_REL) continue;
 
@@ -440,10 +464,11 @@ fn applyRelocations(
         const symbols = try symbolTable(view, symtab_shdr);
         const strtab = try linkedStringTable(view, symtab_shdr);
         const target_output_section = prepared.output_sections[mapped_target];
+        const target_section_name = getString(shstrtab, view.shdrs[target_section_index].sh_name);
 
         for (relas) |rela| {
             const patch_offset = try patchOffset(target_output_section, rela);
-            const symbol_address = try resolveRelocationSymbolAddress(
+            const symbol_address = resolveRelocationSymbolAddress(
                 prepared.section_map,
                 prepared.output_sections,
                 symbols,
@@ -451,7 +476,10 @@ fn applyRelocations(
                 rela.r_sym(),
                 image_base_address,
                 target_image,
-            );
+            ) catch |err| {
+                noteRelocationFailure(view, shstrtab, symbols, strtab, rela, target_section_name, err);
+                return err;
+            };
             const operands = try relocationOperands(
                 prepared.got_slots,
                 symtab_index,
@@ -460,14 +488,17 @@ fn applyRelocations(
                 symbol_address,
             );
             const place_address = try addAddressOffset(image_base_address, patch_offset);
-            try applyAarch64Relocation(
+            applyAarch64Relocation(
                 image,
                 patch_offset,
                 place_address,
                 operands.symbol_address,
                 operands.addend,
                 rela.r_type(),
-            );
+            ) catch |err| {
+                noteRelocationFailure(view, shstrtab, symbols, strtab, rela, target_section_name, err);
+                return err;
+            };
         }
     }
 }
@@ -513,6 +544,78 @@ fn resolveRelocationSymbolAddress(
             return addAddressOffset(image_base_address, output_section.output_offset + symbol_offset);
         },
     }
+}
+
+fn noteRelocationFailure(
+    view: ElfView,
+    shstrtab: []const u8,
+    symbols: []align(1) const elf.Elf64_Sym,
+    strtab: []const u8,
+    rela: elf.Elf64_Rela,
+    target_section_name: []const u8,
+    err: anyerror,
+) void {
+    switch (err) {
+        error.UnsupportedPayloadRelocation => {
+            const symbol_name = relocationSymbolName(view, shstrtab, symbols, strtab, rela.r_sym());
+            recordLinkDiagnostic(
+                "unsupported AArch64 payload relocation {s} for symbol {s} in section {s} (addend={d}, patch_offset=0x{x})",
+                .{
+                    relocationNameString(rela.r_type()),
+                    symbol_name,
+                    target_section_name,
+                    rela.r_addend,
+                    rela.r_offset,
+                },
+            );
+        },
+        error.UnsupportedPayloadExternalSymbol, error.SymbolNotFound => {
+            const symbol_name = relocationSymbolName(view, shstrtab, symbols, strtab, rela.r_sym());
+            recordLinkDiagnostic(
+                "unable to resolve payload external symbol {s} for relocation {s} in section {s}",
+                .{
+                    symbol_name,
+                    relocationNameString(rela.r_type()),
+                    target_section_name,
+                },
+            );
+        },
+        else => {},
+    }
+}
+
+fn relocationSymbolName(
+    view: ElfView,
+    shstrtab: []const u8,
+    symbols: []align(1) const elf.Elf64_Sym,
+    strtab: []const u8,
+    symbol_index: u32,
+) []const u8 {
+    if (symbol_index >= symbols.len) return "<invalid-symbol-index>";
+    const symbol = symbols[symbol_index];
+    if (symbol.st_name != 0) return getString(strtab, symbol.st_name);
+
+    if (symbol.st_shndx != elf.SHN_UNDEF and symbol.st_shndx < view.shdrs.len) {
+        return getString(shstrtab, view.shdrs[symbol.st_shndx].sh_name);
+    }
+
+    return "<unnamed-symbol>";
+}
+
+fn relocationNameString(relocation_type: u32) []const u8 {
+    const enum_value = std.meta.intToEnum(elf.R_AARCH64, relocation_type) catch return "<unknown-relocation>";
+    return @tagName(enum_value);
+}
+
+fn recordLinkDiagnostic(comptime fmt: []const u8, args: anytype) void {
+    const message = std.fmt.bufPrint(&last_link_diagnostic_buf, fmt, args) catch |err| switch (err) {
+        error.NoSpaceLeft => blk: {
+            const fallback = "payload link error (diagnostic truncated)";
+            @memcpy(last_link_diagnostic_buf[0..fallback.len], fallback);
+            break :blk fallback;
+        },
+    };
+    last_link_diagnostic_len = message.len;
 }
 
 const RelocationOperands = struct {
@@ -588,15 +691,57 @@ fn applyAarch64Relocation(
             const value = try absoluteAddressWithAddend(symbol_address, addend);
             try writeU64At(image, patch_offset, value);
         },
+        @intFromEnum(R.ABS16) => {
+            const value = try absoluteAddressWithAddend(symbol_address, addend);
+            if (value > std.math.maxInt(u16)) return error.PayloadRelocationOverflow;
+            try writeU16At(image, patch_offset, @intCast(value));
+        },
         @intFromEnum(R.ABS32) => {
             const value = try absoluteAddressWithAddend(symbol_address, addend);
             if (value > std.math.maxInt(u32)) return error.PayloadRelocationOverflow;
             try writeU32At(image, patch_offset, @intCast(value));
         },
+        @intFromEnum(R.PREL64) => {
+            const delta = try relativeDeltaWithAddend(symbol_address, addend, place_address);
+            try writeI64At(image, patch_offset, delta);
+        },
+        @intFromEnum(R.PREL16) => {
+            const delta = try relativeDeltaWithAddend(symbol_address, addend, place_address);
+            if (delta < std.math.minInt(i16) or delta > std.math.maxInt(i16)) return error.PayloadRelocationOverflow;
+            try writeI16At(image, patch_offset, @intCast(delta));
+        },
         @intFromEnum(R.PREL32) => {
             const delta = try relativeDeltaWithAddend(symbol_address, addend, place_address);
             if (delta < std.math.minInt(i32) or delta > std.math.maxInt(i32)) return error.PayloadRelocationOverflow;
             try writeI32At(image, patch_offset, @intCast(delta));
+        },
+        @intFromEnum(R.MOVW_UABS_G0) => {
+            const value = try absoluteAddressWithAddend(symbol_address, addend);
+            try patchMoveWideImmediate16(image, patch_offset, value, 0, true);
+        },
+        @intFromEnum(R.MOVW_UABS_G0_NC) => {
+            const value = try absoluteAddressWithAddend(symbol_address, addend);
+            try patchMoveWideImmediate16(image, patch_offset, value, 0, false);
+        },
+        @intFromEnum(R.MOVW_UABS_G1) => {
+            const value = try absoluteAddressWithAddend(symbol_address, addend);
+            try patchMoveWideImmediate16(image, patch_offset, value, 16, true);
+        },
+        @intFromEnum(R.MOVW_UABS_G1_NC) => {
+            const value = try absoluteAddressWithAddend(symbol_address, addend);
+            try patchMoveWideImmediate16(image, patch_offset, value, 16, false);
+        },
+        @intFromEnum(R.MOVW_UABS_G2) => {
+            const value = try absoluteAddressWithAddend(symbol_address, addend);
+            try patchMoveWideImmediate16(image, patch_offset, value, 32, true);
+        },
+        @intFromEnum(R.MOVW_UABS_G2_NC) => {
+            const value = try absoluteAddressWithAddend(symbol_address, addend);
+            try patchMoveWideImmediate16(image, patch_offset, value, 32, false);
+        },
+        @intFromEnum(R.MOVW_UABS_G3) => {
+            const value = try absoluteAddressWithAddend(symbol_address, addend);
+            try patchMoveWideImmediate16(image, patch_offset, value, 48, false);
         },
         @intFromEnum(R.CALL26), @intFromEnum(R.JUMP26) => {
             const delta = try relativeDeltaWithAddend(symbol_address, addend, place_address);
@@ -759,6 +904,31 @@ fn patchLiteralLoadImmediate19(image: []u8, patch_offset: usize, byte_delta: i64
     try writeU32At(image, patch_offset, instruction);
 }
 
+/// Patches the 16-bit immediate carried by `movz` / `movk` / `movn`.
+///
+/// For the supported unsigned absolute relocation family, the linker copies one
+/// 16-bit slice of `target_address` into the instruction's imm16 field. The
+/// checked variants (`MOVW_UABS_G0/G1/G2`) additionally require that no
+/// non-zero bits exist above the addressed slice.
+fn patchMoveWideImmediate16(
+    image: []u8,
+    patch_offset: usize,
+    target_address: u64,
+    shift: u6,
+    check_upper_bits: bool,
+) !void {
+    if (shift % 16 != 0 or shift > 48) return error.UnsupportedPayloadRelocation;
+
+    if (check_upper_bits and shift < 48) {
+        if ((target_address >> (shift + 16)) != 0) return error.PayloadRelocationOverflow;
+    }
+
+    const imm16 = @as(u16, @intCast((target_address >> shift) & 0xFFFF));
+    var instruction = try readU32At(image, patch_offset);
+    instruction = (instruction & ~(@as(u32, 0xFFFF) << 5)) | (@as(u32, imm16) << 5);
+    try writeU32At(image, patch_offset, instruction);
+}
+
 /// Patches the shared 12-bit immediate field used by `add` and unsigned
 /// load/store encodings.
 ///
@@ -799,16 +969,34 @@ fn writeU32At(image: []u8, offset: usize, value: u32) !void {
     @memcpy(image[offset .. offset + 4], std.mem.asBytes(&le));
 }
 
+fn writeU16At(image: []u8, offset: usize, value: u16) !void {
+    if (offset + @sizeOf(u16) > image.len) return error.PayloadRelocationOutOfRange;
+    var le = std.mem.nativeToLittle(u16, value);
+    @memcpy(image[offset .. offset + 2], std.mem.asBytes(&le));
+}
+
 fn writeU64At(image: []u8, offset: usize, value: u64) !void {
     if (offset + @sizeOf(u64) > image.len) return error.PayloadRelocationOutOfRange;
     var le = std.mem.nativeToLittle(u64, value);
     @memcpy(image[offset .. offset + 8], std.mem.asBytes(&le));
 }
 
+fn writeI16At(image: []u8, offset: usize, value: i16) !void {
+    if (offset + @sizeOf(i16) > image.len) return error.PayloadRelocationOutOfRange;
+    var le = std.mem.nativeToLittle(i16, value);
+    @memcpy(image[offset .. offset + 2], std.mem.asBytes(&le));
+}
+
 fn writeI32At(image: []u8, offset: usize, value: i32) !void {
     if (offset + @sizeOf(i32) > image.len) return error.PayloadRelocationOutOfRange;
     var le = std.mem.nativeToLittle(i32, value);
     @memcpy(image[offset .. offset + 4], std.mem.asBytes(&le));
+}
+
+fn writeI64At(image: []u8, offset: usize, value: i64) !void {
+    if (offset + @sizeOf(i64) > image.len) return error.PayloadRelocationOutOfRange;
+    var le = std.mem.nativeToLittle(i64, value);
+    @memcpy(image[offset .. offset + 8], std.mem.asBytes(&le));
 }
 
 fn sliceStructs(comptime T: type, bytes: []u8, offset: usize, count: usize) []align(1) T {

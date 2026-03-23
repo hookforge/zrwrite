@@ -8,3 +8,5 @@ pub const linkObject = impl.linkObject;
 pub const linkObjectBytes = impl.linkObjectBytes;
 pub const loadTextOnlyObject = impl.loadTextOnlyObject;
 pub const loadTextOnlyObjectBytes = impl.loadTextOnlyObjectBytes;
+pub const clearLastLinkDiagnostic = impl.clearLastLinkDiagnostic;
+pub const lastLinkDiagnosticMessage = impl.lastLinkDiagnosticMessage;

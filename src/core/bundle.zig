@@ -72,11 +72,30 @@ pub const PayloadSpec = struct {
     object_format: ObjectFormat = .elf,
 };
 
+pub const MetaPayloadSpec = struct {
+    object_path: []const u8,
+    object_format: ObjectFormat = .elf,
+};
+
+pub const MetaHookLocator = struct {
+    kind: HookTargetKind = .symbol,
+    symbol: []const u8 = "",
+    virtual_address: []const u8 = "",
+    file_offset: []const u8 = "",
+};
+
 pub const HookSpec = struct {
     kind: HookKind = .instrument,
     target: HookLocator,
     handler_symbol: []const u8,
     log_message: []const u8 = "",
+    /// Number of contiguous 32-bit instructions to steal starting at the hook
+    /// site. `1` keeps the classic single-instruction detour behavior.
+    ///
+    /// Current Linux/ELF AArch64 limitation:
+    /// - values greater than `1` are supported only for straight-line windows
+    ///   whose displaced instructions are all raw-trampoline-safe
+    stolen_instruction_count: u8 = 1,
 };
 
 pub const Manifest = struct {
@@ -91,6 +110,20 @@ pub const BuildSpec = struct {
     payload_object_path: []const u8,
     payload_object_format: ObjectFormat = .elf,
     hooks: []const HookSpec,
+};
+
+pub const MetaBuildSpec = struct {
+    target: TargetSpec,
+    payload: MetaPayloadSpec,
+    hooks: []const MetaHookSpec,
+};
+
+pub const MetaHookSpec = struct {
+    kind: HookKind = .instrument,
+    target: MetaHookLocator,
+    handler_symbol: []const u8,
+    log_message: []const u8 = "",
+    stolen_instruction_count: u8 = 1,
 };
 
 const Header = extern struct {
@@ -117,6 +150,20 @@ pub const OwnedBundle = struct {
     }
 };
 
+/// Keeps the parsed meta JSON alive while exposing the resolved `BuildSpec`.
+///
+/// The returned `build_spec` borrows storage from the parsed JSON arena, so the
+/// caller must keep this object alive until bundle creation is finished.
+pub const OwnedBuildSpec = struct {
+    parsed: std.json.Parsed(MetaBuildSpec),
+    build_spec: BuildSpec,
+
+    pub fn deinit(self: *OwnedBuildSpec) void {
+        self.parsed.deinit();
+        self.* = undefined;
+    }
+};
+
 pub fn writeToPath(allocator: std.mem.Allocator, output_path: []const u8, spec: BuildSpec) !void {
     const bundle_bytes = try createBytes(allocator, spec);
     defer allocator.free(bundle_bytes);
@@ -130,6 +177,55 @@ pub fn createBytes(allocator: std.mem.Allocator, spec: BuildSpec) ![]u8 {
     const payload_bytes = try std.fs.cwd().readFileAlloc(allocator, spec.payload_object_path, std.math.maxInt(usize));
     defer allocator.free(payload_bytes);
     return createBytesFromPayload(allocator, spec, payload_bytes);
+}
+
+/// Load a human-authored JSON bundle description.
+///
+/// `payload.object_path` is resolved relative to the meta file location so a
+/// multi-hook project can keep its payload object and meta file together
+/// without relying on the caller's current working directory.
+pub fn loadBuildSpecFromMetaPath(allocator: std.mem.Allocator, meta_path: []const u8) !OwnedBuildSpec {
+    const bytes = try std.fs.cwd().readFileAlloc(allocator, meta_path, std.math.maxInt(usize));
+    defer allocator.free(bytes);
+    return loadBuildSpecFromMetaBytes(allocator, meta_path, bytes);
+}
+
+pub fn loadBuildSpecFromMetaBytes(
+    allocator: std.mem.Allocator,
+    meta_path: []const u8,
+    meta_bytes: []const u8,
+) !OwnedBuildSpec {
+    var parsed = try std.json.parseFromSlice(MetaBuildSpec, allocator, meta_bytes, .{
+        .ignore_unknown_fields = false,
+        .allocate = .alloc_always,
+    });
+    errdefer parsed.deinit();
+
+    const resolved_payload_path = try resolveMetaRelativePath(
+        parsed.arena.allocator(),
+        meta_path,
+        parsed.value.payload.object_path,
+    );
+    const resolved_hooks = try parsed.arena.allocator().alloc(HookSpec, parsed.value.hooks.len);
+    for (parsed.value.hooks, resolved_hooks) |meta_hook, *resolved_hook| {
+        resolved_hook.* = .{
+            .kind = meta_hook.kind,
+            .target = try resolveMetaHookLocator(meta_hook.target),
+            .handler_symbol = meta_hook.handler_symbol,
+            .log_message = meta_hook.log_message,
+            .stolen_instruction_count = meta_hook.stolen_instruction_count,
+        };
+    }
+
+    return .{
+        .parsed = parsed,
+        .build_spec = .{
+            .target = parsed.value.target,
+            .payload_object_path = resolved_payload_path,
+            .payload_object_format = parsed.value.payload.object_format,
+            .hooks = resolved_hooks,
+        },
+    };
 }
 
 pub fn createBytesFromPayload(allocator: std.mem.Allocator, spec: BuildSpec, payload_bytes: []const u8) ![]u8 {
@@ -203,6 +299,39 @@ fn encodeManifest(allocator: std.mem.Allocator, manifest: Manifest) ![]u8 {
     defer out.deinit();
     try std.json.Stringify.value(manifest, .{}, &out.writer);
     return allocator.dupe(u8, out.written());
+}
+
+fn resolveMetaRelativePath(
+    allocator: std.mem.Allocator,
+    meta_path: []const u8,
+    value: []const u8,
+) ![]const u8 {
+    if (std.fs.path.isAbsolute(value)) return value;
+    const base_dir = std.fs.path.dirname(meta_path) orelse ".";
+    return std.fs.path.join(allocator, &.{ base_dir, value });
+}
+
+fn resolveMetaHookLocator(locator: MetaHookLocator) !HookLocator {
+    return switch (locator.kind) {
+        .symbol => blk: {
+            if (locator.symbol.len == 0) return error.MissingTargetSymbol;
+            break :blk HookLocator.fromSymbol(locator.symbol);
+        },
+        .virtual_address => HookLocator.fromVirtualAddress(
+            try parseMetaInteger(locator.virtual_address, error.MissingTargetLocator),
+        ),
+        .file_offset => HookLocator.fromFileOffset(
+            try parseMetaInteger(locator.file_offset, error.MissingTargetLocator),
+        ),
+    };
+}
+
+fn parseMetaInteger(value: []const u8, comptime missing_error: anyerror) !u64 {
+    if (value.len == 0) return missing_error;
+    if (std.mem.startsWith(u8, value, "0x") or std.mem.startsWith(u8, value, "0X")) {
+        return std.fmt.parseUnsigned(u64, value[2..], 16);
+    }
+    return std.fmt.parseUnsigned(u64, value, 10);
 }
 
 fn writeHeader(dest: []u8, header: Header) void {

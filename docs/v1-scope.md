@@ -20,6 +20,7 @@
 ### Payload authoring
 
 - Zig-authored patch code
+- `zrstd` payload helper subset for printing / formatting
 - object-file based payload ingestion
 - payload sections:
   - `.text`

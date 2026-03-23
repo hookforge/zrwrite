@@ -10,6 +10,7 @@ pub const InstrumentHookSpec = struct {
     target: bundle.HookLocator,
     handler_symbol: []const u8,
     log_message: []const u8 = "",
+    stolen_instruction_count: u8 = 1,
 };
 
 pub const InstrumentObjectSpec = struct {
@@ -17,6 +18,7 @@ pub const InstrumentObjectSpec = struct {
     target: bundle.HookLocator,
     handler_symbol: []const u8,
     log_message: []const u8 = "",
+    stolen_instruction_count: u8 = 1,
 };
 
 pub const ReplaceHookSpec = struct {
@@ -88,6 +90,15 @@ pub const Rewriter = struct {
         return if (self.output_bytes) |output| output else self.input_bytes;
     }
 
+    fn workingBytes(self: *Rewriter) []u8 {
+        return if (self.output_bytes) |output| output else self.input_bytes;
+    }
+
+    fn installOutput(self: *Rewriter, output: []u8) void {
+        if (self.output_bytes) |previous| self.allocator.free(previous);
+        self.output_bytes = output;
+    }
+
     pub fn writeToPath(self: *const Rewriter, output_path: []const u8) !void {
         const file = try std.fs.cwd().createFile(output_path, .{
             .truncate = true,
@@ -106,6 +117,7 @@ pub const Rewriter = struct {
             .target = spec.target,
             .handler_symbol = spec.handler_symbol,
             .log_message = spec.log_message,
+            .stolen_instruction_count = spec.stolen_instruction_count,
         });
     }
 
@@ -121,15 +133,20 @@ pub const Rewriter = struct {
     }
 
     pub fn addInstrumentHookObject(self: *Rewriter, spec: InstrumentObjectSpec) !InstrumentRewriteReport {
-        if (self.output_bytes != null) return error.MultipleHooksUnsupported;
-
-        const input_view = try ElfView.parse(self.input_bytes);
+        const base_bytes = self.workingBytes();
+        const input_view = try ElfView.parse(base_bytes);
         const target = try resolveTargetLocation(input_view, spec.target);
+        const stolen_instruction_count = try validateStolenInstructionCount(spec.stolen_instruction_count);
+        const stolen_window_size = stolen_instruction_count * @sizeOf(u32);
+        try validatePatchWindowMapping(input_view, target, stolen_instruction_count);
 
-        var original_instruction: [4]u8 = undefined;
-        @memcpy(&original_instruction, self.input_bytes[target.file_offset .. target.file_offset + 4]);
-        const original_opcode = readU32(original_instruction[0..]);
-        const replay_plan = try aarch64.planReplay(target.address, original_opcode);
+        const replay_plan = try analyzeInstrumentReplayPlan(
+            input_view,
+            base_bytes,
+            target,
+            stolen_instruction_count,
+        );
+        const needs_raw_trampoline = stolen_instruction_count != 1 or replay_plan.requiresRawTrampoline();
 
         // The mini-linker runs in two phases:
         // 1. analyze the object so we know how large the injected image must be
@@ -139,7 +156,13 @@ pub const Rewriter = struct {
 
         const callback_offset = 0;
         const trampoline_offset = std.mem.alignForward(usize, payload_layout.image_size, 8);
-        const trampoline_size = if (replay_plan.requiresRawTrampoline()) aarch64.original_trampoline_size else 0;
+        const trampoline_size = if (needs_raw_trampoline)
+            if (stolen_instruction_count == 1 and replay_plan.requiresRawTrampoline())
+                aarch64.original_trampoline_size
+            else
+                stolen_window_size + @sizeOf(u32)
+        else
+            0;
         const stub_offset = std.mem.alignForward(usize, trampoline_offset + trampoline_size, 8);
 
         const stub = try aarch64.buildInstrumentStub(.{
@@ -158,7 +181,7 @@ pub const Rewriter = struct {
         const injected_size = stub_offset + stub_size;
         const plan = try planInjection(input_view, injected_size);
         const callback_address = plan.payload_base_address + callback_offset + payload_layout.entry_offset;
-        const trampoline_address = if (replay_plan.requiresRawTrampoline())
+        const trampoline_address = if (needs_raw_trampoline)
             plan.payload_base_address + trampoline_offset
         else
             0;
@@ -187,7 +210,7 @@ pub const Rewriter = struct {
         defer self.allocator.free(fixed_stub);
         std.debug.assert(fixed_stub.len == stub_size);
 
-        const output = try allocateInjectedOutput(self, plan);
+        const output = try allocateInjectedOutput(self, base_bytes, plan);
         errdefer self.allocator.free(output);
 
         @memcpy(
@@ -195,13 +218,33 @@ pub const Rewriter = struct {
             loaded_payload.image,
         );
 
-        if (replay_plan.requiresRawTrampoline()) {
-            const trampoline = try aarch64.buildOriginalTrampoline(
-                original_instruction,
-                trampoline_address,
-                target.address + 4,
-            );
-            @memcpy(output[plan.injection_offset + trampoline_offset .. plan.injection_offset + trampoline_offset + trampoline.len], &trampoline);
+        if (needs_raw_trampoline) {
+            const stolen_bytes = base_bytes[target.file_offset .. target.file_offset + stolen_window_size];
+            if (stolen_instruction_count == 1 and replay_plan.requiresRawTrampoline()) {
+                var original_instruction: [4]u8 = undefined;
+                @memcpy(&original_instruction, stolen_bytes);
+                const trampoline = try aarch64.buildOriginalTrampoline(
+                    original_instruction,
+                    trampoline_address,
+                    target.address + 4,
+                );
+                @memcpy(
+                    output[plan.injection_offset + trampoline_offset .. plan.injection_offset + trampoline_offset + trampoline.len],
+                    &trampoline,
+                );
+            } else {
+                const trampoline = try aarch64.buildRawTrampoline(
+                    self.allocator,
+                    stolen_bytes,
+                    trampoline_address,
+                    target.address + stolen_window_size,
+                );
+                defer self.allocator.free(trampoline);
+                @memcpy(
+                    output[plan.injection_offset + trampoline_offset .. plan.injection_offset + trampoline_offset + trampoline.len],
+                    trampoline,
+                );
+            }
         }
 
         @memcpy(output[plan.injection_offset + stub_offset .. plan.injection_offset + stub_offset + fixed_stub.len], fixed_stub);
@@ -210,14 +253,20 @@ pub const Rewriter = struct {
 
         const branch_opcode = try aarch64.encodeBranchImmediate(target.address, stub_address);
         writeU32(output[target.file_offset .. target.file_offset + 4], branch_opcode);
+        for (1..stolen_instruction_count) |index| {
+            writeU32(
+                output[target.file_offset + index * 4 .. target.file_offset + (index + 1) * 4],
+                aarch64.nop_instruction,
+            );
+        }
 
-        self.output_bytes = output;
+        self.installOutput(output);
 
         return .{
             .target_address = target.address,
             .target_file_offset = target.file_offset,
             .payload_entry_address = callback_address,
-            .trampoline_address = if (replay_plan.requiresRawTrampoline()) trampoline_address else null,
+            .trampoline_address = if (needs_raw_trampoline) trampoline_address else null,
             .stub_address = stub_address,
             .injection_offset = plan.injection_offset,
             .injected_size = injected_size,
@@ -225,9 +274,8 @@ pub const Rewriter = struct {
     }
 
     pub fn addReplaceHookObject(self: *Rewriter, spec: ReplaceObjectSpec) !ReplaceRewriteReport {
-        if (self.output_bytes != null) return error.MultipleHooksUnsupported;
-
-        const input_view = try ElfView.parse(self.input_bytes);
+        const base_bytes = self.workingBytes();
+        const input_view = try ElfView.parse(base_bytes);
         const target = try resolveTargetLocation(input_view, spec.target);
 
         // Replace hooks reuse the same two-phase payload mini-linker pipeline as
@@ -250,7 +298,7 @@ pub const Rewriter = struct {
         std.debug.assert(loaded_payload.entry_offset == payload_layout.entry_offset);
         std.debug.assert(loaded_payload.image.len == payload_layout.image_size);
 
-        const output = try allocateInjectedOutput(self, plan);
+        const output = try allocateInjectedOutput(self, base_bytes, plan);
         errdefer self.allocator.free(output);
         @memcpy(output[plan.injection_offset .. plan.injection_offset + loaded_payload.image.len], loaded_payload.image);
 
@@ -259,7 +307,7 @@ pub const Rewriter = struct {
         const branch_opcode = try aarch64.encodeBranchImmediate(target.address, payload_entry_address);
         writeU32(output[target.file_offset .. target.file_offset + 4], branch_opcode);
 
-        self.output_bytes = output;
+        self.installOutput(output);
 
         return .{
             .target_address = target.address,
@@ -289,6 +337,110 @@ fn resolveTargetLocation(view: ElfView, target: bundle.HookLocator) !ResolvedTar
             .address = try view.offsetToAddress(target.file_offset),
             .file_offset = @intCast(target.file_offset),
         },
+    };
+}
+
+fn validateStolenInstructionCount(count: u8) !usize {
+    if (count == 0 or count > aarch64.max_stolen_instruction_count) {
+        return error.UnsupportedStolenInstructionCount;
+    }
+    return count;
+}
+
+/// Multi-instruction patch windows are only safe when every displaced address
+/// maps contiguously through the executable image. This keeps the current
+/// implementation honest: the widened detour steals a straight-line file slice,
+/// not an arbitrary cross-segment instruction list.
+fn validatePatchWindowMapping(
+    view: ElfView,
+    target: ResolvedTarget,
+    stolen_instruction_count: usize,
+) !void {
+    for (0..stolen_instruction_count) |index| {
+        const address = target.address + index * 4;
+        const expected_file_offset = target.file_offset + index * 4;
+        if (try view.addressToOffset(address) != expected_file_offset) {
+            return error.NonContiguousPatchWindow;
+        }
+    }
+}
+
+fn analyzeInstrumentReplayPlan(
+    view: ElfView,
+    base_bytes: []const u8,
+    target: ResolvedTarget,
+    stolen_instruction_count: usize,
+) !aarch64.ReplayPlan {
+    if (target.file_offset + stolen_instruction_count * 4 > base_bytes.len) {
+        return error.PatchWindowOutOfRange;
+    }
+
+    if (stolen_instruction_count == 1) {
+        const opcode = readU32(base_bytes[target.file_offset .. target.file_offset + 4]);
+        return aarch64.planReplay(target.address, opcode);
+    }
+
+    try validateNoIncomingBranchesIntoPatchWindow(view, target.address, stolen_instruction_count);
+
+    for (0..stolen_instruction_count) |index| {
+        const address = target.address + index * 4;
+        const file_offset = target.file_offset + index * 4;
+        const opcode = readU32(base_bytes[file_offset .. file_offset + 4]);
+        const plan = try aarch64.planReplay(address, opcode);
+        if (!plan.requiresRawTrampoline()) return error.UnsupportedMultiInstructionPatchWindow;
+    }
+
+    return .{ .trampoline = {} };
+}
+
+/// Reject widened windows that would leave a live branch target in the middle
+/// of the stolen instruction range.
+///
+/// The current widening implementation replays multi-instruction windows by
+/// copying the displaced bytes verbatim into one raw trampoline. That is only
+/// correct for linear entry into the window: if some other direct branch lands
+/// on instruction 2/3/4 of the overwritten range, patching would silently
+/// delete that entry point. We therefore scan executable segments and fail
+/// closed on any direct control-flow edge into the interior of the widened
+/// patch window.
+fn validateNoIncomingBranchesIntoPatchWindow(
+    view: ElfView,
+    window_start: u64,
+    stolen_instruction_count: usize,
+) !void {
+    if (stolen_instruction_count <= 1) return;
+
+    const interior_start = window_start + 4;
+    const window_end = window_start + stolen_instruction_count * 4;
+
+    for (view.phdrs) |phdr| {
+        if (phdr.p_type != elf.PT_LOAD) continue;
+        if ((phdr.p_flags & elf.PF_X) == 0) continue;
+
+        var file_offset: usize = @intCast(phdr.p_offset);
+        const file_end: usize = @intCast(phdr.p_offset + phdr.p_filesz);
+        while (file_offset + 4 <= file_end) : (file_offset += 4) {
+            const source_address = phdr.p_vaddr + (@as(u64, @intCast(file_offset)) - phdr.p_offset);
+            if (source_address >= window_start and source_address < window_end) continue;
+
+            const opcode = readU32(view.bytes[file_offset .. file_offset + 4]);
+            const replay_plan = aarch64.planReplay(source_address, opcode) catch continue;
+            const branch_target = replayBranchTarget(replay_plan) orelse continue;
+            if (branch_target >= interior_start and branch_target < window_end) {
+                return error.IncomingBranchIntoPatchWindow;
+            }
+        }
+    }
+}
+
+fn replayBranchTarget(plan: aarch64.ReplayPlan) ?u64 {
+    return switch (plan) {
+        .branch => |op| op.target,
+        .branch_with_link => |op| op.target,
+        .conditional_branch => |op| op.target,
+        .compare_and_branch => |op| op.target,
+        .test_bit_and_branch => |op| op.target,
+        else => null,
     };
 }
 
@@ -328,13 +480,13 @@ fn planInjection(input_view: ElfView, injected_size: usize) !InjectionPlan {
 /// Allocates the future output image and performs the coarse file-level move:
 /// keep the bytes before the old load tail in place, reserve zeroed space for
 /// the injection, and shift the remaining file tail to its new offset.
-fn allocateInjectedOutput(self: *Rewriter, plan: InjectionPlan) ![]u8 {
+fn allocateInjectedOutput(self: *Rewriter, source_bytes: []const u8, plan: InjectionPlan) ![]u8 {
     const output = try self.allocator.alloc(u8, plan.total_len);
     @memset(output, 0);
 
-    @memcpy(output[0..plan.load_end_offset], self.input_bytes[0..plan.load_end_offset]);
+    @memcpy(output[0..plan.load_end_offset], source_bytes[0..plan.load_end_offset]);
 
-    const tail = self.input_bytes[plan.load_end_offset..];
+    const tail = source_bytes[plan.load_end_offset..];
     @memcpy(output[plan.tail_output_offset .. plan.tail_output_offset + tail.len], tail);
 
     return output;

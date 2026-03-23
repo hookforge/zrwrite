@@ -8,6 +8,10 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/root.zig"),
         .target = target,
     });
+    const zrstd_mod = b.addModule("zrstd", .{
+        .root_source_file = b.path("src/zrstd/root.zig"),
+        .target = target,
+    });
 
     const exe = b.addExecutable(.{
         .name = "zrwrite",
@@ -33,6 +37,18 @@ pub fn build(b: *std.Build) void {
     });
     const run_mod_tests = b.addRunArtifact(mod_tests);
 
+    const zrstd_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/zrstd/root.zig"),
+            .target = b.graph.host,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "zrstd", .module = zrstd_mod },
+            },
+        }),
+    });
+    const run_zrstd_tests = b.addRunArtifact(zrstd_tests);
+
     const integration_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("tests/integration.zig"),
@@ -47,5 +63,6 @@ pub fn build(b: *std.Build) void {
 
     const test_step = b.step("test", "Run unit and integration tests");
     test_step.dependOn(&run_mod_tests.step);
+    test_step.dependOn(&run_zrstd_tests.step);
     test_step.dependOn(&run_integration_tests.step);
 }

@@ -7,3 +7,5 @@ pub const linkObject = object.linkObject;
 pub const linkObjectBytes = object.linkObjectBytes;
 pub const loadTextOnlyObject = object.loadTextOnlyObject;
 pub const loadTextOnlyObjectBytes = object.loadTextOnlyObjectBytes;
+pub const clearLastLinkDiagnostic = object.clearLastLinkDiagnostic;
+pub const lastLinkDiagnosticMessage = object.lastLinkDiagnosticMessage;

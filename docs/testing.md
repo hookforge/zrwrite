@@ -59,9 +59,13 @@ Useful remote smoke scripts:
 ```bash
 bash scripts/orb_encrypt_replace_demo.sh
 bash scripts/orb_semantic_instrument_demo.sh
+bash scripts/orb_condbr_demo.sh
+bash scripts/orb_tstbr_demo.sh
 bash scripts/orb_x16_resume_demo.sh
 bash scripts/orb_x17_resume_demo.sh
+bash scripts/orb_wide_window_demo.sh
 bash scripts/orb_zig_payload_demo.sh
+bash scripts/orb_zig_composite_demo.sh
 bash scripts/orb_zig_external_call_demo.sh
 bash scripts/orb_zig_external_data_demo.sh
 ```
@@ -76,9 +80,29 @@ when the callback leaves `ctx.sp` / `ctx.pc` on the bridge-owned replay path, a
 callback write to `ctx.regs.x17` now also survives back into live execution
 state on real Linux/AArch64 hardware.
 
+`orb_wide_window_demo.sh` is the first widened patch-window smoke. It validates
+that `zrwrite` can steal and replay a 4-instruction straight-line window, patch
+the extra overwritten instructions with `nop`, and still resume correctly on
+real Linux/AArch64 hardware.
+
+`orb_condbr_demo.sh` is the dedicated runtime smoke for
+`R_AARCH64_CONDBR19`. It proves that a payload whose callback contains a
+cross-section conditional branch relocation still links, patches, and resumes
+correctly on real Linux/AArch64 hardware.
+
+`orb_tstbr_demo.sh` is the corresponding runtime smoke for
+`R_AARCH64_TSTBR14`. It validates the `tbz` / `tbnz` style relocation family in
+an end-to-end patched executable on Orb.
+
 `orb_zig_payload_demo.sh` is the first end-to-end ELF/AArch64 mini-linker smoke
 for a real Zig-authored payload object. It exercises `.rodata`, `.data`, `.bss`
 layout plus relocation fixups before validating runtime behavior on Orb.
+
+`orb_zig_composite_demo.sh` is the broader end-to-end composite regression: the
+payload reads an external data symbol, writes payload-local `.bss`, and then
+calls an external target function before resuming. This is the current
+high-value runtime proof that the ELF/AArch64 mini-linker can compose multiple
+symbol-resolution modes in one real Zig payload.
 
 `orb_zig_external_call_demo.sh` extends that coverage to undefined-symbol
 resolution against the target ELF image itself, including a direct `CALL26`

@@ -3,6 +3,8 @@ const HookContext = @import("../../sdk/root.zig").HookContext;
 const replay = @import("replay_plan.zig");
 
 pub const original_trampoline_size: usize = 20;
+pub const nop_instruction: u32 = 0xD503_201F;
+pub const max_stolen_instruction_count: usize = 4;
 pub const ldr_x17_literal_8: u32 = 0x5800_0051;
 pub const br_x17: u32 = 0xD61F_0220;
 /// Legacy export name retained for compatibility with older callers/tests.
@@ -233,6 +235,32 @@ pub fn buildOriginalTrampoline(
     writeU32(buffer[8..12], nop);
     writeU32(buffer[12..16], nop);
     writeU32(buffer[16..20], nop);
+    return buffer;
+}
+
+/// Builds a variable-sized raw trampoline for a widened straight-line patch
+/// window.
+///
+/// The caller provides the exact bytes that were displaced at the original
+/// hook site. The trampoline copies them verbatim and then emits one direct
+/// branch back to the first instruction after the stolen window.
+pub fn buildRawTrampoline(
+    allocator: std.mem.Allocator,
+    stolen_bytes: []const u8,
+    trampoline_address: u64,
+    resume_pc: u64,
+) ![]u8 {
+    if ((stolen_bytes.len & 0x3) != 0) return error.InvalidStolenInstructionBytes;
+
+    const total_size = stolen_bytes.len + @sizeOf(u32);
+    var buffer = try allocator.alloc(u8, total_size);
+    errdefer allocator.free(buffer);
+
+    @memcpy(buffer[0..stolen_bytes.len], stolen_bytes);
+    writeU32(
+        buffer[stolen_bytes.len .. stolen_bytes.len + 4],
+        try encodeBranchImmediate(trampoline_address + stolen_bytes.len, resume_pc),
+    );
     return buffer;
 }
 
@@ -948,7 +976,7 @@ fn signExtend(comptime bit_count: comptime_int, value: u64) i64 {
     return @as(i64, @bitCast(value << shift)) >> shift;
 }
 
-const nop: u32 = 0xD503_201F;
+const nop: u32 = nop_instruction;
 const svc_0: u32 = 0xD400_0001;
 
 test "original trampoline resumes with a direct branch" {
