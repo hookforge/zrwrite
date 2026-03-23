@@ -16,13 +16,21 @@ strategy, or bundle format changes.
 The long-term callback model is:
 
 ```zig
-export fn on_hit(site_address: u64, ctx: *zrwrite.HookContext) callconv(.c) void
+export fn on_hit(hit_address: u64, ctx: *zrwrite.HookContext) callconv(.c) void
 ```
 
 Where:
 
-- `site_address` is the original patch site
+- `hit_address` is the hook-site address reported by the bridge
 - `ctx` is a mutable architectural snapshot
+
+Payloads should use:
+
+```zig
+const img = ctx.target();
+```
+
+to convert recovered linked/static image addresses into runtime pointers.
 
 ## HookContext Contract
 
@@ -35,6 +43,7 @@ minimum it must model:
 - condition flags / CPSR subset used by replay logic
 - FP/SIMD registers
 - FP control/status registers
+- runtime image metadata needed to reason about PIE / ASLR safely
 
 ## Control-Flow Rule
 
@@ -59,6 +68,22 @@ execution resumes when the callback returns.
   limitation, not an ABI change
 
 ## Current Implementation Gap
+
+The ABI shape now reserves `HookContext.runtime` as the payload-visible home
+for:
+
+- `load_bias`
+- `site_linked_address`
+- `site_runtime_address`
+
+Today the Linux/AArch64 bridge initializes that block as a stable zero-bias
+mapping for ET_EXEC / non-PIE and now also computes a real runtime load-bias
+view for the validated Linux/AArch64 instrument PIE path.
+
+The remaining PIE work is runtime work, not API-shape work:
+
+- cover every long-detour fallback path with the same PIE-safe semantics
+- tighten ET_DYN relocation handling
 
 The Linux/AArch64 bridge now saves and restores:
 

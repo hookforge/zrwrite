@@ -1,5 +1,8 @@
 const std = @import("std");
-const HookContext = @import("../../sdk/root.zig").HookContext;
+const sdk = @import("../../sdk/root.zig");
+const HookContext = sdk.HookContext;
+const HookRuntimeInfo = sdk.HookRuntimeInfo;
+const hook_runtime_info_abi_version_current = sdk.hook_runtime_info_abi_version_current;
 const replay = @import("replay_plan.zig");
 
 pub const original_trampoline_size: usize = 20;
@@ -26,6 +29,8 @@ pub const applyReplay = replay.applyReplay;
 /// - `HookContext.pc` starts at the original site, not the trampoline
 /// - if the callback leaves `pc` untouched, the bridge consumes `replay_plan`
 ///   and decides how execution should continue
+/// - `HookContext.runtime` carries the public image-address metadata used by
+///   payload-side PIE / ASLR helper code
 ///
 /// Current implementation limitation:
 /// - a truly dynamic indirect resume still needs one terminal branch-carrier
@@ -56,6 +61,10 @@ const HookLayout = struct {
     fpregs_offset: usize = @offsetOf(HookContext, "fpregs"),
     fpsr_offset: usize = @offsetOf(HookContext, "fpsr"),
     fpcr_offset: usize = @offsetOf(HookContext, "fpcr"),
+    runtime_offset: usize = @offsetOf(HookContext, "runtime"),
+    runtime_load_bias_offset: usize = @offsetOf(HookContext, "runtime") + @offsetOf(HookRuntimeInfo, "load_bias"),
+    runtime_site_linked_address_offset: usize = @offsetOf(HookContext, "runtime") + @offsetOf(HookRuntimeInfo, "site_linked_address"),
+    runtime_site_runtime_address_offset: usize = @offsetOf(HookContext, "runtime") + @offsetOf(HookRuntimeInfo, "site_runtime_address"),
     scratch_offset: usize = std.mem.alignForward(usize, @sizeOf(HookContext) + @sizeOf(u64), 16) - @sizeOf(u64),
 };
 
@@ -64,6 +73,8 @@ comptime {
     std.debug.assert(layout.frame_size >= @sizeOf(HookContext) + @sizeOf(u64));
     std.debug.assert(layout.scratch_offset >= @sizeOf(HookContext));
     std.debug.assert(layout.scratch_offset + @sizeOf(u64) <= layout.frame_size);
+    std.debug.assert(layout.runtime_offset == @offsetOf(HookContext, "runtime"));
+    std.debug.assert(layout.runtime_load_bias_offset == layout.runtime_offset + @offsetOf(HookRuntimeInfo, "load_bias"));
 }
 
 const Condition = struct {
@@ -328,14 +339,20 @@ pub fn buildInstrumentStub(options: InstrumentStubOptions) ![]u8 {
         null
     else
         try builder.reserveLiteral();
+    const runtime_anchor_literal_index = try builder.reserveLiteral();
 
-    try emitStubPrologue(&builder, layout, options.site_address);
+    const runtime_anchor_instruction_offset = try emitStubPrologue(
+        &builder,
+        layout,
+        options.site_address,
+        runtime_anchor_literal_index,
+    );
     if (message_literal_index) |literal_index| {
-        try emitDebugWrite(&builder, literal_index, options.log_message.len);
+        try emitDebugWrite(&builder, layout, literal_index, options.log_message.len);
     }
-    try emitCallbackInvocation(&builder, options.site_address, options.callback_address);
+    try emitCallbackInvocation(&builder, layout, options.callback_address);
 
-    const skip_replay_branch = try emitReplayBypassGuard(&builder, layout, options.site_address);
+    const skip_replay_branch = try emitReplayBypassGuard(&builder, layout);
     try emitReplaySequence(&builder, layout, options);
     const resume_offset = builder.code.items.len;
     builder.patchU32(
@@ -348,6 +365,13 @@ pub fn buildInstrumentStub(options: InstrumentStubOptions) ![]u8 {
 
     try emitResumeDispatcherAndEpilogues(&builder, layout, options);
     try builder.alignCode(8);
+
+    if (options.stub_address != 0) {
+        builder.setLiteral(
+            runtime_anchor_literal_index,
+            options.stub_address + @as(u64, @intCast(runtime_anchor_instruction_offset)),
+        );
+    }
 
     if (message_literal_index) |literal_index| {
         const message_address = options.stub_address +
@@ -378,7 +402,22 @@ pub fn encodeBranchImmediate(from_address: u64, to_address: u64) !u32 {
     return 0x1400_0000 | (raw & 0x03FF_FFFF);
 }
 
-fn emitStubPrologue(builder: *InstrumentStubBuilder, layout: HookLayout, site_address: u64) !void {
+/// Emits the bridge prologue and initializes the public runtime metadata block.
+///
+/// The important PIE detail is the load-bias derivation:
+/// - `adr x10, .` captures one live runtime address inside the injected stub
+/// - a matching linked/static address for that exact instruction is loaded from
+///   the literal pool
+/// - subtracting the two yields the image `load_bias`
+///
+/// Every later runtime address materialization in the stub then becomes:
+/// `runtime = linked + load_bias`.
+fn emitStubPrologue(
+    builder: *InstrumentStubBuilder,
+    layout: HookLayout,
+    site_address: u64,
+    runtime_anchor_literal_index: u32,
+) !usize {
     _ = try builder.emitU32(encodeSubImmediateSp(layout.frame_size));
 
     inline for (0..15) |pair_index| {
@@ -415,10 +454,27 @@ fn emitStubPrologue(builder: *InstrumentStubBuilder, layout: HookLayout, site_ad
     _ = try builder.emitU32(encodeStrUnsigned32(10, 31, layout.fpsr_offset));
     _ = try builder.emitU32(encodeMrsFpcr(10));
     _ = try builder.emitU32(encodeStrUnsigned32(10, 31, layout.fpcr_offset));
+
+    const runtime_anchor_instruction_offset = try builder.emitU32(try encodeAdrDelta(10, 0));
+    try builder.emitLoadLiteralIndex(11, runtime_anchor_literal_index);
+    _ = try builder.emitU32(encodeSubRegister64(10, 10, 11));
+
+    _ = try builder.emitU32(encodeMovZ(11, hook_runtime_info_abi_version_current));
+    _ = try builder.emitU32(encodeStrUnsigned64(11, 31, layout.runtime_offset));
+    _ = try builder.emitU32(encodeStrUnsigned64(10, 31, layout.runtime_load_bias_offset));
+
+    try builder.emitLoadLiteral(11, site_address);
+    _ = try builder.emitU32(encodeStrUnsigned64(11, 31, layout.runtime_site_linked_address_offset));
+    _ = try builder.emitU32(encodeAddRegister64(11, 11, 10));
+    _ = try builder.emitU32(encodeStrUnsigned64(11, 31, layout.runtime_site_runtime_address_offset));
+    _ = try builder.emitU32(encodeStrUnsigned64(11, 31, layout.pc_offset));
+
+    return runtime_anchor_instruction_offset;
 }
 
 fn emitDebugWrite(
     builder: *InstrumentStubBuilder,
+    layout: HookLayout,
     message_literal_index: u32,
     log_message_len: usize,
 ) !void {
@@ -429,7 +485,7 @@ fn emitDebugWrite(
     // - x2: length
     // - x8: syscall number
     _ = try builder.emitU32(encodeMovZ(0, 1));
-    try builder.emitLoadLiteralIndex(1, message_literal_index);
+    try emitLoadRuntimeAddressFromLiteralIndex(builder, layout, 1, message_literal_index, 9);
     _ = try builder.emitU32(encodeMovZ(2, @intCast(log_message_len)));
     _ = try builder.emitU32(encodeMovZ(8, 64));
     _ = try builder.emitU32(svc_0);
@@ -437,22 +493,21 @@ fn emitDebugWrite(
 
 fn emitCallbackInvocation(
     builder: *InstrumentStubBuilder,
-    site_address: u64,
+    layout: HookLayout,
     callback_address: u64,
 ) !void {
-    try builder.emitLoadLiteral(0, site_address);
+    _ = try builder.emitU32(encodeLdrUnsigned64(0, 31, layout.runtime_site_runtime_address_offset));
     _ = try builder.emitU32(encodeAddImmediate(1, 31, 0));
-    try builder.emitLoadLiteral(16, callback_address);
+    try emitLoadRuntimeAddress(builder, layout, 16, callback_address, 9);
     _ = try builder.emitU32(encodeBlr(16));
 }
 
 fn emitReplayBypassGuard(
     builder: *InstrumentStubBuilder,
     layout: HookLayout,
-    site_address: u64,
 ) !usize {
     _ = try builder.emitU32(encodeLdrUnsigned64(16, 31, layout.pc_offset));
-    try builder.emitLoadLiteral(17, site_address);
+    _ = try builder.emitU32(encodeLdrUnsigned64(17, 31, layout.runtime_site_runtime_address_offset));
     _ = try builder.emitU32(encodeCmpRegister64(16, 17));
     return builder.emitU32(0);
 }
@@ -466,75 +521,75 @@ fn emitReplaySequence(
 
     switch (options.replay_plan) {
         .trampoline => {
-            try emitStoreContextPcLiteral(builder, layout, options.trampoline_address);
+            try emitStoreContextPcLinkedAddress(builder, layout, options.trampoline_address);
         },
         .adr => |op| {
-            try emitStoreContextRegisterLiteral(builder, layout, op.rd, op.absolute);
-            try emitStoreContextPcLiteral(builder, layout, next_pc);
+            try emitStoreContextRegisterLinkedAddress(builder, layout, op.rd, op.absolute);
+            try emitStoreContextPcLinkedAddress(builder, layout, next_pc);
         },
         .adrp => |op| {
-            try emitStoreContextRegisterLiteral(builder, layout, op.rd, op.page_base);
-            try emitStoreContextPcLiteral(builder, layout, next_pc);
+            try emitStoreContextRegisterLinkedAddress(builder, layout, op.rd, op.page_base);
+            try emitStoreContextPcLinkedAddress(builder, layout, next_pc);
         },
         .ldr_literal_w => |op| {
-            try builder.emitLoadLiteral(9, op.literal_address);
+            try emitLoadRuntimeAddress(builder, layout, 9, op.literal_address, 11);
             _ = try builder.emitU32(encodeLdrUnsigned32(10, 9, 0));
             _ = try builder.emitU32(encodeStrUnsigned64(10, 31, xRegisterOffset(layout, op.rt)));
-            try emitStoreContextPcLiteral(builder, layout, next_pc);
+            try emitStoreContextPcLinkedAddress(builder, layout, next_pc);
         },
         .ldr_literal_x => |op| {
-            try builder.emitLoadLiteral(9, op.literal_address);
+            try emitLoadRuntimeAddress(builder, layout, 9, op.literal_address, 11);
             _ = try builder.emitU32(encodeLdrUnsigned64(10, 9, 0));
             _ = try builder.emitU32(encodeStrUnsigned64(10, 31, xRegisterOffset(layout, op.rt)));
-            try emitStoreContextPcLiteral(builder, layout, next_pc);
+            try emitStoreContextPcLinkedAddress(builder, layout, next_pc);
         },
         .ldr_literal_s => |op| {
             const fp_offset = fpRegisterOffset(layout, op.rt);
-            try builder.emitLoadLiteral(9, op.literal_address);
+            try emitLoadRuntimeAddress(builder, layout, 9, op.literal_address, 11);
             _ = try builder.emitU32(encodeLdrUnsigned32(10, 9, 0));
             _ = try builder.emitU32(encodeStrUnsigned32(10, 31, fp_offset + 0));
             _ = try builder.emitU32(encodeStrUnsigned32(31, 31, fp_offset + 4));
             _ = try builder.emitU32(encodeStrUnsigned64(31, 31, fp_offset + 8));
-            try emitStoreContextPcLiteral(builder, layout, next_pc);
+            try emitStoreContextPcLinkedAddress(builder, layout, next_pc);
         },
         .ldr_literal_d => |op| {
             const fp_offset = fpRegisterOffset(layout, op.rt);
-            try builder.emitLoadLiteral(9, op.literal_address);
+            try emitLoadRuntimeAddress(builder, layout, 9, op.literal_address, 11);
             _ = try builder.emitU32(encodeLdrUnsigned64(10, 9, 0));
             _ = try builder.emitU32(encodeStrUnsigned64(10, 31, fp_offset + 0));
             _ = try builder.emitU32(encodeStrUnsigned64(31, 31, fp_offset + 8));
-            try emitStoreContextPcLiteral(builder, layout, next_pc);
+            try emitStoreContextPcLinkedAddress(builder, layout, next_pc);
         },
         .ldr_literal_q => |op| {
             const fp_offset = fpRegisterOffset(layout, op.rt);
-            try builder.emitLoadLiteral(9, op.literal_address);
+            try emitLoadRuntimeAddress(builder, layout, 9, op.literal_address, 12);
             _ = try builder.emitU32(encodeLdrUnsigned64(10, 9, 0));
             _ = try builder.emitU32(encodeLdrUnsigned64(11, 9, 8));
             _ = try builder.emitU32(encodeStrUnsigned64(10, 31, fp_offset + 0));
             _ = try builder.emitU32(encodeStrUnsigned64(11, 31, fp_offset + 8));
-            try emitStoreContextPcLiteral(builder, layout, next_pc);
+            try emitStoreContextPcLinkedAddress(builder, layout, next_pc);
         },
         .ldrsw_literal => |op| {
-            try builder.emitLoadLiteral(9, op.literal_address);
+            try emitLoadRuntimeAddress(builder, layout, 9, op.literal_address, 11);
             _ = try builder.emitU32(encodeLdrswUnsigned(10, 9, 0));
             _ = try builder.emitU32(encodeStrUnsigned64(10, 31, xRegisterOffset(layout, op.rt)));
-            try emitStoreContextPcLiteral(builder, layout, next_pc);
+            try emitStoreContextPcLinkedAddress(builder, layout, next_pc);
         },
         .prfm_literal => {
-            try emitStoreContextPcLiteral(builder, layout, next_pc);
+            try emitStoreContextPcLinkedAddress(builder, layout, next_pc);
         },
         .branch => |op| {
-            try emitStoreContextPcLiteral(builder, layout, op.target);
+            try emitStoreContextPcLinkedAddress(builder, layout, op.target);
         },
         .branch_with_link => |op| {
-            try emitStoreContextRegisterLiteral(builder, layout, 30, next_pc);
-            try emitStoreContextPcLiteral(builder, layout, op.target);
+            try emitStoreContextRegisterLinkedAddress(builder, layout, 30, next_pc);
+            try emitStoreContextPcLinkedAddress(builder, layout, op.target);
         },
         .conditional_branch => |op| {
             _ = try builder.emitU32(encodeLdrUnsigned32(9, 31, layout.cpsr_offset));
             _ = try builder.emitU32(encodeMsrNzcv(9));
             const branch_to_taken = try builder.emitU32(0);
-            try emitStoreContextPcLiteral(builder, layout, next_pc);
+            try emitStoreContextPcLinkedAddress(builder, layout, next_pc);
             const branch_to_done = try builder.emitU32(0);
             const taken_offset = builder.code.items.len;
             builder.patchU32(
@@ -544,7 +599,7 @@ fn emitReplaySequence(
                     @as(i64, @intCast(taken_offset)) - @as(i64, @intCast(branch_to_taken)),
                 ),
             );
-            try emitStoreContextPcLiteral(builder, layout, op.target);
+            try emitStoreContextPcLinkedAddress(builder, layout, op.target);
             const done_offset = builder.code.items.len;
             builder.patchU32(
                 branch_to_done,
@@ -560,7 +615,7 @@ fn emitReplaySequence(
                 _ = try builder.emitU32(encodeLdrUnsigned32(9, 31, xRegisterOffset(layout, op.rt)));
             }
             const branch_to_taken = try builder.emitU32(0);
-            try emitStoreContextPcLiteral(builder, layout, next_pc);
+            try emitStoreContextPcLinkedAddress(builder, layout, next_pc);
             const branch_to_done = try builder.emitU32(0);
             const taken_offset = builder.code.items.len;
             builder.patchU32(
@@ -572,7 +627,7 @@ fn emitReplaySequence(
                     op.is_64bit,
                 ),
             );
-            try emitStoreContextPcLiteral(builder, layout, op.target);
+            try emitStoreContextPcLinkedAddress(builder, layout, op.target);
             const done_offset = builder.code.items.len;
             builder.patchU32(
                 branch_to_done,
@@ -584,7 +639,7 @@ fn emitReplaySequence(
         .test_bit_and_branch => |op| {
             _ = try builder.emitU32(encodeLdrUnsigned64(9, 31, xRegisterOffset(layout, op.rt)));
             const branch_to_taken = try builder.emitU32(0);
-            try emitStoreContextPcLiteral(builder, layout, next_pc);
+            try emitStoreContextPcLinkedAddress(builder, layout, next_pc);
             const branch_to_done = try builder.emitU32(0);
             const taken_offset = builder.code.items.len;
             builder.patchU32(
@@ -596,7 +651,7 @@ fn emitReplaySequence(
                     !op.branch_on_zero,
                 ),
             );
-            try emitStoreContextPcLiteral(builder, layout, op.target);
+            try emitStoreContextPcLinkedAddress(builder, layout, op.target);
             const done_offset = builder.code.items.len;
             builder.patchU32(
                 branch_to_done,
@@ -670,7 +725,7 @@ fn emitResumeDispatcherAndEpilogues(
 
     _ = try builder.emitU32(encodeLdrUnsigned64(9, 31, layout.pc_offset));
     for (targets.values[0..targets.count], 0..) |target_address, index| {
-        try builder.emitLoadLiteral(10, target_address);
+        try emitLoadRuntimeAddress(builder, layout, 10, target_address, 11);
         _ = try builder.emitU32(encodeCmpRegister64(9, 10));
         target_branches[index] = .{
             .target_address = target_address,
@@ -808,23 +863,49 @@ fn emitIndirectResumeEpilogue(builder: *InstrumentStubBuilder, layout: HookLayou
     _ = try builder.emitU32(encodeBr(17));
 }
 
-fn emitStoreContextPcLiteral(
+fn emitLoadRuntimeAddress(
     builder: *InstrumentStubBuilder,
     layout: HookLayout,
-    value: u64,
+    rt: u5,
+    linked_address: u64,
+    bias_reg: u5,
 ) !void {
-    try builder.emitLoadLiteral(9, value);
+    std.debug.assert(rt != bias_reg);
+    try builder.emitLoadLiteral(rt, linked_address);
+    _ = try builder.emitU32(encodeLdrUnsigned64(bias_reg, 31, layout.runtime_load_bias_offset));
+    _ = try builder.emitU32(encodeAddRegister64(rt, rt, bias_reg));
+}
+
+fn emitLoadRuntimeAddressFromLiteralIndex(
+    builder: *InstrumentStubBuilder,
+    layout: HookLayout,
+    rt: u5,
+    literal_index: u32,
+    bias_reg: u5,
+) !void {
+    std.debug.assert(rt != bias_reg);
+    try builder.emitLoadLiteralIndex(rt, literal_index);
+    _ = try builder.emitU32(encodeLdrUnsigned64(bias_reg, 31, layout.runtime_load_bias_offset));
+    _ = try builder.emitU32(encodeAddRegister64(rt, rt, bias_reg));
+}
+
+fn emitStoreContextPcLinkedAddress(
+    builder: *InstrumentStubBuilder,
+    layout: HookLayout,
+    linked_address: u64,
+) !void {
+    try emitLoadRuntimeAddress(builder, layout, 9, linked_address, 10);
     _ = try builder.emitU32(encodeStrUnsigned64(9, 31, layout.pc_offset));
 }
 
-fn emitStoreContextRegisterLiteral(
+fn emitStoreContextRegisterLinkedAddress(
     builder: *InstrumentStubBuilder,
     layout: HookLayout,
     reg: u5,
-    value: u64,
+    linked_address: u64,
 ) !void {
     if (reg == 31) return;
-    try builder.emitLoadLiteral(9, value);
+    try emitLoadRuntimeAddress(builder, layout, 9, linked_address, 10);
     _ = try builder.emitU32(encodeStrUnsigned64(9, 31, xRegisterOffset(layout, reg)));
 }
 
@@ -854,6 +935,14 @@ fn encodeSubImmediateSp(imm: usize) u32 {
 fn encodeAddImmediate(rd: u5, rn: u5, imm: usize) u32 {
     std.debug.assert(imm <= 0xFFF);
     return 0x9100_0000 | (@as(u32, @intCast(imm)) << 10) | (@as(u32, rn) << 5) | rd;
+}
+
+fn encodeAddRegister64(rd: u5, rn: u5, rm: u5) u32 {
+    return 0x8B00_0000 | (@as(u32, rm) << 16) | (@as(u32, rn) << 5) | rd;
+}
+
+fn encodeSubRegister64(rd: u5, rn: u5, rm: u5) u32 {
+    return 0xCB00_0000 | (@as(u32, rm) << 16) | (@as(u32, rn) << 5) | rd;
 }
 
 fn encodeStpUnsigned(rt: u5, rt2: u5, rn: u5, offset: usize) u32 {
@@ -913,6 +1002,16 @@ fn encodeLdur64(rt: u5, rn: u5, offset: i16) u32 {
 
 fn encodeMovZ(rd: u5, imm16: u16) u32 {
     return 0xD280_0000 | (@as(u32, imm16) << 5) | rd;
+}
+
+fn encodeAdrDelta(rd: u5, byte_offset: i64) !u32 {
+    if (byte_offset < -0x10_0000 or byte_offset > 0x0f_ffff) return error.BranchOutOfRange;
+    const signed: i32 = @intCast(byte_offset);
+    const raw: u32 = @bitCast(signed);
+    return 0x1000_0000 |
+        ((raw & 0x3) << 29) |
+        (((raw >> 2) & 0x7FFFF) << 5) |
+        rd;
 }
 
 fn encodeCmpRegister64(rn: u5, rm: u5) u32 {

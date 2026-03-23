@@ -86,6 +86,15 @@ typedef union zrwrite_fpregs {
     zrwrite_fpregs_named_t named;
 } zrwrite_fpregs_t;
 
+typedef struct zrwrite_hook_runtime_info {
+    uint16_t abi_version;
+    uint16_t flags;
+    uint32_t reserved0;
+    int64_t load_bias;
+    uint64_t site_linked_address;
+    uint64_t site_runtime_address;
+} zrwrite_hook_runtime_info_t;
+
 typedef struct zrwrite_hook_context {
     zrwrite_xregs_t regs;
     uint64_t sp;
@@ -95,6 +104,7 @@ typedef struct zrwrite_hook_context {
     zrwrite_fpregs_t fpregs;
     uint32_t fpsr;
     uint32_t fpcr;
+    zrwrite_hook_runtime_info_t runtime;
 } zrwrite_hook_context_t;
 
 typedef void (*zrwrite_instrument_callback_t)(uint64_t address, zrwrite_hook_context_t *ctx);
