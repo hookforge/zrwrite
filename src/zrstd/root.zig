@@ -1,4 +1,4 @@
-//! Small payload-side helper layer for Linux/AArch64 injected Zig code.
+//! Small payload-side helper layer for Linux/macOS AArch64 injected Zig code.
 //!
 //! Why this exists:
 //! - injected payloads are not normal hosted Zig executables
@@ -16,8 +16,8 @@ const std = @import("std");
 const linux = std.os.linux;
 comptime {
     if (!builtin.is_test) {
-        if (builtin.os.tag != .linux) {
-            @compileError("zrstd currently provides runtime helpers only for Linux payloads.");
+        if (builtin.os.tag != .linux and builtin.os.tag != .macos) {
+            @compileError("zrstd currently provides runtime helpers only for Linux/macOS payloads.");
         }
         if (builtin.cpu.arch != .aarch64) {
             @compileError("zrstd currently targets AArch64 payloads only.");
@@ -25,9 +25,16 @@ comptime {
     }
 }
 
+const darwin_sys_write: usize = 4;
+const darwin_eintr: usize = 4;
+const darwin_nzcv_carry_mask: usize = 0x2000_0000;
+
 pub const stdout_fd: usize = 1;
 pub const stderr_fd: usize = 2;
-pub const default_print_buffer_len: usize = 512;
+// Keep the default buffer comfortably above the "single rich trace line"
+// workload. Payload authors can still bypass this helper and call
+// `formatInto()` directly when they want tighter control over stack usage.
+pub const default_print_buffer_len: usize = 2048;
 
 /// Namespace that mirrors the intent of `std.debug` for payload authors.
 ///
@@ -417,21 +424,84 @@ pub fn formatInto(buffer: []u8, comptime fmt_str: []const u8, args: anytype) ![]
     return writer.written();
 }
 
-/// Writes the full byte slice to the requested file descriptor via raw Linux
-/// `write(2)` syscalls. Errors are intentionally swallowed because payload
+const DarwinSyscallResult = struct {
+    rc: usize,
+    nzcv: usize,
+
+    /// Darwin arm64 raw syscalls report failure through the carry flag rather
+    /// than by returning a negative integer directly in `x0`.
+    ///
+    /// We therefore snapshot `NZCV` immediately after `svc #0x80` and inspect
+    /// the carry bit here before deciding whether `rc` is a byte count or an
+    /// errno value.
+    fn isError(self: DarwinSyscallResult) bool {
+        return (self.nzcv & darwin_nzcv_carry_mask) != 0;
+    }
+};
+
+/// Executes a raw Darwin/macOS `write(2)` syscall on arm64.
+///
+/// Why this exists instead of calling libc:
+/// - injected payloads are linked as tiny standalone objects
+/// - the current mini-linker does not yet provide a stable "import any
+///   libSystem helper symbol" story for arbitrary payload-side stdlib paths
+/// - a raw syscall keeps the tracing primitive self-contained and predictable
+///
+/// ABI notes for Darwin arm64:
+/// - `x0..x2` carry `fd`, `buf`, `len`
+/// - `x16` carries the syscall number (`SYS_write == 4`)
+/// - `svc #0x80` enters the kernel
+/// - the carry bit in `NZCV` distinguishes success from errno returns
+fn darwinWriteSyscall(fd: usize, bytes: []const u8) DarwinSyscallResult {
+    var nzcv: usize = 0;
+    const rc = asm volatile (
+        \\ svc #0x80
+        \\ mrs x16, nzcv
+        \\ str x16, [x3]
+        : [ret] "={x0}" (-> usize),
+        : [arg0] "{x0}" (fd),
+          [arg1] "{x1}" (@intFromPtr(bytes.ptr)),
+          [arg2] "{x2}" (bytes.len),
+          [flag_ptr] "{x3}" (@intFromPtr(&nzcv)),
+          [sysno] "{x16}" (darwin_sys_write),
+        : .{ .memory = true }
+    );
+    return .{
+        .rc = rc,
+        .nzcv = nzcv,
+    };
+}
+
+/// Writes the full byte slice to the requested file descriptor via raw
+/// platform syscalls. Errors are intentionally swallowed because payload
 /// tracing must not destabilize the patched target process.
 pub fn writeAll(fd: usize, bytes: []const u8) void {
     var remaining = bytes;
     while (remaining.len != 0) {
-        const rc = linux.syscall3(.write, fd, @intFromPtr(remaining.ptr), remaining.len);
-        switch (std.posix.errno(rc)) {
-            .SUCCESS => {
-                const written: usize = @intCast(rc);
-                if (written == 0) return;
-                remaining = remaining[written..];
+        switch (builtin.os.tag) {
+            .linux => {
+                const rc = linux.syscall3(.write, fd, @intFromPtr(remaining.ptr), remaining.len);
+                switch (std.posix.errno(rc)) {
+                    .SUCCESS => {
+                        const written: usize = @intCast(rc);
+                        if (written == 0) return;
+                        remaining = remaining[written..];
+                    },
+                    .INTR => continue,
+                    else => return,
+                }
             },
-            .INTR => continue,
-            else => return,
+            .macos => {
+                const result = darwinWriteSyscall(fd, remaining);
+                if (result.isError()) {
+                    if (result.rc == darwin_eintr) continue;
+                    return;
+                }
+
+                if (result.rc == 0) return;
+                remaining = remaining[result.rc..];
+            },
+            else => unreachable,
         }
     }
 }
@@ -552,4 +622,43 @@ test "mem helpers keep payload buffers explicit and bounded" {
     try std.testing.expectEqual(@as(u8, 'a'), dest[0]);
     try std.testing.expectEqual(@as(u8, 0), dest[1]);
     try std.testing.expectEqual(@as(u8, 0), dest[2]);
+}
+
+test "default print buffer fits the arcapi trace line shape" {
+    var storage: [default_print_buffer_len]u8 = undefined;
+    const rendered = try formatInto(
+        &storage,
+        "trace next_word block={} word={} out=0x{x:0>8} ctr_lo=0x{x:0>8} ctr_hi=0x{x:0>8} a=0x{x:0>8} s0=0x{x:0>8} s16=0x{x:0>8}\n",
+        .{
+            @as(usize, 2),
+            @as(usize, 3),
+            @as(u32, 0x1234ABCD),
+            @as(u32, 0x00010001),
+            @as(u32, 0x00000000),
+            @as(u32, 0x6396D461),
+            @as(u32, 0xCE67963B),
+            @as(u32, 0x651D3CAC),
+        },
+    );
+
+    try std.testing.expect(rendered.len < default_print_buffer_len);
+}
+
+test "darwin raw write path can write bytes to a host file descriptor" {
+    if (builtin.os.tag != .macos or builtin.cpu.arch != .aarch64) {
+        return error.SkipZigTest;
+    }
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const file = try tmp.dir.createFile("zrstd_darwin_write_smoke.txt", .{ .read = true });
+    defer file.close();
+
+    writeAll(@intCast(file.handle), "zrstd darwin smoke");
+    try file.seekTo(0);
+
+    var buffer: [32]u8 = undefined;
+    const len = try file.readAll(&buffer);
+    try std.testing.expectEqualStrings("zrstd darwin smoke", buffer[0..len]);
 }

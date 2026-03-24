@@ -13,11 +13,23 @@ threadlocal var last_link_diagnostic_len: usize = 0;
 pub const PayloadLayout = struct {
     image_size: usize,
     entry_offset: usize,
+    writable_image_size: usize = 0,
+
+    pub fn hasSeparateWritableImage(self: PayloadLayout) bool {
+        return self.writable_image_size != 0;
+    }
 };
 
 pub const LoadedPayload = struct {
     image: []u8,
     entry_offset: usize,
+    writable_image: ?[]u8 = null,
+
+    pub fn deinit(self: *LoadedPayload, allocator: std.mem.Allocator) void {
+        if (self.writable_image) |image| allocator.free(image);
+        allocator.free(self.image);
+        self.* = undefined;
+    }
 };
 
 /// Clears the last payload-linker diagnostic.
@@ -41,6 +53,12 @@ const OutputSection = struct {
     output_offset: usize,
     size: usize,
     alignment: usize,
+    region: PayloadImageRegion = .primary,
+};
+
+const PayloadImageRegion = enum {
+    primary,
+    writable,
 };
 
 /// Key that identifies one synthetic GOT slot inside the injected payload.
@@ -87,6 +105,11 @@ const PreparedObject = struct {
         self.allocator.free(self.section_map);
         self.* = undefined;
     }
+};
+
+const PayloadImageBases = struct {
+    primary: u64,
+    writable: ?u64 = null,
 };
 
 /// Analyzes a relocatable AArch64 ELF object and computes the size/layout of
@@ -176,12 +199,12 @@ pub fn linkObjectBytes(
     image_base_address: u64,
     target_image: ?ElfView,
 ) !LoadedPayload {
-    return linkObjectBytesForFormat(
+    return linkObjectBytesForFormatWithImageBases(
         allocator,
         .elf,
         object_bytes,
         handler_symbol,
-        image_base_address,
+        .{ .primary = image_base_address },
         if (target_image) |view| image_backend.View{ .elf = view } else null,
     );
 }
@@ -201,6 +224,32 @@ pub fn linkObjectBytesForFormat(
     image_base_address: u64,
     target_image: ?image_backend.View,
 ) !LoadedPayload {
+    return linkObjectBytesForFormatWithImageBases(
+        allocator,
+        object_format,
+        object_bytes,
+        handler_symbol,
+        .{ .primary = image_base_address },
+        target_image,
+    );
+}
+
+/// Extended linking entrypoint that can place writable payload sections into a
+/// second injected image.
+///
+/// This is currently exercised only by the Mach-O backend:
+/// - `primary` holds executable code plus read-only data
+/// - `writable`, when present, holds `.data/.bss` state that must not share the
+///   executable carrier segment on macOS arm64 because ad-hoc-signed images are
+///   effectively W^X at runtime
+pub fn linkObjectBytesForFormatWithImageBases(
+    allocator: std.mem.Allocator,
+    object_format: bundle.ObjectFormat,
+    object_bytes: []const u8,
+    handler_symbol: []const u8,
+    image_bases: PayloadImageBases,
+    target_image: ?image_backend.View,
+) !LoadedPayload {
     clearLastLinkDiagnostic();
     return switch (object_format) {
         .elf => blk: {
@@ -214,8 +263,8 @@ pub fn linkObjectBytesForFormat(
             @memset(image, 0);
 
             try copyAllocatedSections(image, view, prepared.output_sections);
-            try initializeGotSlots(image, view, prepared, image_base_address, try elfTargetImage(target_image));
-            try applyRelocations(image, view, prepared, image_base_address, try elfTargetImage(target_image));
+            try initializeGotSlots(image, view, prepared, image_bases.primary, try elfTargetImage(target_image));
+            try applyRelocations(image, view, prepared, image_bases.primary, try elfTargetImage(target_image));
 
             break :blk .{
                 .image = image,
@@ -226,7 +275,7 @@ pub fn linkObjectBytesForFormat(
             allocator,
             object_bytes,
             handler_symbol,
-            image_base_address,
+            image_bases,
             target_image,
         ),
     };
@@ -1075,8 +1124,25 @@ fn patchAdrpImmediate21(
     place_address: u64,
     target_address: u64,
 ) !void {
-    const page_delta = @as(i128, @intCast(target_address & ~@as(u64, 0xFFF))) -
-        @as(i128, @intCast(place_address & ~@as(u64, 0xFFF)));
+    // `ADRP` does *not* encode a raw byte delta.
+    //
+    // The instruction stores a signed 21-bit displacement in units of 4 KiB
+    // pages, and the CPU implicitly appends the low twelve zero bits at
+    // execution time. Feeding the encoder the raw byte delta between the two
+    // page bases would therefore over-scale the relocation by another factor
+    // of 4096 and produce completely bogus targets such as:
+    //
+    //   wanted page delta: 7 pages  -> target around +0x7000
+    //   buggy encoded delta: 0x7000 -> CPU interprets as 0x7000 pages
+    //                                 (= +0x0700_0000 bytes)
+    //
+    // The Mach-O RX/RW split runtime smoke surfaced this clearly because code
+    // in the executable payload image referenced writable state in the
+    // separate `__DATA` carrier segment.
+    const target_page = target_address & ~@as(u64, 0xFFF);
+    const place_page = place_address & ~@as(u64, 0xFFF);
+    const page_delta = @as(i128, @intCast(target_page >> 12)) -
+        @as(i128, @intCast(place_page >> 12));
     if (page_delta < std.math.minInt(i64) or page_delta > std.math.maxInt(i64)) {
         return error.PayloadRelocationOverflow;
     }
@@ -1176,7 +1242,8 @@ const macho_linker = struct {
         section_map: []?usize,
         output_sections: []OutputSection,
         entry_offset: usize,
-        image_size: usize,
+        primary_image_size: usize,
+        writable_image_size: usize,
 
         fn deinit(self: *MachOPreparedObject) void {
             self.allocator.free(self.output_sections);
@@ -1378,8 +1445,9 @@ const macho_linker = struct {
         defer prepared.deinit();
 
         return .{
-            .image_size = prepared.image_size,
+            .image_size = prepared.primary_image_size,
             .entry_offset = prepared.entry_offset,
+            .writable_image_size = prepared.writable_image_size,
         };
     }
 
@@ -1387,7 +1455,7 @@ const macho_linker = struct {
         allocator: std.mem.Allocator,
         object_bytes: []const u8,
         handler_symbol: []const u8,
-        image_base_address: u64,
+        image_bases: PayloadImageBases,
         target_image: ?image_backend.View,
     ) !LoadedPayload {
         const view = try ObjectView.parse(allocator, object_bytes);
@@ -1396,16 +1464,24 @@ const macho_linker = struct {
         var prepared = try prepareMachOObjectLayout(allocator, view, handler_symbol);
         defer prepared.deinit();
 
-        const image = try allocator.alloc(u8, prepared.image_size);
+        const image = try allocator.alloc(u8, prepared.primary_image_size);
         errdefer allocator.free(image);
         @memset(image, 0);
 
-        try copyAllocatedSectionsMachO(image, view, prepared.output_sections);
-        try applyMachORelocations(image, view, prepared, image_base_address, target_image);
+        const writable_image = if (prepared.writable_image_size != 0)
+            try allocator.alloc(u8, prepared.writable_image_size)
+        else
+            null;
+        errdefer if (writable_image) |bytes| allocator.free(bytes);
+        if (writable_image) |bytes| @memset(bytes, 0);
+
+        try copyAllocatedSectionsMachO(image, writable_image, view, prepared.output_sections);
+        try applyMachORelocations(image, writable_image, view, prepared, image_bases, target_image);
 
         return .{
             .image = image,
             .entry_offset = prepared.entry_offset,
+            .writable_image = writable_image,
         };
     }
 
@@ -1421,21 +1497,28 @@ const macho_linker = struct {
         var output_sections: std.array_list.Managed(OutputSection) = .init(allocator);
         defer output_sections.deinit();
 
-        var cursor: usize = 0;
+        var primary_cursor: usize = 0;
+        var writable_cursor: usize = 0;
         for (view.sections) |section| {
             const should_keep = try shouldKeepSection(section);
             if (!should_keep) continue;
 
+            const region = classifySectionRegion(section);
             const alignment = machoSectionAlignment(section.header.@"align");
-            cursor = std.mem.alignForward(usize, cursor, alignment);
+            const cursor = switch (region) {
+                .primary => &primary_cursor,
+                .writable => &writable_cursor,
+            };
+            cursor.* = std.mem.alignForward(usize, cursor.*, alignment);
             section_map[section.ordinal] = output_sections.items.len;
             try output_sections.append(.{
                 .input_index = section.ordinal,
-                .output_offset = cursor,
+                .output_offset = cursor.*,
                 .size = @intCast(section.header.size),
                 .alignment = alignment,
+                .region = region,
             });
-            cursor += @intCast(section.header.size);
+            cursor.* += @intCast(section.header.size);
         }
 
         if (output_sections.items.len == 0) return error.PayloadMissingAllocSections;
@@ -1446,7 +1529,8 @@ const macho_linker = struct {
             .section_map = section_map,
             .output_sections = try output_sections.toOwnedSlice(),
             .entry_offset = entry_offset,
-            .image_size = cursor,
+            .primary_image_size = primary_cursor,
+            .writable_image_size = writable_cursor,
         };
     }
 
@@ -1496,6 +1580,23 @@ const macho_linker = struct {
         };
     }
 
+    /// Chooses which injected Mach-O image will own the section.
+    ///
+    /// Current split policy:
+    /// - executable code and read-only payload data stay in the primary image
+    /// - writable state (`__DATA`, `__bss`, zerofill) moves into the writable
+    ///   image so Mach-O runtime pages do not need to be both executable and
+    ///   writable after ad-hoc code signing
+    fn classifySectionRegion(section: SectionRef) PayloadImageRegion {
+        const segname = parseFixedName(section.header.segname[0..]);
+        const sectname = parseFixedName(section.header.sectname[0..]);
+
+        if (section.header.isZerofill()) return .writable;
+        if (std.mem.eql(u8, segname, "__DATA")) return .writable;
+        if (std.mem.eql(u8, sectname, "__data") or std.mem.eql(u8, sectname, "__bss")) return .writable;
+        return .primary;
+    }
+
     fn machoSectionAlignment(raw_alignment: u32) usize {
         if (raw_alignment == 0) return 1;
         return @as(usize, 1) << @intCast(raw_alignment);
@@ -1518,6 +1619,7 @@ const macho_linker = struct {
             if (ordinal >= section_map.len) return error.InvalidPayloadSymbolSection;
             const mapped_index = section_map[ordinal] orelse return error.PayloadEntryInUnsupportedSection;
             const output_section = output_sections[mapped_index];
+            if (output_section.region != .primary) return error.PayloadEntryInUnsupportedSection;
             const input_section = try view.sectionByOrdinal(ordinal);
             if (symbol.n_value < input_section.header.addr) return error.PayloadSymbolOutOfRange;
             const symbol_offset = symbol.n_value - input_section.header.addr;
@@ -1528,10 +1630,16 @@ const macho_linker = struct {
         return error.PayloadSymbolNotFound;
     }
 
-    fn copyAllocatedSectionsMachO(image: []u8, view: ObjectView, output_sections: []const OutputSection) !void {
+    fn copyAllocatedSectionsMachO(
+        image: []u8,
+        writable_image: ?[]u8,
+        view: ObjectView,
+        output_sections: []const OutputSection,
+    ) !void {
         for (output_sections) |output_section| {
             const input_section = try view.sectionByOrdinal(output_section.input_index);
-            const dest = image[output_section.output_offset .. output_section.output_offset + output_section.size];
+            const dest_image = try imageSliceForRegion(image, writable_image, output_section.region);
+            const dest = dest_image[output_section.output_offset .. output_section.output_offset + output_section.size];
             if (input_section.header.isZerofill()) {
                 @memset(dest, 0);
                 continue;
@@ -1552,15 +1660,18 @@ const macho_linker = struct {
     /// file's placeholder addresses.
     fn applyMachORelocations(
         image: []u8,
+        writable_image: ?[]u8,
         view: ObjectView,
         prepared: MachOPreparedObject,
-        image_base_address: u64,
+        image_bases: PayloadImageBases,
         target_image: ?image_backend.View,
     ) !void {
         for (view.sections) |section| {
             const mapped_target = prepared.section_map[section.ordinal] orelse continue;
             const relocs = try view.sectionRelocations(section.ordinal);
             const output_section = prepared.output_sections[mapped_target];
+            const patch_image = try imageSliceForRegion(image, writable_image, output_section.region);
+            const place_base = try baseAddressForRegion(image_bases, output_section.region);
 
             var pending_addend: ?PendingAddend = null;
             for (relocs) |reloc| {
@@ -1585,15 +1696,15 @@ const macho_linker = struct {
                 } else 0;
 
                 const patch_offset = try machOPatchOffset(output_section, reloc);
-                const place_address = try addAddressOffset(image_base_address, patch_offset);
+                const place_address = try addAddressOffset(place_base, patch_offset);
 
                 applyRelocation(
-                    image,
+                    patch_image,
                     view,
                     prepared,
                     section,
                     patch_offset,
-                    image_base_address,
+                    image_bases,
                     place_address,
                     reloc,
                     relocation_type,
@@ -1624,13 +1735,31 @@ const macho_linker = struct {
         return output_section.output_offset + section_relative_offset;
     }
 
+    fn imageSliceForRegion(
+        primary_image: []u8,
+        writable_image: ?[]u8,
+        region: PayloadImageRegion,
+    ) ![]u8 {
+        return switch (region) {
+            .primary => primary_image,
+            .writable => writable_image orelse error.MissingWritablePayloadImage,
+        };
+    }
+
+    fn baseAddressForRegion(image_bases: PayloadImageBases, region: PayloadImageRegion) !u64 {
+        return switch (region) {
+            .primary => image_bases.primary,
+            .writable => image_bases.writable orelse error.MissingWritablePayloadImageBase,
+        };
+    }
+
     fn applyRelocation(
         image: []u8,
         view: ObjectView,
         prepared: MachOPreparedObject,
         section: SectionRef,
         patch_offset: usize,
-        image_base_address: u64,
+        image_bases: PayloadImageBases,
         place_address: u64,
         reloc: macho.relocation_info,
         relocation_type: macho.reloc_type_arm64,
@@ -1643,7 +1772,7 @@ const macho_linker = struct {
             view,
             prepared,
             reloc,
-            image_base_address,
+            image_bases,
             target_image,
         );
 
@@ -1730,12 +1859,12 @@ const macho_linker = struct {
         view: ObjectView,
         prepared: MachOPreparedObject,
         reloc: macho.relocation_info,
-        image_base_address: u64,
+        image_bases: PayloadImageBases,
         target_image: ?image_backend.View,
     ) !u64 {
         if (reloc.r_extern == 0) {
             if (reloc.r_symbolnum == r_abs_symbolnum) return 0;
-            return resolveSectionOrdinalAddress(view, prepared, reloc.r_symbolnum, image_base_address);
+            return resolveSectionOrdinalAddress(view, prepared, reloc.r_symbolnum, image_bases);
         }
 
         const symbol_index: usize = reloc.r_symbolnum;
@@ -1744,7 +1873,7 @@ const macho_linker = struct {
 
         if (symbol.stab()) return error.UnsupportedPayloadRelocation;
         if (symbol.abs()) return symbol.n_value;
-        if (symbol.sect()) return resolveSymbolAddressInPayload(view, prepared, symbol, image_base_address);
+        if (symbol.sect()) return resolveSymbolAddressInPayload(view, prepared, symbol, image_bases);
 
         if (symbol.undf()) {
             if (symbol.tentative()) return error.UnsupportedPayloadCommonSymbol;
@@ -1772,21 +1901,21 @@ const macho_linker = struct {
         view: ObjectView,
         prepared: MachOPreparedObject,
         ordinal_u24: anytype,
-        image_base_address: u64,
+        image_bases: PayloadImageBases,
     ) !u64 {
         const ordinal: usize = ordinal_u24;
         if (ordinal >= prepared.section_map.len) return error.InvalidPayloadSymbolSection;
         const mapped_index = prepared.section_map[ordinal] orelse return error.SymbolTargetsDroppedSection;
         const output_section = prepared.output_sections[mapped_index];
         _ = try view.sectionByOrdinal(ordinal);
-        return addAddressOffset(image_base_address, output_section.output_offset);
+        return addAddressOffset(try baseAddressForRegion(image_bases, output_section.region), output_section.output_offset);
     }
 
     fn resolveSymbolAddressInPayload(
         view: ObjectView,
         prepared: MachOPreparedObject,
         symbol: macho.nlist_64,
-        image_base_address: u64,
+        image_bases: PayloadImageBases,
     ) !u64 {
         const ordinal: usize = symbol.n_sect;
         if (ordinal >= prepared.section_map.len) return error.InvalidPayloadSymbolSection;
@@ -1796,7 +1925,10 @@ const macho_linker = struct {
         if (symbol.n_value < input_section.header.addr) return error.PayloadSymbolOutOfRange;
         const symbol_offset = symbol.n_value - input_section.header.addr;
         if (symbol_offset > output_section.size) return error.PayloadSymbolOutOfRange;
-        return addAddressOffset(image_base_address, output_section.output_offset + @as(usize, @intCast(symbol_offset)));
+        return addAddressOffset(
+            try baseAddressForRegion(image_bases, output_section.region),
+            output_section.output_offset + @as(usize, @intCast(symbol_offset)),
+        );
     }
 
     fn noteMachORelocationFailure(
@@ -1868,9 +2000,26 @@ const macho_linker = struct {
             return 0;
         }
 
-        // Load/store unsigned immediate. For the scalar forms used by the
-        // first payload tests, the access scale is encoded in `size[31:30]`.
+        // Load/store unsigned immediate.
+        //
+        // Two relevant arm64 encoding families land here:
+        // - the classic scalar integer loads/stores, where `size[31:30]`
+        //   directly carries the byte scale
+        // - the SIMD/FP unsigned-immediate forms Zig also emits for payload
+        //   authoring patterns such as copying a 16-byte `{ ptr, len }`
+        //   constant into a local `[]u8` slice descriptor before calling
+        //   `zrstd.debug.print`
+        //
+        // The latter matters for Mach-O because PAGEOFF12 only gives us the
+        // final symbol address; the linker still has to recover the scale from
+        // the consumer instruction itself. Q-register loads/stores encode a
+        // 16-byte scale even though `size[31:30] == 0`, so blindly reusing the
+        // scalar decoder would patch the raw byte offset into the imm12 field
+        // and overshoot the target by another factor of 16 at runtime.
         if ((opcode & 0x3B00_0000) == 0x3900_0000) {
+            if (((opcode >> 30) & 0x3) == 0 and ((opcode >> 23) & 1) != 0) {
+                return 4;
+            }
             return @intCast((opcode >> 30) & 0x3);
         }
 
@@ -1984,4 +2133,11 @@ fn sliceStructs(comptime T: type, bytes: []u8, offset: usize, count: usize) []al
 fn sliceConstStructs(comptime T: type, bytes: []const u8, offset: usize, count: usize) []align(1) const T {
     const byte_len = count * @sizeOf(T);
     return std.mem.bytesAsSlice(T, bytes[offset .. offset + byte_len]);
+}
+
+test "Mach-O PAGEOFF12 scale decoder handles scalar and q-register unsigned loads" {
+    try std.testing.expectEqual(@as(u6, 2), try macho_linker.pageOffShiftForInstruction(0xBD40_0400));
+    try std.testing.expectEqual(@as(u6, 3), try macho_linker.pageOffShiftForInstruction(0xFD40_0400));
+    try std.testing.expectEqual(@as(u6, 4), try macho_linker.pageOffShiftForInstruction(0x3DC0_0100));
+    try std.testing.expectEqual(@as(u6, 4), try macho_linker.pageOffShiftForInstruction(0x3D80_0400));
 }

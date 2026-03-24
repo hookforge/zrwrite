@@ -59,6 +59,21 @@ The ABI should support the following invariant:
 In other words, the callback edits state; the selected hook mode defines how
 execution resumes when the callback returns.
 
+## Payload Image Sharing Rule
+
+Within one rewrite session, repeated **instrument** hooks that point at the
+same payload object should behave as if they are entering different exported
+functions from one injected payload module.
+
+That means:
+
+- payload `.text` is injected once
+- payload `.data` / `.bss` are shared across those handlers
+- each hook still gets its own hook-local stub / trampoline plumbing
+
+This is the user-facing "looks like one payload" model. Replace hooks are not
+yet part of this sharing rule.
+
 ## Compatibility Policy
 
 - New fields may only be added if ABI layout remains compatible

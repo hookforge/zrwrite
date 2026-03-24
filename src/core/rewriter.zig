@@ -4,8 +4,10 @@ const bundle = @import("bundle.zig");
 const aarch64 = @import("../isa/aarch64/root.zig");
 const image_backend = @import("image_backend.zig");
 const ElfView = @import("../format/elf/root.zig").View;
-const MachOView = @import("../format/macho/root.zig").View;
-const MachOInjectionPlan = @import("../format/macho/root.zig").InjectionPlan;
+const macho_format = @import("../format/macho/root.zig");
+const MachOView = macho_format.View;
+const MachOInjectionPlan = macho_format.InjectionPlan;
+const MachOSplitInjectionPlan = macho_format.SplitInjectionPlan;
 const payload = @import("payload/object.zig");
 const pattern_locator = @import("pattern_locator.zig");
 
@@ -116,11 +118,40 @@ const ImageInjectionPlan = union(enum) {
     }
 };
 
+/// Cache entry for the "inject once, attach many instrument hooks" model.
+///
+/// User expectation is that one payload object behaves like one module:
+/// - its `.text` is emitted once
+/// - its writable `.data` / `.bss` live in one shared image
+/// - multiple handler symbols inside that object can observe the same globals
+///
+/// We intentionally key this by the full object bytes plus binary format. That
+/// keeps the semantics simple and avoids accidental sharing across different
+/// payload builds that merely happen to export the same symbol names.
+const SharedInstrumentPayload = struct {
+    binary_format: bundle.BinaryFormat,
+    object_bytes: []u8,
+    primary_base_address: u64,
+
+    fn deinit(self: *SharedInstrumentPayload, allocator: std.mem.Allocator) void {
+        allocator.free(self.object_bytes);
+        self.* = undefined;
+    }
+};
+
 pub const Rewriter = struct {
     allocator: std.mem.Allocator,
     input_bytes: []u8,
     output_bytes: ?[]u8 = null,
     input_mode: u16,
+    /// Instrument hooks reuse previously injected payload images when the same
+    /// object bytes are attached again during one rewrite session.
+    ///
+    /// Scope of this cache:
+    /// - applies only to instrument hooks
+    /// - shared only within one `Rewriter`
+    /// - replace hooks still inject their own standalone payload image
+    shared_instrument_payloads: std.ArrayListUnmanaged(SharedInstrumentPayload) = .empty,
 
     pub fn initPath(allocator: std.mem.Allocator, input_path: []const u8) !Rewriter {
         const input_bytes = try std.fs.cwd().readFileAlloc(allocator, input_path, std.math.maxInt(usize));
@@ -136,6 +167,8 @@ pub const Rewriter = struct {
     }
 
     pub fn deinit(self: *Rewriter) void {
+        for (self.shared_instrument_payloads.items) |*entry| entry.deinit(self.allocator);
+        self.shared_instrument_payloads.deinit(self.allocator);
         if (self.output_bytes) |output| self.allocator.free(output);
         self.allocator.free(self.input_bytes);
         self.* = undefined;
@@ -203,9 +236,13 @@ pub const Rewriter = struct {
         clearLastRewriteDiagnostic();
         const base_bytes = self.workingBytes();
         const input_view = try image_backend.View.parseAs(base_bytes, binary_format);
+        // Repeated instrument attachments of the same payload object should
+        // look like multiple entry points into one payload module, not like N
+        // silently duplicated modules with isolated global state.
+        const shared_payload = self.findSharedInstrumentPayload(binary_format, spec.payload_object_bytes);
         return switch (input_view) {
-            .elf => |view| self.addInstrumentHookObjectElf(view, spec),
-            .macho => |view| self.addInstrumentHookObjectMachO(view, spec),
+            .elf => |view| self.addInstrumentHookObjectElf(view, spec, shared_payload),
+            .macho => |view| self.addInstrumentHookObjectMachO(view, spec, shared_payload),
         };
     }
 
@@ -213,6 +250,7 @@ pub const Rewriter = struct {
         self: *Rewriter,
         input_view: ElfView,
         spec: InstrumentObjectSpec,
+        shared_payload: ?SharedInstrumentPayload,
     ) !InstrumentRewriteReport {
         const target_view: image_backend.View = .{ .elf = input_view };
         const base_bytes = self.workingBytes();
@@ -239,15 +277,15 @@ pub const Rewriter = struct {
         const needs_raw_trampoline = windowNeedsRawTrampoline(window_plan);
         const enable_bti = target_view.hasAarch64BtiProperty();
         const bti_prefix_size: usize = if (enable_bti) @sizeOf(u32) else 0;
+        const payload_layout = try payload.analyzeObjectBytesForFormat(
+            self.allocator,
+            .elf,
+            spec.payload_object_bytes,
+            spec.handler_symbol,
+        );
 
-        // The mini-linker runs in two phases:
-        // 1. analyze the object so we know how large the injected image must be
-        // 2. after the final injection VA is chosen, link/relocate the payload
-        //    against that concrete base address and the target ELF symbol set
-        const payload_layout = try payload.analyzeObjectBytes(self.allocator, spec.payload_object_bytes, spec.handler_symbol);
-
-        const callback_offset = 0;
-        const trampoline_offset = std.mem.alignForward(usize, payload_layout.image_size, 8);
+        const payload_image_size: usize = if (shared_payload == null) payload_layout.image_size else 0;
+        const trampoline_offset = std.mem.alignForward(usize, payload_image_size, 8);
         const trampoline_size = if (needs_raw_trampoline)
             if (stolen_instruction_count == 1 and replay_plan.requiresRawTrampoline())
                 aarch64.original_trampoline_size + bti_prefix_size
@@ -274,23 +312,15 @@ pub const Rewriter = struct {
 
         const injected_size = stub_offset + stub_size;
         const plan = try planInjectedImage(target_view, injected_size);
-        const callback_address = plan.payloadBaseAddress() + callback_offset + payload_layout.entry_offset;
+        const callback_address = if (shared_payload) |entry|
+            entry.primary_base_address + payload_layout.entry_offset
+        else
+            plan.payloadBaseAddress() + payload_layout.entry_offset;
         const trampoline_address = if (needs_raw_trampoline)
             plan.payloadBaseAddress() + trampoline_offset
         else
             0;
         const stub_address = plan.payloadBaseAddress() + stub_offset;
-
-        const loaded_payload = try payload.linkObjectBytes(
-            self.allocator,
-            spec.payload_object_bytes,
-            spec.handler_symbol,
-            plan.payloadBaseAddress() + callback_offset,
-            input_view,
-        );
-        defer self.allocator.free(loaded_payload.image);
-        std.debug.assert(loaded_payload.entry_offset == payload_layout.entry_offset);
-        std.debug.assert(loaded_payload.image.len == payload_layout.image_size);
 
         const fixed_stub = try aarch64.buildInstrumentStub(.{
             .allocator = self.allocator,
@@ -306,13 +336,26 @@ pub const Rewriter = struct {
         defer self.allocator.free(fixed_stub);
         std.debug.assert(fixed_stub.len == stub_size);
 
-        const output = try materializeInjectedOutput(self, target_view, base_bytes, plan);
+        var output = try materializeInjectedOutput(self, target_view, base_bytes, plan);
         errdefer self.allocator.free(output);
 
-        @memcpy(
-            output[plan.injectionOffset() + callback_offset .. plan.injectionOffset() + callback_offset + loaded_payload.image.len],
-            loaded_payload.image,
-        );
+        if (shared_payload == null) {
+            const loaded_payload = try payload.linkObjectBytes(
+                self.allocator,
+                spec.payload_object_bytes,
+                spec.handler_symbol,
+                plan.payloadBaseAddress(),
+                input_view,
+            );
+            defer self.allocator.free(loaded_payload.image);
+            std.debug.assert(loaded_payload.entry_offset == payload_layout.entry_offset);
+            std.debug.assert(loaded_payload.image.len == payload_layout.image_size);
+
+            @memcpy(
+                output[plan.injectionOffset() .. plan.injectionOffset() + loaded_payload.image.len],
+                loaded_payload.image,
+            );
+        }
 
         if (needs_raw_trampoline) {
             const stolen_bytes = base_bytes[target.file_offset .. target.file_offset + stolen_window_size];
@@ -349,7 +392,7 @@ pub const Rewriter = struct {
 
         @memcpy(output[plan.injectionOffset() + stub_offset .. plan.injectionOffset() + stub_offset + fixed_stub.len], fixed_stub);
 
-        try finalizeInjectedOutput(target_view, output, plan, true);
+        output = try finalizeInjectedOutput(self.allocator, target_view, output, plan, true);
 
         try writeInstrumentDetourPatch(
             output,
@@ -368,6 +411,13 @@ pub const Rewriter = struct {
             );
         }
 
+        if (shared_payload == null) {
+            try self.rememberSharedInstrumentPayload(
+                .elf,
+                spec.payload_object_bytes,
+                plan.payloadBaseAddress(),
+            );
+        }
         self.installOutput(output);
 
         return .{
@@ -385,6 +435,7 @@ pub const Rewriter = struct {
         self: *Rewriter,
         input_view: MachOView,
         spec: InstrumentObjectSpec,
+        shared_payload: ?SharedInstrumentPayload,
     ) !InstrumentRewriteReport {
         const target_view: image_backend.View = .{ .macho = input_view };
         const base_bytes = self.workingBytes();
@@ -428,8 +479,9 @@ pub const Rewriter = struct {
             spec.handler_symbol,
         );
 
-        const callback_offset = 0;
-        const trampoline_offset = std.mem.alignForward(usize, payload_layout.image_size, 8);
+        const payload_image_size: usize = if (shared_payload == null) payload_layout.image_size else 0;
+        const writable_image_size: usize = if (shared_payload == null) payload_layout.writable_image_size else 0;
+        const trampoline_offset = std.mem.alignForward(usize, payload_image_size, 8);
         const trampoline_size = if (needs_raw_trampoline)
             if (stolen_instruction_count == 1 and replay_plan.requiresRawTrampoline())
                 aarch64.original_trampoline_size + bti_prefix_size
@@ -454,26 +506,21 @@ pub const Rewriter = struct {
         defer self.allocator.free(stub);
         std.debug.assert(stub.len == stub_size);
 
-        const injected_size = stub_offset + stub_size;
-        const plan = try planInjectedImage(target_view, injected_size);
-        const callback_address = plan.payloadBaseAddress() + callback_offset + payload_layout.entry_offset;
+        const executable_injected_size = stub_offset + stub_size;
+        const split_plan = try input_view.planSplitInjection(
+            executable_injected_size,
+            writable_image_size,
+            16,
+        );
+        const callback_address = if (shared_payload) |entry|
+            entry.primary_base_address + payload_layout.entry_offset
+        else
+            split_plan.executable.payload_base_address + payload_layout.entry_offset;
         const trampoline_address = if (needs_raw_trampoline)
-            plan.payloadBaseAddress() + trampoline_offset
+            split_plan.executable.payload_base_address + trampoline_offset
         else
             0;
-        const stub_address = plan.payloadBaseAddress() + stub_offset;
-
-        const loaded_payload = try payload.linkObjectBytesForFormat(
-            self.allocator,
-            .macho,
-            spec.payload_object_bytes,
-            spec.handler_symbol,
-            plan.payloadBaseAddress() + callback_offset,
-            target_view,
-        );
-        defer self.allocator.free(loaded_payload.image);
-        std.debug.assert(loaded_payload.entry_offset == payload_layout.entry_offset);
-        std.debug.assert(loaded_payload.image.len == payload_layout.image_size);
+        const stub_address = split_plan.executable.payload_base_address + stub_offset;
 
         const fixed_stub = try aarch64.buildInstrumentStub(.{
             .allocator = self.allocator,
@@ -489,13 +536,43 @@ pub const Rewriter = struct {
         defer self.allocator.free(fixed_stub);
         std.debug.assert(fixed_stub.len == stub_size);
 
-        const output = try materializeInjectedOutput(self, target_view, base_bytes, plan);
+        var output = try input_view.materializeSplitInjectedImage(self.allocator, split_plan);
         errdefer self.allocator.free(output);
 
-        @memcpy(
-            output[plan.injectionOffset() + callback_offset .. plan.injectionOffset() + callback_offset + loaded_payload.image.len],
-            loaded_payload.image,
-        );
+        if (shared_payload == null) {
+            var loaded_payload = try payload.linkObjectBytesForFormatWithImageBases(
+                self.allocator,
+                .macho,
+                spec.payload_object_bytes,
+                spec.handler_symbol,
+                .{
+                    .primary = split_plan.executable.payload_base_address,
+                    .writable = if (split_plan.writable) |region| region.payload_base_address else null,
+                },
+                target_view,
+            );
+            defer loaded_payload.deinit(self.allocator);
+            std.debug.assert(loaded_payload.entry_offset == payload_layout.entry_offset);
+            std.debug.assert(loaded_payload.image.len == payload_layout.image_size);
+            if (payload_layout.writable_image_size == 0) {
+                std.debug.assert(loaded_payload.writable_image == null);
+            } else {
+                std.debug.assert(loaded_payload.writable_image != null);
+                std.debug.assert(loaded_payload.writable_image.?.len == payload_layout.writable_image_size);
+            }
+
+            @memcpy(
+                output[split_plan.executable.injection_offset .. split_plan.executable.injection_offset + loaded_payload.image.len],
+                loaded_payload.image,
+            );
+            if (loaded_payload.writable_image) |writable_image| {
+                const writable_plan = split_plan.writable orelse return error.MissingWritablePayloadImageBase;
+                @memcpy(
+                    output[writable_plan.injection_offset .. writable_plan.injection_offset + writable_image.len],
+                    writable_image,
+                );
+            }
+        }
 
         if (needs_raw_trampoline) {
             const stolen_bytes = base_bytes[target.file_offset .. target.file_offset + stolen_window_size];
@@ -511,7 +588,7 @@ pub const Rewriter = struct {
                 );
                 defer self.allocator.free(trampoline);
                 @memcpy(
-                    output[plan.injectionOffset() + trampoline_offset .. plan.injectionOffset() + trampoline_offset + trampoline.len],
+                    output[split_plan.executable.injection_offset + trampoline_offset .. split_plan.executable.injection_offset + trampoline_offset + trampoline.len],
                     trampoline,
                 );
             } else {
@@ -524,15 +601,18 @@ pub const Rewriter = struct {
                 );
                 defer self.allocator.free(trampoline);
                 @memcpy(
-                    output[plan.injectionOffset() + trampoline_offset .. plan.injectionOffset() + trampoline_offset + trampoline.len],
+                    output[split_plan.executable.injection_offset + trampoline_offset .. split_plan.executable.injection_offset + trampoline_offset + trampoline.len],
                     trampoline,
                 );
             }
         }
 
-        @memcpy(output[plan.injectionOffset() + stub_offset .. plan.injectionOffset() + stub_offset + fixed_stub.len], fixed_stub);
+        @memcpy(
+            output[split_plan.executable.injection_offset + stub_offset .. split_plan.executable.injection_offset + stub_offset + fixed_stub.len],
+            fixed_stub,
+        );
 
-        try finalizeInjectedOutput(target_view, output, plan, true);
+        output = try finalizeMachOSplitOutput(self.allocator, output, split_plan);
 
         try writeInstrumentDetourPatch(
             output,
@@ -551,6 +631,13 @@ pub const Rewriter = struct {
             );
         }
 
+        if (shared_payload == null) {
+            try self.rememberSharedInstrumentPayload(
+                .macho,
+                spec.payload_object_bytes,
+                split_plan.executable.payload_base_address,
+            );
+        }
         self.installOutput(output);
 
         return .{
@@ -559,9 +646,45 @@ pub const Rewriter = struct {
             .payload_entry_address = callback_address,
             .trampoline_address = if (needs_raw_trampoline) trampoline_address else null,
             .stub_address = stub_address,
-            .injection_offset = plan.injectionOffset(),
-            .injected_size = injected_size,
+            .injection_offset = split_plan.executable.injection_offset,
+            .injected_size = executable_injected_size + writable_image_size,
         };
+    }
+
+    fn findSharedInstrumentPayload(
+        self: *const Rewriter,
+        binary_format: bundle.BinaryFormat,
+        object_bytes: []const u8,
+    ) ?SharedInstrumentPayload {
+        for (self.shared_instrument_payloads.items) |entry| {
+            if (entry.binary_format != binary_format) continue;
+            if (!std.mem.eql(u8, entry.object_bytes, object_bytes)) continue;
+            return entry;
+        }
+        return null;
+    }
+
+    fn rememberSharedInstrumentPayload(
+        self: *Rewriter,
+        binary_format: bundle.BinaryFormat,
+        object_bytes: []const u8,
+        primary_base_address: u64,
+    ) !void {
+        // The first hook that injects a payload image becomes the canonical
+        // storage location for later hooks that reuse the same object bytes.
+        // Later hooks only need their own local detour/trampoline/stub pieces;
+        // their callback address is recovered as:
+        //   shared primary base + handler entry offset
+        if (self.findSharedInstrumentPayload(binary_format, object_bytes) != null) return;
+
+        const owned_bytes = try self.allocator.dupe(u8, object_bytes);
+        errdefer self.allocator.free(owned_bytes);
+
+        try self.shared_instrument_payloads.append(self.allocator, .{
+            .binary_format = binary_format,
+            .object_bytes = owned_bytes,
+            .primary_base_address = primary_base_address,
+        });
     }
 
     pub fn addReplaceHookObject(self: *Rewriter, spec: ReplaceObjectSpec) !ReplaceRewriteReport {
@@ -612,11 +735,11 @@ pub const Rewriter = struct {
         std.debug.assert(loaded_payload.entry_offset == payload_layout.entry_offset);
         std.debug.assert(loaded_payload.image.len == payload_layout.image_size);
 
-        const output = try materializeInjectedOutput(self, target_view, base_bytes, plan);
+        var output = try materializeInjectedOutput(self, target_view, base_bytes, plan);
         errdefer self.allocator.free(output);
         @memcpy(output[plan.injectionOffset() .. plan.injectionOffset() + loaded_payload.image.len], loaded_payload.image);
 
-        try finalizeInjectedOutput(target_view, output, plan, true);
+        output = try finalizeInjectedOutput(self.allocator, target_view, output, plan, true);
 
         const branch_opcode = aarch64.encodeBranchImmediate(target.address, payload_entry_address) catch |err| {
             if (err == error.BranchOutOfRange) {
@@ -661,27 +784,49 @@ pub const Rewriter = struct {
             spec.replacement_symbol,
         );
 
-        const injected_size = payload_layout.image_size;
-        const plan = try planInjectedImage(target_view, injected_size);
-        const payload_entry_address = plan.payloadBaseAddress() + payload_layout.entry_offset;
+        const split_plan = try input_view.planSplitInjection(
+            payload_layout.image_size,
+            payload_layout.writable_image_size,
+            16,
+        );
+        const payload_entry_address = split_plan.executable.payload_base_address + payload_layout.entry_offset;
 
-        const loaded_payload = try payload.linkObjectBytesForFormat(
+        var loaded_payload = try payload.linkObjectBytesForFormatWithImageBases(
             self.allocator,
             .macho,
             spec.payload_object_bytes,
             spec.replacement_symbol,
-            plan.payloadBaseAddress(),
+            .{
+                .primary = split_plan.executable.payload_base_address,
+                .writable = if (split_plan.writable) |region| region.payload_base_address else null,
+            },
             target_view,
         );
-        defer self.allocator.free(loaded_payload.image);
+        defer loaded_payload.deinit(self.allocator);
         std.debug.assert(loaded_payload.entry_offset == payload_layout.entry_offset);
         std.debug.assert(loaded_payload.image.len == payload_layout.image_size);
+        if (payload_layout.writable_image_size == 0) {
+            std.debug.assert(loaded_payload.writable_image == null);
+        } else {
+            std.debug.assert(loaded_payload.writable_image != null);
+            std.debug.assert(loaded_payload.writable_image.?.len == payload_layout.writable_image_size);
+        }
 
-        const output = try materializeInjectedOutput(self, target_view, base_bytes, plan);
+        var output = try input_view.materializeSplitInjectedImage(self.allocator, split_plan);
         errdefer self.allocator.free(output);
-        @memcpy(output[plan.injectionOffset() .. plan.injectionOffset() + loaded_payload.image.len], loaded_payload.image);
+        @memcpy(
+            output[split_plan.executable.injection_offset .. split_plan.executable.injection_offset + loaded_payload.image.len],
+            loaded_payload.image,
+        );
+        if (loaded_payload.writable_image) |writable_image| {
+            const writable_plan = split_plan.writable orelse return error.MissingWritablePayloadImageBase;
+            @memcpy(
+                output[writable_plan.injection_offset .. writable_plan.injection_offset + writable_image.len],
+                writable_image,
+            );
+        }
 
-        try finalizeInjectedOutput(target_view, output, plan, true);
+        output = try finalizeMachOSplitOutput(self.allocator, output, split_plan);
 
         const branch_opcode = aarch64.encodeBranchImmediate(target.address, payload_entry_address) catch |err| {
             if (err == error.BranchOutOfRange) {
@@ -700,8 +845,8 @@ pub const Rewriter = struct {
             .target_address = target.address,
             .target_file_offset = target.file_offset,
             .payload_entry_address = payload_entry_address,
-            .injection_offset = plan.injectionOffset(),
-            .injected_size = injected_size,
+            .injection_offset = split_plan.executable.injection_offset,
+            .injected_size = payload_layout.image_size + payload_layout.writable_image_size,
         };
     }
 };
@@ -1246,22 +1391,73 @@ fn materializeElfInjectedOutput(self: *Rewriter, source_bytes: []const u8, plan:
 /// pipeline only needs one abstract operation here:
 /// "the injected bytes are now in place, repair the executable image so the
 /// loader and later address lookups agree with that new layout".
+///
+/// Mach-O may additionally shrink the output:
+/// - stale `LC_CODE_SIGNATURE` data is removed when the layout is provably safe
+///   for later ad-hoc re-signing
+/// - the physical byte slice is then truncated so `writeToPath()` emits the
+///   same file extent that the repaired load commands now describe
 fn finalizeInjectedOutput(
+    allocator: std.mem.Allocator,
     input_view: image_backend.View,
     output: []u8,
     plan: ImageInjectionPlan,
     make_executable: bool,
-) !void {
+) ![]u8 {
     return switch (plan) {
         .elf => |elf_plan| switch (input_view) {
-            .elf => |view| finalizeElfInjectedOutput(view, output, elf_plan, make_executable),
+            .elf => |view| blk: {
+                try finalizeElfInjectedOutput(view, output, elf_plan, make_executable);
+                break :blk output;
+            },
             .macho => unreachable,
         },
         .macho => |macho_plan| {
             var output_view = try MachOView.parse(output);
-            try output_view.finalizeInjectedImage(macho_plan, make_executable);
+            const final_size = output_view.finalizeInjectedImage(macho_plan, make_executable) catch |err| switch (err) {
+                error.UnsafeMachOCodeSignatureLayout => {
+                    if (macho_format.lastDiagnosticMessage()) |message| {
+                        recordRewriteDiagnostic("{s}", .{message});
+                    } else {
+                        recordRewriteDiagnostic(
+                            "Mach-O codesign closure refused: output would remain only structurally parseable, not safely re-signable",
+                            .{},
+                        );
+                    }
+                    return err;
+                },
+                else => return err,
+            };
+
+            if (final_size == output.len) return output;
+            return try allocator.realloc(output, final_size);
         },
     };
+}
+
+fn finalizeMachOSplitOutput(
+    allocator: std.mem.Allocator,
+    output: []u8,
+    plan: MachOSplitInjectionPlan,
+) ![]u8 {
+    var output_view = try MachOView.parse(output);
+    const final_size = output_view.finalizeSplitInjectedImage(plan) catch |err| switch (err) {
+        error.UnsafeMachOCodeSignatureLayout => {
+            if (macho_format.lastDiagnosticMessage()) |message| {
+                recordRewriteDiagnostic("{s}", .{message});
+            } else {
+                recordRewriteDiagnostic(
+                    "Mach-O codesign closure refused: output would remain only structurally parseable, not safely re-signable",
+                    .{},
+                );
+            }
+            return err;
+        },
+        else => return err,
+    };
+
+    if (final_size == output.len) return output;
+    return try allocator.realloc(output, final_size);
 }
 
 /// Repairs ELF metadata after the new payload bytes have been inserted.

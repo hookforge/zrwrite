@@ -207,6 +207,7 @@ test "Mach-O view plans linkedit-tail injection and can clear stale code signatu
     const original_linkedit_vmaddr = linkedit.command.vmaddr;
     const original_symtab = (try view.symbolTableRange()).?;
     const original_strtab = (try view.stringTableRange()).?;
+    const original_code_signature = (try view.codeSignatureRange()).?;
     const carrier_end = std.mem.alignForward(
         usize,
         @as(usize, @intCast(carrier.command.fileoff + @max(carrier.command.filesize, carrier.command.vmsize))),
@@ -223,23 +224,23 @@ test "Mach-O view plans linkedit-tail injection and can clear stale code signatu
     defer allocator.free(output_bytes);
 
     const output_view = try zrwrite.format.macho.View.parse(output_bytes);
-    try output_view.finalizeInjectedImage(plan, true);
+    const final_size = try output_view.finalizeInjectedImage(plan, true);
+    try std.testing.expectEqual(output_bytes.len - original_code_signature.size, final_size);
 
-    const output_carrier = try output_view.segmentByName(carrier.segName());
+    const finalized_view = try zrwrite.format.macho.View.parse(output_bytes[0..final_size]);
+    const output_carrier = try finalized_view.segmentByName(carrier.segName());
     try std.testing.expectEqual(plan.injection_end_offset - @as(usize, @intCast(carrier.command.fileoff)), output_carrier.command.filesize);
     try std.testing.expectEqual(output_carrier.command.filesize, output_carrier.command.vmsize);
     try std.testing.expect((output_carrier.command.initprot & std.macho.PROT.EXEC) != 0);
     try std.testing.expect((output_carrier.command.maxprot & std.macho.PROT.EXEC) != 0);
 
-    const shifted_linkedit = try output_view.segmentByName("__LINKEDIT");
+    const shifted_linkedit = try finalized_view.segmentByName("__LINKEDIT");
     try std.testing.expectEqual(original_linkedit_fileoff + plan.tail_shift, shifted_linkedit.command.fileoff);
     try std.testing.expectEqual(original_linkedit_vmaddr + plan.tail_shift, shifted_linkedit.command.vmaddr);
-    try std.testing.expectEqual(original_symtab.offset + plan.tail_shift, (try output_view.symbolTableRange()).?.offset);
-    try std.testing.expectEqual(original_strtab.offset + plan.tail_shift, (try output_view.stringTableRange()).?.offset);
-
-    const cleared_code_signature = (try output_view.codeSignatureRange()).?;
-    try std.testing.expectEqual(@as(usize, 0), cleared_code_signature.offset);
-    try std.testing.expectEqual(@as(usize, 0), cleared_code_signature.size);
+    try std.testing.expectEqual(original_symtab.offset + plan.tail_shift, (try finalized_view.symbolTableRange()).?.offset);
+    try std.testing.expectEqual(original_strtab.offset + plan.tail_shift, (try finalized_view.stringTableRange()).?.offset);
+    try std.testing.expectEqual(@as(u64, @intCast(final_size)), shifted_linkedit.command.fileoff + shifted_linkedit.command.filesize);
+    try std.testing.expect((try finalized_view.codeSignatureRange()) == null);
 }
 
 test "Mach-O rewriter applies native instrument payload with rodata/data/bss relocations" {
@@ -321,7 +322,7 @@ test "Mach-O rewriter applies native instrument payload with rodata/data/bss rel
     try std.testing.expect(report.payload_entry_address < report.stub_address.?);
     try std.testing.expect(report.injection_offset < output_bytes.len);
     try std.testing.expectEqual(report.payload_entry_address, try output_view.offsetToAddress(report.injection_offset));
-    try std.testing.expect((try output_view.codeSignatureRange()).?.size == 0);
+    try std.testing.expect((try output_view.codeSignatureRange()) == null);
 }
 
 test "Mach-O rewriter applies native replace payload with BRANCH26 relocations" {
@@ -398,7 +399,455 @@ test "Mach-O rewriter applies native replace payload with BRANCH26 relocations" 
     const branch_target = try zrwrite.aarch64.decodeBranchTarget(branch_opcode, report.target_address);
     try std.testing.expectEqual(report.payload_entry_address, branch_target);
     try std.testing.expectEqual(report.payload_entry_address, try output_view.offsetToAddress(report.injection_offset));
-    try std.testing.expect((try output_view.codeSignatureRange()).?.size == 0);
+    try std.testing.expect((try output_view.codeSignatureRange()) == null);
+}
+
+test "Mach-O finalize emits a diagnostic when codesign-safe LINKEDIT closure is impossible" {
+    if (builtin.os.tag != .macos or builtin.cpu.arch != .aarch64) {
+        return error.SkipZigTest;
+    }
+
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const tmp_dir_path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(tmp_dir_path);
+
+    const input_path = try std.fs.path.join(allocator, &.{ tmp_dir_path, "compute_macho_diag" });
+    defer allocator.free(input_path);
+
+    try runCommand(allocator, &.{
+        "zig",
+        "cc",
+        "-target",
+        "aarch64-macos",
+        "-O0",
+        "-g0",
+        "tests/fixtures/compute.c",
+        "-o",
+        input_path,
+    });
+
+    const original_bytes = try std.fs.cwd().readFileAlloc(allocator, input_path, std.math.maxInt(usize));
+    defer allocator.free(original_bytes);
+
+    const mutable_bytes = try allocator.dupe(u8, original_bytes);
+    defer allocator.free(mutable_bytes);
+
+    const view = try zrwrite.format.macho.View.parse(mutable_bytes);
+    const carrier = try view.carrierSegmentForInjection();
+    const linkedit = try view.segmentByName("__LINKEDIT");
+    const carrier_end = std.mem.alignForward(
+        usize,
+        @as(usize, @intCast(carrier.command.fileoff + @max(carrier.command.filesize, carrier.command.vmsize))),
+        16,
+    );
+    const slack_before_linkedit = @as(usize, @intCast(linkedit.command.fileoff)) - carrier_end;
+    const plan = try view.planInjection(slack_before_linkedit + 0x100, 16);
+
+    const output_bytes = try view.materializeInjectedImage(allocator, plan);
+    defer allocator.free(output_bytes);
+
+    const output_view = try zrwrite.format.macho.View.parse(output_bytes);
+    const broken_linkedit = try output_view.segmentByName("__LINKEDIT");
+    broken_linkedit.command.filesize -= 4;
+
+    try std.testing.expectError(error.UnsafeMachOCodeSignatureLayout, output_view.finalizeInjectedImage(plan, true));
+    const diagnostic = zrwrite.format.macho.lastDiagnosticMessage() orelse return error.MissingDiagnostic;
+    try std.testing.expect(std.mem.indexOf(u8, diagnostic, "__LINKEDIT ends") != null);
+}
+
+test "Mach-O instrument output can be ad-hoc codesigned and executed on macOS arm64" {
+    if (builtin.os.tag != .macos or builtin.cpu.arch != .aarch64) {
+        return error.SkipZigTest;
+    }
+
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const tmp_dir_path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(tmp_dir_path);
+
+    const input_path = try std.fs.path.join(allocator, &.{ tmp_dir_path, "compute_macho_runtime_instrument" });
+    defer allocator.free(input_path);
+    const payload_path = try std.fs.path.join(allocator, &.{ tmp_dir_path, "macho_payload_runtime.o" });
+    defer allocator.free(payload_path);
+    const output_path = try std.fs.path.join(allocator, &.{ tmp_dir_path, "compute_macho_runtime_instrumented" });
+    defer allocator.free(output_path);
+
+    try runCommand(allocator, &.{
+        "zig",
+        "cc",
+        "-target",
+        "aarch64-macos",
+        "-O0",
+        "-g0",
+        "-fno-sanitize=undefined",
+        "-fno-stack-protector",
+        "-fno-asynchronous-unwind-tables",
+        "tests/fixtures/compute.c",
+        "-o",
+        input_path,
+    });
+
+    try runCommand(allocator, &.{
+        "zig",
+        "cc",
+        "-target",
+        "aarch64-macos",
+        "-c",
+        "-O0",
+        "-g0",
+        "-fno-sanitize=undefined",
+        "-fno-stack-protector",
+        "-fno-asynchronous-unwind-tables",
+        "-I",
+        "include",
+        "tests/fixtures/macho_payload_runtime.c",
+        "-o",
+        payload_path,
+    });
+
+    const payload_bytes = try std.fs.cwd().readFileAlloc(allocator, payload_path, std.math.maxInt(usize));
+    defer allocator.free(payload_bytes);
+
+    var rw = try zrwrite.Rewriter.initPath(allocator, input_path);
+    defer rw.deinit();
+
+    _ = try rw.addInstrumentHookObjectForFormat(.macho, .{
+        .payload_object_bytes = payload_bytes,
+        .target = zrwrite.bundle.HookLocator.fromSymbol("compute"),
+        .handler_symbol = "on_hit",
+    });
+    try rw.writeToPath(output_path);
+
+    try runCommand(allocator, &.{ "codesign", "-f", "-s", "-", output_path });
+    try runCommandExpectExitCode(allocator, &.{output_path}, 53);
+}
+
+test "Mach-O instrument output with writable payload state can be ad-hoc codesigned and executed on macOS arm64" {
+    if (builtin.os.tag != .macos or builtin.cpu.arch != .aarch64) {
+        return error.SkipZigTest;
+    }
+
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const tmp_dir_path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(tmp_dir_path);
+
+    const input_path = try std.fs.path.join(allocator, &.{ tmp_dir_path, "compute_macho_runtime_stateful" });
+    defer allocator.free(input_path);
+    const payload_path = try std.fs.path.join(allocator, &.{ tmp_dir_path, "macho_payload_stateful_runtime.o" });
+    defer allocator.free(payload_path);
+    const output_path = try std.fs.path.join(allocator, &.{ tmp_dir_path, "compute_macho_runtime_stateful_instrumented" });
+    defer allocator.free(output_path);
+
+    try runCommand(allocator, &.{
+        "zig",
+        "cc",
+        "-target",
+        "aarch64-macos",
+        "-O0",
+        "-g0",
+        "-fno-sanitize=undefined",
+        "-fno-stack-protector",
+        "-fno-asynchronous-unwind-tables",
+        "tests/fixtures/compute.c",
+        "-o",
+        input_path,
+    });
+
+    try runCommand(allocator, &.{
+        "zig",
+        "cc",
+        "-target",
+        "aarch64-macos",
+        "-c",
+        "-O0",
+        "-g0",
+        "-fno-sanitize=undefined",
+        "-fno-stack-protector",
+        "-fno-asynchronous-unwind-tables",
+        "-I",
+        "include",
+        "tests/fixtures/macho_payload_stateful.c",
+        "-o",
+        payload_path,
+    });
+
+    const payload_bytes = try std.fs.cwd().readFileAlloc(allocator, payload_path, std.math.maxInt(usize));
+    defer allocator.free(payload_bytes);
+
+    var rw = try zrwrite.Rewriter.initPath(allocator, input_path);
+    defer rw.deinit();
+
+    _ = try rw.addInstrumentHookObjectForFormat(.macho, .{
+        .payload_object_bytes = payload_bytes,
+        .target = zrwrite.bundle.HookLocator.fromSymbol("compute"),
+        .handler_symbol = "on_hit",
+    });
+    try rw.writeToPath(output_path);
+
+    try runCommand(allocator, &.{ "codesign", "-f", "-s", "-", output_path });
+    try runCommandExpectExitCode(allocator, &.{output_path}, 53);
+}
+
+test "Mach-O multiple instrument hooks can share one payload image and writable state" {
+    if (builtin.os.tag != .macos or builtin.cpu.arch != .aarch64) {
+        return error.SkipZigTest;
+    }
+
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const tmp_dir_path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(tmp_dir_path);
+
+    const input_path = try std.fs.path.join(allocator, &.{ tmp_dir_path, "compute_pair_macho_runtime_shared" });
+    defer allocator.free(input_path);
+    const payload_path = try std.fs.path.join(allocator, &.{ tmp_dir_path, "macho_multi_handler_shared_state.o" });
+    defer allocator.free(payload_path);
+    const output_path = try std.fs.path.join(allocator, &.{ tmp_dir_path, "compute_pair_macho_runtime_shared_instrumented" });
+    defer allocator.free(output_path);
+
+    try runCommand(allocator, &.{
+        "zig",
+        "cc",
+        "-target",
+        "aarch64-macos",
+        "-O0",
+        "-g0",
+        "-fno-sanitize=undefined",
+        "-fno-stack-protector",
+        "-fno-asynchronous-unwind-tables",
+        "tests/fixtures/compute_pair.c",
+        "-o",
+        input_path,
+    });
+
+    try runCommand(allocator, &.{
+        "zig",
+        "cc",
+        "-target",
+        "aarch64-macos",
+        "-c",
+        "-O0",
+        "-g0",
+        "-fno-sanitize=undefined",
+        "-fno-stack-protector",
+        "-fno-asynchronous-unwind-tables",
+        "-I",
+        "include",
+        "tests/fixtures/macho_multi_handler_shared_state_payload.c",
+        "-o",
+        payload_path,
+    });
+
+    const payload_bytes = try std.fs.cwd().readFileAlloc(allocator, payload_path, std.math.maxInt(usize));
+    defer allocator.free(payload_bytes);
+
+    const left_layout = try zrwrite.payload.analyzeObjectBytesForFormat(
+        allocator,
+        .macho,
+        payload_bytes,
+        "on_left",
+    );
+    const right_layout = try zrwrite.payload.analyzeObjectBytesForFormat(
+        allocator,
+        .macho,
+        payload_bytes,
+        "on_right",
+    );
+
+    var rw = try zrwrite.Rewriter.initPath(allocator, input_path);
+    defer rw.deinit();
+
+    const left_report = try rw.addInstrumentHookObjectForFormat(.macho, .{
+        .payload_object_bytes = payload_bytes,
+        .target = zrwrite.bundle.HookLocator.fromSymbol("compute_left"),
+        .handler_symbol = "on_left",
+    });
+    const right_report = try rw.addInstrumentHookObjectForFormat(.macho, .{
+        .payload_object_bytes = payload_bytes,
+        .target = zrwrite.bundle.HookLocator.fromSymbol("compute_right"),
+        .handler_symbol = "on_right",
+    });
+
+    try std.testing.expectEqual(
+        left_report.payload_entry_address - left_layout.entry_offset,
+        right_report.payload_entry_address - right_layout.entry_offset,
+    );
+    try std.testing.expect(left_report.stub_address.? != right_report.stub_address.?);
+    try std.testing.expect(left_report.injection_offset != right_report.injection_offset);
+
+    try rw.writeToPath(output_path);
+
+    try runCommand(allocator, &.{ "codesign", "-f", "-s", "-", output_path });
+    try runCommandExpectExitCode(allocator, &.{output_path}, 32);
+}
+
+test "Mach-O zig zrstd payload with multiple default placeholders can be ad-hoc codesigned and executed on macOS arm64" {
+    if (builtin.os.tag != .macos or builtin.cpu.arch != .aarch64) {
+        return error.SkipZigTest;
+    }
+
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const tmp_dir_path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(tmp_dir_path);
+
+    const input_path = try std.fs.path.join(allocator, &.{ tmp_dir_path, "compute_macho_zig_zrstd" });
+    defer allocator.free(input_path);
+    const payload_path = try std.fs.path.join(allocator, &.{ tmp_dir_path, "macho_zig_zrstd_runtime.o" });
+    defer allocator.free(payload_path);
+    const output_path = try std.fs.path.join(allocator, &.{ tmp_dir_path, "compute_macho_zig_zrstd_instrumented" });
+    defer allocator.free(output_path);
+
+    try runCommand(allocator, &.{
+        "zig",
+        "cc",
+        "-target",
+        "aarch64-macos",
+        "-O0",
+        "-g0",
+        "-fno-sanitize=undefined",
+        "-fno-stack-protector",
+        "-fno-asynchronous-unwind-tables",
+        "tests/fixtures/compute.c",
+        "-o",
+        input_path,
+    });
+
+    const emit_bin_arg = try std.fmt.allocPrint(allocator, "-femit-bin={s}", .{payload_path});
+    defer allocator.free(emit_bin_arg);
+
+    try runCommand(allocator, &.{
+        "zig",
+        "build-obj",
+        "-target",
+        "aarch64-macos",
+        "-O",
+        "ReleaseSmall",
+        "-fstrip",
+        "--dep",
+        "zrwrite",
+        "--dep",
+        "zrstd",
+        "-Mroot=tests/fixtures/macho_zrstd_multi_default_runtime.zig",
+        "-Mzrwrite=src/root.zig",
+        "-Mzrstd=src/zrstd/root.zig",
+        emit_bin_arg,
+    });
+
+    const payload_bytes = try std.fs.cwd().readFileAlloc(allocator, payload_path, std.math.maxInt(usize));
+    defer allocator.free(payload_bytes);
+
+    var rw = try zrwrite.Rewriter.initPath(allocator, input_path);
+    defer rw.deinit();
+
+    _ = try rw.addInstrumentHookObjectForFormat(.macho, .{
+        .payload_object_bytes = payload_bytes,
+        .target = zrwrite.bundle.HookLocator.fromSymbol("compute"),
+        .handler_symbol = "on_hit",
+    });
+    try rw.writeToPath(output_path);
+
+    try runCommand(allocator, &.{ "codesign", "-f", "-s", "-", output_path });
+
+    const result = try std.process.Child.run(.{
+        .allocator = allocator,
+        .argv = &.{output_path},
+    });
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+
+    switch (result.term) {
+        .Exited => |code| try std.testing.expectEqual(@as(u8, 53), code),
+        else => return error.CommandFailed,
+    }
+
+    try std.testing.expect(std.mem.indexOf(u8, result.stdout, "trace next_word block=1 word=2\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.stdout, "<zrstd: formatted output truncated>") == null);
+}
+
+test "Mach-O replace output can be ad-hoc codesigned and executed on macOS arm64" {
+    if (builtin.os.tag != .macos or builtin.cpu.arch != .aarch64) {
+        return error.SkipZigTest;
+    }
+
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const tmp_dir_path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(tmp_dir_path);
+
+    const input_path = try std.fs.path.join(allocator, &.{ tmp_dir_path, "compute_macho_runtime_replace" });
+    defer allocator.free(input_path);
+    const payload_path = try std.fs.path.join(allocator, &.{ tmp_dir_path, "macho_replace_branch_runtime.o" });
+    defer allocator.free(payload_path);
+    const output_path = try std.fs.path.join(allocator, &.{ tmp_dir_path, "compute_macho_runtime_replaced" });
+    defer allocator.free(output_path);
+
+    try runCommand(allocator, &.{
+        "zig",
+        "cc",
+        "-target",
+        "aarch64-macos",
+        "-O0",
+        "-g0",
+        "-fno-sanitize=undefined",
+        "-fno-stack-protector",
+        "-fno-asynchronous-unwind-tables",
+        "tests/fixtures/compute.c",
+        "-o",
+        input_path,
+    });
+
+    try runCommand(allocator, &.{
+        "zig",
+        "cc",
+        "-target",
+        "aarch64-macos",
+        "-c",
+        "-O0",
+        "-g0",
+        "-fno-sanitize=undefined",
+        "-fno-stack-protector",
+        "-fno-asynchronous-unwind-tables",
+        "tests/fixtures/macho_replace_branch_payload.c",
+        "-o",
+        payload_path,
+    });
+
+    const payload_bytes = try std.fs.cwd().readFileAlloc(allocator, payload_path, std.math.maxInt(usize));
+    defer allocator.free(payload_bytes);
+
+    var rw = try zrwrite.Rewriter.initPath(allocator, input_path);
+    defer rw.deinit();
+
+    _ = try rw.addReplaceHookObjectForFormat(.macho, .{
+        .payload_object_bytes = payload_bytes,
+        .target = zrwrite.bundle.HookLocator.fromSymbol("compute"),
+        .replacement_symbol = "replacement_compute",
+    });
+    try rw.writeToPath(output_path);
+
+    try runCommand(allocator, &.{ "codesign", "-f", "-s", "-", output_path });
+    try runCommandExpectExitCode(allocator, &.{output_path}, 63);
 }
 
 test "bundle -> apply supports replace hook via virtual address locator" {
@@ -2960,5 +3409,40 @@ fn runCommand(allocator: std.mem.Allocator, argv: []const []const u8) !void {
             result.stderr,
         });
         return error.CommandFailed;
+    }
+}
+
+fn runCommandExpectExitCode(
+    allocator: std.mem.Allocator,
+    argv: []const []const u8,
+    expected_exit_code: u8,
+) !void {
+    const result = try std.process.Child.run(.{
+        .allocator = allocator,
+        .argv = argv,
+    });
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+
+    switch (result.term) {
+        .Exited => |code| {
+            if (code == expected_exit_code) return;
+            std.debug.print("command exited with unexpected code: {s} -> {d} (expected {d})\n{s}\n{s}\n", .{
+                argv[0],
+                code,
+                expected_exit_code,
+                result.stdout,
+                result.stderr,
+            });
+            return error.UnexpectedExitCode;
+        },
+        else => {
+            std.debug.print("command did not exit normally: {s}\n{s}\n{s}\n", .{
+                argv[0],
+                result.stdout,
+                result.stderr,
+            });
+            return error.CommandFailed;
+        },
     }
 }
