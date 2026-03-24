@@ -1,6 +1,5 @@
 const std = @import("std");
-const elf = std.elf;
-const ElfView = @import("../format/elf/root.zig").View;
+const image_backend = @import("image_backend.zig");
 
 /// One byte inside a parsed code pattern.
 ///
@@ -55,7 +54,7 @@ pub fn parseHexPattern(allocator: std.mem.Allocator, pattern_text: []const u8) !
 
 pub fn findMatchesInExecutableSegments(
     allocator: std.mem.Allocator,
-    view: ElfView,
+    view: image_backend.View,
     pattern: []const PatternByte,
     limit: usize,
 ) ![]Match {
@@ -64,21 +63,23 @@ pub fn findMatchesInExecutableSegments(
     var matches: std.ArrayList(Match) = .empty;
     defer matches.deinit(allocator);
 
-    for (view.phdrs) |phdr| {
-        if (phdr.p_type != elf.PT_LOAD) continue;
-        if ((phdr.p_flags & elf.PF_X) == 0) continue;
-        if (phdr.p_filesz < pattern.len) continue;
+    const executable_ranges = try view.executableRanges(allocator);
+    defer allocator.free(executable_ranges);
+    const bytes = view.bytes();
 
-        const file_start: usize = @intCast(phdr.p_offset);
-        const file_end: usize = @intCast(phdr.p_offset + phdr.p_filesz);
+    for (executable_ranges) |range| {
+        if (range.size < pattern.len) continue;
+
+        const file_start = range.file_offset;
+        const file_end = range.file_offset + range.size;
         const last_start = file_end - pattern.len;
 
         var file_offset = file_start;
         while (file_offset <= last_start) : (file_offset += 1) {
-            if (!matchesPattern(view.bytes[file_offset .. file_offset + pattern.len], pattern)) continue;
+            if (!matchesPattern(bytes[file_offset .. file_offset + pattern.len], pattern)) continue;
 
             try matches.append(allocator, .{
-                .address = phdr.p_vaddr + (@as(u64, @intCast(file_offset)) - phdr.p_offset),
+                .address = range.address + (@as(u64, @intCast(file_offset - range.file_offset))),
                 .file_offset = file_offset,
             });
             if (limit != 0 and matches.items.len >= limit) break;

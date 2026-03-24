@@ -35,9 +35,16 @@ pub fn applyLoadedBundleToPath(
     const manifest = owned_bundle.manifest();
 
     if (manifest.target.arch != .aarch64) return error.UnsupportedBundleArchitecture;
-    if (manifest.target.binary_format != .elf) return error.UnsupportedBundleBinaryFormat;
-    if (manifest.payload.object_format != .elf) return error.UnsupportedPayloadObjectFormat;
     if (manifest.hooks.len == 0) return error.MissingBundleHooks;
+
+    switch (manifest.target.binary_format) {
+        .elf => {
+            if (manifest.payload.object_format != .elf) return error.UnsupportedPayloadObjectFormat;
+        },
+        .macho => {
+            if (manifest.payload.object_format != .macho) return error.UnsupportedPayloadObjectFormat;
+        },
+    }
 
     var rw = try rewriter.Rewriter.initPath(allocator, input_path);
     defer rw.deinit();
@@ -48,7 +55,7 @@ pub fn applyLoadedBundleToPath(
     var report: ?ApplyReport = null;
     for (manifest.hooks) |hook| {
         report = switch (hook.kind) {
-            .instrument => try rw.addInstrumentHookObject(.{
+            .instrument => try rw.addInstrumentHookObjectForFormat(manifest.target.binary_format, .{
                 .payload_object_bytes = owned_bundle.payload_object,
                 .target = hook.target,
                 .handler_symbol = hook.handler_symbol,
@@ -56,7 +63,7 @@ pub fn applyLoadedBundleToPath(
                 .expected_bytes = hook.expected_bytes,
                 .stolen_instruction_count = hook.stolen_instruction_count,
             }),
-            .replace => try rw.addReplaceHookObject(.{
+            .replace => try rw.addReplaceHookObjectForFormat(manifest.target.binary_format, .{
                 .payload_object_bytes = owned_bundle.payload_object,
                 .target = hook.target,
                 .replacement_symbol = hook.handler_symbol,

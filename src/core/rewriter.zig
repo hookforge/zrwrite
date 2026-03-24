@@ -2,7 +2,10 @@ const std = @import("std");
 const elf = std.elf;
 const bundle = @import("bundle.zig");
 const aarch64 = @import("../isa/aarch64/root.zig");
+const image_backend = @import("image_backend.zig");
 const ElfView = @import("../format/elf/root.zig").View;
+const MachOView = @import("../format/macho/root.zig").View;
+const MachOInjectionPlan = @import("../format/macho/root.zig").InjectionPlan;
 const payload = @import("payload/object.zig");
 const pattern_locator = @import("pattern_locator.zig");
 
@@ -84,7 +87,7 @@ const IncomingBranchRetarget = struct {
     target_index: usize,
 };
 
-const InjectionPlan = struct {
+const ElfInjectionPlan = struct {
     last_load_index: usize,
     load_end_offset: usize,
     injection_offset: usize,
@@ -92,6 +95,25 @@ const InjectionPlan = struct {
     tail_shift: usize,
     total_len: usize,
     payload_base_address: u64,
+};
+
+const ImageInjectionPlan = union(enum) {
+    elf: ElfInjectionPlan,
+    macho: MachOInjectionPlan,
+
+    fn injectionOffset(self: ImageInjectionPlan) usize {
+        return switch (self) {
+            .elf => |plan| plan.injection_offset,
+            .macho => |plan| plan.injection_offset,
+        };
+    }
+
+    fn payloadBaseAddress(self: ImageInjectionPlan) u64 {
+        return switch (self) {
+            .elf => |plan| plan.payload_base_address,
+            .macho => |plan| plan.payload_base_address,
+        };
+    }
 };
 
 pub const Rewriter = struct {
@@ -170,13 +192,34 @@ pub const Rewriter = struct {
     }
 
     pub fn addInstrumentHookObject(self: *Rewriter, spec: InstrumentObjectSpec) !InstrumentRewriteReport {
+        return self.addInstrumentHookObjectForFormat(.elf, spec);
+    }
+
+    pub fn addInstrumentHookObjectForFormat(
+        self: *Rewriter,
+        binary_format: bundle.BinaryFormat,
+        spec: InstrumentObjectSpec,
+    ) !InstrumentRewriteReport {
         clearLastRewriteDiagnostic();
         const base_bytes = self.workingBytes();
-        const input_view = try ElfView.parse(base_bytes);
-        const target = try resolveTargetLocation(self.allocator, input_view, spec.target);
+        const input_view = try image_backend.View.parseAs(base_bytes, binary_format);
+        return switch (input_view) {
+            .elf => |view| self.addInstrumentHookObjectElf(view, spec),
+            .macho => |view| self.addInstrumentHookObjectMachO(view, spec),
+        };
+    }
+
+    fn addInstrumentHookObjectElf(
+        self: *Rewriter,
+        input_view: ElfView,
+        spec: InstrumentObjectSpec,
+    ) !InstrumentRewriteReport {
+        const target_view: image_backend.View = .{ .elf = input_view };
+        const base_bytes = self.workingBytes();
+        const target = try resolveTargetLocation(self.allocator, target_view, spec.target);
         const stolen_instruction_count = try validateStolenInstructionCount(spec.stolen_instruction_count);
         const stolen_window_size = stolen_instruction_count * @sizeOf(u32);
-        try validatePatchWindowMapping(input_view, target, stolen_instruction_count);
+        try validatePatchWindowMapping(target_view, target, stolen_instruction_count);
         try validateExpectedBytes(self.allocator, base_bytes, target, spec.expected_bytes);
 
         const window_plan = try analyzeInstrumentWindowPlan(
@@ -186,7 +229,7 @@ pub const Rewriter = struct {
         );
         const incoming_branches = try collectIncomingBranchRetargets(
             self.allocator,
-            input_view,
+            target_view,
             target.address,
             stolen_instruction_count,
             window_plan,
@@ -194,7 +237,7 @@ pub const Rewriter = struct {
         defer self.allocator.free(incoming_branches);
         const replay_plan = window_plan.singleReplayPlan() orelse aarch64.ReplayPlan{ .trampoline = {} };
         const needs_raw_trampoline = windowNeedsRawTrampoline(window_plan);
-        const enable_bti = input_view.hasAarch64BtiProperty();
+        const enable_bti = target_view.hasAarch64BtiProperty();
         const bti_prefix_size: usize = if (enable_bti) @sizeOf(u32) else 0;
 
         // The mini-linker runs in two phases:
@@ -230,19 +273,19 @@ pub const Rewriter = struct {
         std.debug.assert(stub.len == stub_size);
 
         const injected_size = stub_offset + stub_size;
-        const plan = try planInjection(input_view, injected_size);
-        const callback_address = plan.payload_base_address + callback_offset + payload_layout.entry_offset;
+        const plan = try planInjectedImage(target_view, injected_size);
+        const callback_address = plan.payloadBaseAddress() + callback_offset + payload_layout.entry_offset;
         const trampoline_address = if (needs_raw_trampoline)
-            plan.payload_base_address + trampoline_offset
+            plan.payloadBaseAddress() + trampoline_offset
         else
             0;
-        const stub_address = plan.payload_base_address + stub_offset;
+        const stub_address = plan.payloadBaseAddress() + stub_offset;
 
         const loaded_payload = try payload.linkObjectBytes(
             self.allocator,
             spec.payload_object_bytes,
             spec.handler_symbol,
-            plan.payload_base_address + callback_offset,
+            plan.payloadBaseAddress() + callback_offset,
             input_view,
         );
         defer self.allocator.free(loaded_payload.image);
@@ -263,11 +306,11 @@ pub const Rewriter = struct {
         defer self.allocator.free(fixed_stub);
         std.debug.assert(fixed_stub.len == stub_size);
 
-        const output = try allocateInjectedOutput(self, base_bytes, plan);
+        const output = try materializeInjectedOutput(self, target_view, base_bytes, plan);
         errdefer self.allocator.free(output);
 
         @memcpy(
-            output[plan.injection_offset + callback_offset .. plan.injection_offset + callback_offset + loaded_payload.image.len],
+            output[plan.injectionOffset() + callback_offset .. plan.injectionOffset() + callback_offset + loaded_payload.image.len],
             loaded_payload.image,
         );
 
@@ -285,7 +328,7 @@ pub const Rewriter = struct {
                 );
                 defer self.allocator.free(trampoline);
                 @memcpy(
-                    output[plan.injection_offset + trampoline_offset .. plan.injection_offset + trampoline_offset + trampoline.len],
+                    output[plan.injectionOffset() + trampoline_offset .. plan.injectionOffset() + trampoline_offset + trampoline.len],
                     trampoline,
                 );
             } else {
@@ -298,15 +341,15 @@ pub const Rewriter = struct {
                 );
                 defer self.allocator.free(trampoline);
                 @memcpy(
-                    output[plan.injection_offset + trampoline_offset .. plan.injection_offset + trampoline_offset + trampoline.len],
+                    output[plan.injectionOffset() + trampoline_offset .. plan.injectionOffset() + trampoline_offset + trampoline.len],
                     trampoline,
                 );
             }
         }
 
-        @memcpy(output[plan.injection_offset + stub_offset .. plan.injection_offset + stub_offset + fixed_stub.len], fixed_stub);
+        @memcpy(output[plan.injectionOffset() + stub_offset .. plan.injectionOffset() + stub_offset + fixed_stub.len], fixed_stub);
 
-        try finalizeInjectedOutput(input_view, output, plan, true);
+        try finalizeInjectedOutput(target_view, output, plan, true);
 
         try writeInstrumentDetourPatch(
             output,
@@ -333,16 +376,220 @@ pub const Rewriter = struct {
             .payload_entry_address = callback_address,
             .trampoline_address = if (needs_raw_trampoline) trampoline_address else null,
             .stub_address = stub_address,
-            .injection_offset = plan.injection_offset,
+            .injection_offset = plan.injectionOffset(),
+            .injected_size = injected_size,
+        };
+    }
+
+    fn addInstrumentHookObjectMachO(
+        self: *Rewriter,
+        input_view: MachOView,
+        spec: InstrumentObjectSpec,
+    ) !InstrumentRewriteReport {
+        const target_view: image_backend.View = .{ .macho = input_view };
+        const base_bytes = self.workingBytes();
+        const target = try resolveTargetLocation(self.allocator, target_view, spec.target);
+        const stolen_instruction_count = try validateStolenInstructionCount(spec.stolen_instruction_count);
+        const stolen_window_size = stolen_instruction_count * @sizeOf(u32);
+        try validatePatchWindowMapping(target_view, target, stolen_instruction_count);
+        try validateExpectedBytes(self.allocator, base_bytes, target, spec.expected_bytes);
+
+        // All detour / trampoline / incoming-branch logic is shared with the
+        // ELF path. Once the Mach-O image backend can plan/finalize injection
+        // and the Mach-O payload mini-linker can produce a relocated callback
+        // image, the rest of the instrument pipeline becomes backend-neutral.
+        //
+        // In other words, the hard Mach-O-specific work lives at the edges:
+        // - mapping target addresses/file offsets in the input image
+        // - choosing where the injected blob will live in the output image
+        // - linking a native Mach-O payload object against that final address
+        const window_plan = try analyzeInstrumentWindowPlan(
+            base_bytes,
+            target,
+            stolen_instruction_count,
+        );
+        const incoming_branches = try collectIncomingBranchRetargets(
+            self.allocator,
+            target_view,
+            target.address,
+            stolen_instruction_count,
+            window_plan,
+        );
+        defer self.allocator.free(incoming_branches);
+        const replay_plan = window_plan.singleReplayPlan() orelse aarch64.ReplayPlan{ .trampoline = {} };
+        const needs_raw_trampoline = windowNeedsRawTrampoline(window_plan);
+        const enable_bti = target_view.hasAarch64BtiProperty();
+        const bti_prefix_size: usize = if (enable_bti) @sizeOf(u32) else 0;
+
+        const payload_layout = try payload.analyzeObjectBytesForFormat(
+            self.allocator,
+            .macho,
+            spec.payload_object_bytes,
+            spec.handler_symbol,
+        );
+
+        const callback_offset = 0;
+        const trampoline_offset = std.mem.alignForward(usize, payload_layout.image_size, 8);
+        const trampoline_size = if (needs_raw_trampoline)
+            if (stolen_instruction_count == 1 and replay_plan.requiresRawTrampoline())
+                aarch64.original_trampoline_size + bti_prefix_size
+            else
+                stolen_window_size + aarch64.long_detour_size + bti_prefix_size
+        else
+            0;
+        const stub_offset = std.mem.alignForward(usize, trampoline_offset + trampoline_size, 8);
+
+        const stub = try aarch64.buildInstrumentStub(.{
+            .allocator = self.allocator,
+            .site_address = target.address,
+            .callback_address = 0,
+            .trampoline_address = 0,
+            .stub_address = 0,
+            .replay_plan = replay_plan,
+            .window_plan = window_plan,
+            .enable_bti = enable_bti,
+            .log_message = spec.log_message,
+        });
+        const stub_size = stub.len;
+        defer self.allocator.free(stub);
+        std.debug.assert(stub.len == stub_size);
+
+        const injected_size = stub_offset + stub_size;
+        const plan = try planInjectedImage(target_view, injected_size);
+        const callback_address = plan.payloadBaseAddress() + callback_offset + payload_layout.entry_offset;
+        const trampoline_address = if (needs_raw_trampoline)
+            plan.payloadBaseAddress() + trampoline_offset
+        else
+            0;
+        const stub_address = plan.payloadBaseAddress() + stub_offset;
+
+        const loaded_payload = try payload.linkObjectBytesForFormat(
+            self.allocator,
+            .macho,
+            spec.payload_object_bytes,
+            spec.handler_symbol,
+            plan.payloadBaseAddress() + callback_offset,
+            target_view,
+        );
+        defer self.allocator.free(loaded_payload.image);
+        std.debug.assert(loaded_payload.entry_offset == payload_layout.entry_offset);
+        std.debug.assert(loaded_payload.image.len == payload_layout.image_size);
+
+        const fixed_stub = try aarch64.buildInstrumentStub(.{
+            .allocator = self.allocator,
+            .site_address = target.address,
+            .callback_address = callback_address,
+            .trampoline_address = trampoline_address,
+            .stub_address = stub_address,
+            .replay_plan = replay_plan,
+            .window_plan = window_plan,
+            .enable_bti = enable_bti,
+            .log_message = spec.log_message,
+        });
+        defer self.allocator.free(fixed_stub);
+        std.debug.assert(fixed_stub.len == stub_size);
+
+        const output = try materializeInjectedOutput(self, target_view, base_bytes, plan);
+        errdefer self.allocator.free(output);
+
+        @memcpy(
+            output[plan.injectionOffset() + callback_offset .. plan.injectionOffset() + callback_offset + loaded_payload.image.len],
+            loaded_payload.image,
+        );
+
+        if (needs_raw_trampoline) {
+            const stolen_bytes = base_bytes[target.file_offset .. target.file_offset + stolen_window_size];
+            if (stolen_instruction_count == 1 and replay_plan.requiresRawTrampoline()) {
+                var original_instruction: [4]u8 = undefined;
+                @memcpy(&original_instruction, stolen_bytes);
+                const trampoline = try aarch64.buildOriginalTrampolineBytes(
+                    self.allocator,
+                    original_instruction,
+                    trampoline_address,
+                    target.address + 4,
+                    enable_bti,
+                );
+                defer self.allocator.free(trampoline);
+                @memcpy(
+                    output[plan.injectionOffset() + trampoline_offset .. plan.injectionOffset() + trampoline_offset + trampoline.len],
+                    trampoline,
+                );
+            } else {
+                const trampoline = try aarch64.buildRawTrampoline(
+                    self.allocator,
+                    stolen_bytes,
+                    trampoline_address,
+                    target.address + stolen_window_size,
+                    enable_bti,
+                );
+                defer self.allocator.free(trampoline);
+                @memcpy(
+                    output[plan.injectionOffset() + trampoline_offset .. plan.injectionOffset() + trampoline_offset + trampoline.len],
+                    trampoline,
+                );
+            }
+        }
+
+        @memcpy(output[plan.injectionOffset() + stub_offset .. plan.injectionOffset() + stub_offset + fixed_stub.len], fixed_stub);
+
+        try finalizeInjectedOutput(target_view, output, plan, true);
+
+        try writeInstrumentDetourPatch(
+            output,
+            target.file_offset,
+            target.address,
+            stub_address,
+            stolen_instruction_count,
+        );
+        if (incoming_branches.len != 0) {
+            try retargetIncomingBranches(
+                output,
+                incoming_branches,
+                window_plan,
+                trampoline_address,
+                enable_bti,
+            );
+        }
+
+        self.installOutput(output);
+
+        return .{
+            .target_address = target.address,
+            .target_file_offset = target.file_offset,
+            .payload_entry_address = callback_address,
+            .trampoline_address = if (needs_raw_trampoline) trampoline_address else null,
+            .stub_address = stub_address,
+            .injection_offset = plan.injectionOffset(),
             .injected_size = injected_size,
         };
     }
 
     pub fn addReplaceHookObject(self: *Rewriter, spec: ReplaceObjectSpec) !ReplaceRewriteReport {
+        return self.addReplaceHookObjectForFormat(.elf, spec);
+    }
+
+    pub fn addReplaceHookObjectForFormat(
+        self: *Rewriter,
+        binary_format: bundle.BinaryFormat,
+        spec: ReplaceObjectSpec,
+    ) !ReplaceRewriteReport {
         clearLastRewriteDiagnostic();
         const base_bytes = self.workingBytes();
-        const input_view = try ElfView.parse(base_bytes);
-        const target = try resolveTargetLocation(self.allocator, input_view, spec.target);
+        const input_view = try image_backend.View.parseAs(base_bytes, binary_format);
+        return switch (input_view) {
+            .elf => |view| self.addReplaceHookObjectElf(view, spec),
+            .macho => |view| self.addReplaceHookObjectMachO(view, spec),
+        };
+    }
+
+    fn addReplaceHookObjectElf(
+        self: *Rewriter,
+        input_view: ElfView,
+        spec: ReplaceObjectSpec,
+    ) !ReplaceRewriteReport {
+        const target_view: image_backend.View = .{ .elf = input_view };
+        const base_bytes = self.workingBytes();
+        const target = try resolveTargetLocation(self.allocator, target_view, spec.target);
         try validateExpectedBytes(self.allocator, base_bytes, target, spec.expected_bytes);
 
         // Replace hooks reuse the same two-phase payload mini-linker pipeline as
@@ -351,25 +598,25 @@ pub const Rewriter = struct {
         const payload_layout = try payload.analyzeObjectBytes(self.allocator, spec.payload_object_bytes, spec.replacement_symbol);
 
         const injected_size = payload_layout.image_size;
-        const plan = try planInjection(input_view, injected_size);
-        const payload_entry_address = plan.payload_base_address + payload_layout.entry_offset;
+        const plan = try planInjectedImage(target_view, injected_size);
+        const payload_entry_address = plan.payloadBaseAddress() + payload_layout.entry_offset;
 
         const loaded_payload = try payload.linkObjectBytes(
             self.allocator,
             spec.payload_object_bytes,
             spec.replacement_symbol,
-            plan.payload_base_address,
+            plan.payloadBaseAddress(),
             input_view,
         );
         defer self.allocator.free(loaded_payload.image);
         std.debug.assert(loaded_payload.entry_offset == payload_layout.entry_offset);
         std.debug.assert(loaded_payload.image.len == payload_layout.image_size);
 
-        const output = try allocateInjectedOutput(self, base_bytes, plan);
+        const output = try materializeInjectedOutput(self, target_view, base_bytes, plan);
         errdefer self.allocator.free(output);
-        @memcpy(output[plan.injection_offset .. plan.injection_offset + loaded_payload.image.len], loaded_payload.image);
+        @memcpy(output[plan.injectionOffset() .. plan.injectionOffset() + loaded_payload.image.len], loaded_payload.image);
 
-        try finalizeInjectedOutput(input_view, output, plan, true);
+        try finalizeInjectedOutput(target_view, output, plan, true);
 
         const branch_opcode = aarch64.encodeBranchImmediate(target.address, payload_entry_address) catch |err| {
             if (err == error.BranchOutOfRange) {
@@ -388,7 +635,72 @@ pub const Rewriter = struct {
             .target_address = target.address,
             .target_file_offset = target.file_offset,
             .payload_entry_address = payload_entry_address,
-            .injection_offset = plan.injection_offset,
+            .injection_offset = plan.injectionOffset(),
+            .injected_size = injected_size,
+        };
+    }
+
+    fn addReplaceHookObjectMachO(
+        self: *Rewriter,
+        input_view: MachOView,
+        spec: ReplaceObjectSpec,
+    ) !ReplaceRewriteReport {
+        const target_view: image_backend.View = .{ .macho = input_view };
+        const base_bytes = self.workingBytes();
+        const target = try resolveTargetLocation(self.allocator, target_view, spec.target);
+        try validateExpectedBytes(self.allocator, base_bytes, target, spec.expected_bytes);
+
+        // Replace hooks are the smallest end-to-end Mach-O payload exercise:
+        // no trampoline is needed, but we still prove that the new Mach-O
+        // payload linker can produce a fully relocated injected image whose
+        // entry point is reachable from the patch site with a direct branch.
+        const payload_layout = try payload.analyzeObjectBytesForFormat(
+            self.allocator,
+            .macho,
+            spec.payload_object_bytes,
+            spec.replacement_symbol,
+        );
+
+        const injected_size = payload_layout.image_size;
+        const plan = try planInjectedImage(target_view, injected_size);
+        const payload_entry_address = plan.payloadBaseAddress() + payload_layout.entry_offset;
+
+        const loaded_payload = try payload.linkObjectBytesForFormat(
+            self.allocator,
+            .macho,
+            spec.payload_object_bytes,
+            spec.replacement_symbol,
+            plan.payloadBaseAddress(),
+            target_view,
+        );
+        defer self.allocator.free(loaded_payload.image);
+        std.debug.assert(loaded_payload.entry_offset == payload_layout.entry_offset);
+        std.debug.assert(loaded_payload.image.len == payload_layout.image_size);
+
+        const output = try materializeInjectedOutput(self, target_view, base_bytes, plan);
+        errdefer self.allocator.free(output);
+        @memcpy(output[plan.injectionOffset() .. plan.injectionOffset() + loaded_payload.image.len], loaded_payload.image);
+
+        try finalizeInjectedOutput(target_view, output, plan, true);
+
+        const branch_opcode = aarch64.encodeBranchImmediate(target.address, payload_entry_address) catch |err| {
+            if (err == error.BranchOutOfRange) {
+                recordRewriteDiagnostic(
+                    "replace hook target 0x{x} cannot reach replacement entry 0x{x} with a direct branch",
+                    .{ target.address, payload_entry_address },
+                );
+            }
+            return err;
+        };
+        writeU32(output[target.file_offset .. target.file_offset + 4], branch_opcode);
+
+        self.installOutput(output);
+
+        return .{
+            .target_address = target.address,
+            .target_file_offset = target.file_offset,
+            .payload_entry_address = payload_entry_address,
+            .injection_offset = plan.injectionOffset(),
             .injected_size = injected_size,
         };
     }
@@ -495,7 +807,7 @@ fn formatHexBytes(buffer: []u8, bytes: []const u8) []const u8 {
 
 fn resolveTargetLocation(
     allocator: std.mem.Allocator,
-    view: ElfView,
+    view: image_backend.View,
     target: bundle.HookLocator,
 ) !ResolvedTarget {
     return switch (target.kind) {
@@ -521,7 +833,7 @@ fn resolveTargetLocation(
 
 fn resolvePatternTargetLocation(
     allocator: std.mem.Allocator,
-    view: ElfView,
+    view: image_backend.View,
     target: bundle.HookLocator,
 ) !ResolvedTarget {
     if (target.pattern.len == 0) return error.MissingTargetLocator;
@@ -582,7 +894,7 @@ fn validateStolenInstructionCount(count: u8) !usize {
 /// implementation honest: the widened detour steals a straight-line file slice,
 /// not an arbitrary cross-segment instruction list.
 fn validatePatchWindowMapping(
-    view: ElfView,
+    view: image_backend.View,
     target: ResolvedTarget,
     stolen_instruction_count: usize,
 ) !void {
@@ -665,7 +977,7 @@ fn windowNeedsRawTrampoline(window_plan: aarch64.WindowPlan) bool {
 /// which is left for a later milestone.
 fn collectIncomingBranchRetargets(
     allocator: std.mem.Allocator,
-    view: ElfView,
+    view: image_backend.View,
     window_start: u64,
     stolen_instruction_count: usize,
     window_plan: aarch64.WindowPlan,
@@ -675,20 +987,21 @@ fn collectIncomingBranchRetargets(
     var incoming: std.ArrayList(IncomingBranchRetarget) = .empty;
     defer incoming.deinit(allocator);
 
+    const executable_ranges = try view.executableRanges(allocator);
+    defer allocator.free(executable_ranges);
+    const bytes = view.bytes();
+
     const interior_start = window_start + 4;
     const window_end = window_start + stolen_instruction_count * 4;
 
-    for (view.phdrs) |phdr| {
-        if (phdr.p_type != elf.PT_LOAD) continue;
-        if ((phdr.p_flags & elf.PF_X) == 0) continue;
-
-        var file_offset: usize = @intCast(phdr.p_offset);
-        const file_end: usize = @intCast(phdr.p_offset + phdr.p_filesz);
+    for (executable_ranges) |range| {
+        var file_offset = range.file_offset;
+        const file_end = range.file_offset + range.size;
         while (file_offset + 4 <= file_end) : (file_offset += 4) {
-            const source_address = phdr.p_vaddr + (@as(u64, @intCast(file_offset)) - phdr.p_offset);
+            const source_address = range.address + @as(u64, @intCast(file_offset - range.file_offset));
             if (source_address >= window_start and source_address < window_end) continue;
 
-            const opcode = readU32(view.bytes[file_offset .. file_offset + 4]);
+            const opcode = readU32(bytes[file_offset .. file_offset + 4]);
             const replay_plan = aarch64.planReplay(source_address, opcode) catch continue;
             const branch_target = replayBranchTarget(replay_plan) orelse continue;
             if (branch_target >= interior_start and branch_target < window_end) {
@@ -849,16 +1162,29 @@ fn writeInstrumentDetourPatch(
 
 /// Chooses where the injected payload blob will live inside the output image.
 ///
+/// The rewriter now routes this through a backend-neutral wrapper so the main
+/// hook pipeline can stay structurally identical across ELF and Mach-O:
+/// - ELF extends the last `PT_LOAD`
+/// - Mach-O extends the carrier segment that precedes `__LINKEDIT`
+///
+/// The payload linker is still ELF-only today, but the injection planning seam
+/// is already shared so adding the Mach-O linker will not require another
+/// cross-cutting refactor through the rewrite skeleton.
+fn planInjectedImage(input_view: image_backend.View, injected_size: usize) !ImageInjectionPlan {
+    return switch (input_view) {
+        .elf => |view| .{ .elf = try planElfInjection(view, injected_size) },
+        .macho => |view| .{ .macho = try view.planInjection(injected_size, 16) },
+    };
+}
+
+/// ELF-specific injection planning policy.
+///
 /// The current ELF strategy is intentionally simple:
 /// - locate the last `PT_LOAD`
 /// - grow that segment
 /// - insert new bytes at the first aligned offset after its in-memory extent
 /// - shift the non-loaded file tail forward
-///
-/// This is good enough for the current single-image ELF MVP, but the function
-/// is documented in detail because future PIE / multi-segment work will almost
-/// certainly need to evolve this policy.
-fn planInjection(input_view: ElfView, injected_size: usize) !InjectionPlan {
+fn planElfInjection(input_view: ElfView, injected_size: usize) !ElfInjectionPlan {
     const last_load_index = try input_view.lastLoadSegmentIndex();
     const last_load = input_view.phdrs[last_load_index];
     const load_end_offset: usize = @intCast(last_load.p_offset + last_load.p_filesz);
@@ -880,10 +1206,29 @@ fn planInjection(input_view: ElfView, injected_size: usize) !InjectionPlan {
     };
 }
 
-/// Allocates the future output image and performs the coarse file-level move:
-/// keep the bytes before the old load tail in place, reserve zeroed space for
-/// the injection, and shift the remaining file tail to its new offset.
-fn allocateInjectedOutput(self: *Rewriter, source_bytes: []const u8, plan: InjectionPlan) ![]u8 {
+/// Allocates the future output image and performs the coarse file-level move.
+///
+/// The backend-neutral wrapper dispatches to:
+/// - the existing ELF "grow last load segment and shift tail" logic
+/// - the Mach-O image materializer that preserves bytes up to the injection
+///   site and shifts the `__LINKEDIT` tail only when needed
+fn materializeInjectedOutput(
+    self: *Rewriter,
+    input_view: image_backend.View,
+    source_bytes: []const u8,
+    plan: ImageInjectionPlan,
+) ![]u8 {
+    return switch (plan) {
+        .elf => |elf_plan| materializeElfInjectedOutput(self, source_bytes, elf_plan),
+        .macho => |macho_plan| switch (input_view) {
+            .macho => |view| view.materializeInjectedImage(self.allocator, macho_plan),
+            .elf => unreachable,
+        },
+    };
+}
+
+/// ELF-specific output materialization.
+fn materializeElfInjectedOutput(self: *Rewriter, source_bytes: []const u8, plan: ElfInjectionPlan) ![]u8 {
     const output = try self.allocator.alloc(u8, plan.total_len);
     @memset(output, 0);
 
@@ -895,14 +1240,37 @@ fn allocateInjectedOutput(self: *Rewriter, source_bytes: []const u8, plan: Injec
     return output;
 }
 
-/// Repairs ELF metadata after the new payload bytes have been inserted.
+/// Repairs image metadata after the new payload bytes have been inserted.
 ///
-/// Important details:
-/// - the section header table may move when it lives after the injected blob
-/// - section file offsets after the old load tail must be shifted forward
-/// - the final load segment must grow to cover the injected bytes
-/// - the segment is optionally marked executable when code was injected
-fn finalizeInjectedOutput(input_view: ElfView, output: []u8, plan: InjectionPlan, make_executable: bool) !void {
+/// ELF and Mach-O have very different metadata surfaces, but the rewrite
+/// pipeline only needs one abstract operation here:
+/// "the injected bytes are now in place, repair the executable image so the
+/// loader and later address lookups agree with that new layout".
+fn finalizeInjectedOutput(
+    input_view: image_backend.View,
+    output: []u8,
+    plan: ImageInjectionPlan,
+    make_executable: bool,
+) !void {
+    return switch (plan) {
+        .elf => |elf_plan| switch (input_view) {
+            .elf => |view| finalizeElfInjectedOutput(view, output, elf_plan, make_executable),
+            .macho => unreachable,
+        },
+        .macho => |macho_plan| {
+            var output_view = try MachOView.parse(output);
+            try output_view.finalizeInjectedImage(macho_plan, make_executable);
+        },
+    };
+}
+
+/// Repairs ELF metadata after the new payload bytes have been inserted.
+fn finalizeElfInjectedOutput(
+    input_view: ElfView,
+    output: []u8,
+    plan: ElfInjectionPlan,
+    make_executable: bool,
+) !void {
     if (input_view.ehdr.e_shoff != 0 and input_view.ehdr.e_shnum != 0) {
         const old_e_shoff: usize = @intCast(input_view.ehdr.e_shoff);
         if (old_e_shoff >= plan.load_end_offset) {

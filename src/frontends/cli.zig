@@ -1,10 +1,10 @@
 const std = @import("std");
 const bundle = @import("../core/bundle.zig");
 const apply = @import("../core/apply.zig");
+const image_backend = @import("../core/image_backend.zig");
 const payload = @import("../core/payload/root.zig");
 const pattern_locator = @import("../core/pattern_locator.zig");
 const rewriter = @import("../core/rewriter.zig");
-const ElfView = @import("../format/elf/root.zig").View;
 
 pub fn main() !void {
     var gpa_state: std.heap.GeneralPurposeAllocator(.{}) = .init;
@@ -331,7 +331,7 @@ fn commandInspect(allocator: std.mem.Allocator, args: []const []const u8) !void 
     const bytes = try std.fs.cwd().readFileAlloc(allocator, input_path orelse return error.MissingInputPath, std.math.maxInt(usize));
     defer allocator.free(bytes);
 
-    const view = try ElfView.parse(bytes);
+    const view = try image_backend.View.parse(bytes);
     const resolved = try resolveInspectLocation(allocator, view, try locator.toHookLocator());
 
     const exact_len = @min(pattern_bytes, bytes.len - resolved.file_offset);
@@ -383,7 +383,7 @@ const InspectLocation = struct {
 
 fn resolveInspectLocation(
     allocator: std.mem.Allocator,
-    view: ElfView,
+    view: image_backend.View,
     locator: bundle.HookLocator,
 ) !InspectLocation {
     return switch (locator.kind) {

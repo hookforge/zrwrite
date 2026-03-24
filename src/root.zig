@@ -10,6 +10,7 @@ pub const sdk = sdk_mod;
 pub const aarch64 = isa.aarch64;
 pub const elf = format.elf;
 pub const payload = core.payload;
+pub const image_backend = core.image_backend;
 pub const rewriter = core.rewriter;
 pub const bundle = core.bundle;
 pub const apply = core.apply;

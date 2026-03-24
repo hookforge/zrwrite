@@ -1,3 +1,4 @@
+const builtin = @import("builtin");
 const std = @import("std");
 const zrwrite = @import("zrwrite");
 
@@ -114,6 +115,290 @@ test "bundle -> apply appends instrument payload, patches compute, and keeps cal
 
     try std.testing.expectEqual(@sizeOf(zrwrite.HookContext), @sizeOf(@import("zrwrite").sdk.HookContext));
     try std.testing.expectEqual(@offsetOf(zrwrite.HookContext, "pc"), @offsetOf(@import("zrwrite").sdk.HookContext, "pc"));
+}
+
+test "image backend parses thin arm64 Mach-O executables on macOS hosts" {
+    if (builtin.os.tag != .macos or builtin.cpu.arch != .aarch64) {
+        return error.SkipZigTest;
+    }
+
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const tmp_dir_path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(tmp_dir_path);
+
+    const input_path = try std.fs.path.join(allocator, &.{ tmp_dir_path, "compute_macho" });
+    defer allocator.free(input_path);
+
+    try runCommand(allocator, &.{
+        "zig",
+        "cc",
+        "-target",
+        "aarch64-macos",
+        "-O0",
+        "-g0",
+        "tests/fixtures/compute.c",
+        "-o",
+        input_path,
+    });
+
+    const input_bytes = try std.fs.cwd().readFileAlloc(allocator, input_path, std.math.maxInt(usize));
+    defer allocator.free(input_bytes);
+
+    const backend_view = try zrwrite.image_backend.View.parseAs(@constCast(input_bytes), .macho);
+    try std.testing.expectEqual(zrwrite.bundle.BinaryFormat.macho, backend_view.binaryFormat());
+
+    const main_address = try backend_view.resolveSymbolAddress("main");
+    const underscored_main_address = try backend_view.resolveSymbolAddress("_main");
+    try std.testing.expectEqual(main_address, underscored_main_address);
+
+    const main_offset = try backend_view.addressToOffset(main_address);
+    try std.testing.expectEqual(main_address, try backend_view.offsetToAddress(main_offset));
+
+    const compute_address = try backend_view.resolveSymbolAddress("compute");
+    try std.testing.expect(compute_address != 0);
+
+    const executable_ranges = try backend_view.executableRanges(allocator);
+    defer allocator.free(executable_ranges);
+    try std.testing.expect(executable_ranges.len != 0);
+}
+
+test "Mach-O view plans linkedit-tail injection and can clear stale code signatures" {
+    if (builtin.os.tag != .macos or builtin.cpu.arch != .aarch64) {
+        return error.SkipZigTest;
+    }
+
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const tmp_dir_path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(tmp_dir_path);
+
+    const input_path = try std.fs.path.join(allocator, &.{ tmp_dir_path, "compute_macho_layout" });
+    defer allocator.free(input_path);
+
+    try runCommand(allocator, &.{
+        "zig",
+        "cc",
+        "-target",
+        "aarch64-macos",
+        "-O0",
+        "-g0",
+        "tests/fixtures/compute.c",
+        "-o",
+        input_path,
+    });
+
+    const original_bytes = try std.fs.cwd().readFileAlloc(allocator, input_path, std.math.maxInt(usize));
+    defer allocator.free(original_bytes);
+
+    const mutable_bytes = try allocator.dupe(u8, original_bytes);
+    defer allocator.free(mutable_bytes);
+
+    const view = try zrwrite.format.macho.View.parse(mutable_bytes);
+    const carrier = try view.carrierSegmentForInjection();
+    const linkedit = try view.segmentByName("__LINKEDIT");
+    const original_linkedit_fileoff = linkedit.command.fileoff;
+    const original_linkedit_vmaddr = linkedit.command.vmaddr;
+    const original_symtab = (try view.symbolTableRange()).?;
+    const original_strtab = (try view.stringTableRange()).?;
+    const carrier_end = std.mem.alignForward(
+        usize,
+        @as(usize, @intCast(carrier.command.fileoff + @max(carrier.command.filesize, carrier.command.vmsize))),
+        16,
+    );
+    const slack_before_linkedit = @as(usize, @intCast(original_linkedit_fileoff)) - carrier_end;
+    const plan = try view.planInjection(slack_before_linkedit + 0x100, 16);
+
+    try std.testing.expectEqual(@as(usize, 0x100), plan.tail_shift);
+    try std.testing.expect(!plan.fitsExistingSlack());
+    try std.testing.expectEqual(original_bytes.len + plan.tail_shift, plan.total_len);
+
+    const output_bytes = try view.materializeInjectedImage(allocator, plan);
+    defer allocator.free(output_bytes);
+
+    const output_view = try zrwrite.format.macho.View.parse(output_bytes);
+    try output_view.finalizeInjectedImage(plan, true);
+
+    const output_carrier = try output_view.segmentByName(carrier.segName());
+    try std.testing.expectEqual(plan.injection_end_offset - @as(usize, @intCast(carrier.command.fileoff)), output_carrier.command.filesize);
+    try std.testing.expectEqual(output_carrier.command.filesize, output_carrier.command.vmsize);
+    try std.testing.expect((output_carrier.command.initprot & std.macho.PROT.EXEC) != 0);
+    try std.testing.expect((output_carrier.command.maxprot & std.macho.PROT.EXEC) != 0);
+
+    const shifted_linkedit = try output_view.segmentByName("__LINKEDIT");
+    try std.testing.expectEqual(original_linkedit_fileoff + plan.tail_shift, shifted_linkedit.command.fileoff);
+    try std.testing.expectEqual(original_linkedit_vmaddr + plan.tail_shift, shifted_linkedit.command.vmaddr);
+    try std.testing.expectEqual(original_symtab.offset + plan.tail_shift, (try output_view.symbolTableRange()).?.offset);
+    try std.testing.expectEqual(original_strtab.offset + plan.tail_shift, (try output_view.stringTableRange()).?.offset);
+
+    const cleared_code_signature = (try output_view.codeSignatureRange()).?;
+    try std.testing.expectEqual(@as(usize, 0), cleared_code_signature.offset);
+    try std.testing.expectEqual(@as(usize, 0), cleared_code_signature.size);
+}
+
+test "Mach-O rewriter applies native instrument payload with rodata/data/bss relocations" {
+    if (builtin.os.tag != .macos or builtin.cpu.arch != .aarch64) {
+        return error.SkipZigTest;
+    }
+
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const tmp_dir_path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(tmp_dir_path);
+
+    const input_path = try std.fs.path.join(allocator, &.{ tmp_dir_path, "compute_macho_rewrite" });
+    defer allocator.free(input_path);
+    const payload_path = try std.fs.path.join(allocator, &.{ tmp_dir_path, "macho_payload_stateful.o" });
+    defer allocator.free(payload_path);
+    const output_path = try std.fs.path.join(allocator, &.{ tmp_dir_path, "compute_macho_instrumented" });
+    defer allocator.free(output_path);
+
+    try runCommand(allocator, &.{
+        "zig",
+        "cc",
+        "-target",
+        "aarch64-macos",
+        "-O0",
+        "-g0",
+        "-fno-sanitize=undefined",
+        "-fno-stack-protector",
+        "-fno-asynchronous-unwind-tables",
+        "tests/fixtures/compute.c",
+        "-o",
+        input_path,
+    });
+
+    try runCommand(allocator, &.{
+        "zig",
+        "cc",
+        "-target",
+        "aarch64-macos",
+        "-c",
+        "-O0",
+        "-g0",
+        "-fno-sanitize=undefined",
+        "-fno-stack-protector",
+        "-fno-asynchronous-unwind-tables",
+        "-I",
+        "include",
+        "tests/fixtures/macho_payload_stateful.c",
+        "-o",
+        payload_path,
+    });
+
+    const payload_bytes = try std.fs.cwd().readFileAlloc(allocator, payload_path, std.math.maxInt(usize));
+    defer allocator.free(payload_bytes);
+
+    var rw = try zrwrite.Rewriter.initPath(allocator, input_path);
+    defer rw.deinit();
+
+    const report = try rw.addInstrumentHookObjectForFormat(.macho, .{
+        .payload_object_bytes = payload_bytes,
+        .target = zrwrite.bundle.HookLocator.fromSymbol("compute"),
+        .handler_symbol = "on_hit",
+    });
+
+    try rw.writeToPath(output_path);
+
+    const output_bytes = try std.fs.cwd().readFileAlloc(allocator, output_path, std.math.maxInt(usize));
+    defer allocator.free(output_bytes);
+
+    const output_view = try zrwrite.format.macho.View.parse(@constCast(output_bytes));
+    const branch_ptr: *const [4]u8 = @ptrCast(output_bytes[report.target_file_offset .. report.target_file_offset + 4].ptr);
+    const branch_opcode = std.mem.readInt(u32, branch_ptr, .little);
+    const branch_target = try zrwrite.aarch64.decodeBranchTarget(branch_opcode, report.target_address);
+
+    try std.testing.expectEqual(report.stub_address.?, branch_target);
+    try std.testing.expect(report.payload_entry_address < report.stub_address.?);
+    try std.testing.expect(report.injection_offset < output_bytes.len);
+    try std.testing.expectEqual(report.payload_entry_address, try output_view.offsetToAddress(report.injection_offset));
+    try std.testing.expect((try output_view.codeSignatureRange()).?.size == 0);
+}
+
+test "Mach-O rewriter applies native replace payload with BRANCH26 relocations" {
+    if (builtin.os.tag != .macos or builtin.cpu.arch != .aarch64) {
+        return error.SkipZigTest;
+    }
+
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const tmp_dir_path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(tmp_dir_path);
+
+    const input_path = try std.fs.path.join(allocator, &.{ tmp_dir_path, "compute_macho_replace" });
+    defer allocator.free(input_path);
+    const payload_path = try std.fs.path.join(allocator, &.{ tmp_dir_path, "macho_replace_branch_payload.o" });
+    defer allocator.free(payload_path);
+    const output_path = try std.fs.path.join(allocator, &.{ tmp_dir_path, "compute_macho_replaced" });
+    defer allocator.free(output_path);
+
+    try runCommand(allocator, &.{
+        "zig",
+        "cc",
+        "-target",
+        "aarch64-macos",
+        "-O0",
+        "-g0",
+        "-fno-sanitize=undefined",
+        "-fno-stack-protector",
+        "-fno-asynchronous-unwind-tables",
+        "tests/fixtures/compute.c",
+        "-o",
+        input_path,
+    });
+
+    try runCommand(allocator, &.{
+        "zig",
+        "cc",
+        "-target",
+        "aarch64-macos",
+        "-c",
+        "-O0",
+        "-g0",
+        "-fno-sanitize=undefined",
+        "-fno-stack-protector",
+        "-fno-asynchronous-unwind-tables",
+        "tests/fixtures/macho_replace_branch_payload.c",
+        "-o",
+        payload_path,
+    });
+
+    const payload_bytes = try std.fs.cwd().readFileAlloc(allocator, payload_path, std.math.maxInt(usize));
+    defer allocator.free(payload_bytes);
+
+    var rw = try zrwrite.Rewriter.initPath(allocator, input_path);
+    defer rw.deinit();
+
+    const report = try rw.addReplaceHookObjectForFormat(.macho, .{
+        .payload_object_bytes = payload_bytes,
+        .target = zrwrite.bundle.HookLocator.fromSymbol("compute"),
+        .replacement_symbol = "replacement_compute",
+    });
+
+    try rw.writeToPath(output_path);
+
+    const output_bytes = try std.fs.cwd().readFileAlloc(allocator, output_path, std.math.maxInt(usize));
+    defer allocator.free(output_bytes);
+    const output_view = try zrwrite.format.macho.View.parse(@constCast(output_bytes));
+
+    const branch_ptr: *const [4]u8 = @ptrCast(output_bytes[report.target_file_offset .. report.target_file_offset + 4].ptr);
+    const branch_opcode = std.mem.readInt(u32, branch_ptr, .little);
+    const branch_target = try zrwrite.aarch64.decodeBranchTarget(branch_opcode, report.target_address);
+    try std.testing.expectEqual(report.payload_entry_address, branch_target);
+    try std.testing.expectEqual(report.payload_entry_address, try output_view.offsetToAddress(report.injection_offset));
+    try std.testing.expect((try output_view.codeSignatureRange()).?.size == 0);
 }
 
 test "bundle -> apply supports replace hook via virtual address locator" {
