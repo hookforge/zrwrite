@@ -216,7 +216,7 @@ test "Mach-O view plans linkedit-tail injection and can clear stale code signatu
     const slack_before_linkedit = @as(usize, @intCast(original_linkedit_fileoff)) - carrier_end;
     const plan = try view.planInjection(slack_before_linkedit + 0x100, 16);
 
-    try std.testing.expectEqual(@as(usize, 0x100), plan.tail_shift);
+    try std.testing.expectEqual(@as(usize, 0x4000), plan.tail_shift);
     try std.testing.expect(!plan.fitsExistingSlack());
     try std.testing.expectEqual(original_bytes.len + plan.tail_shift, plan.total_len);
 
@@ -237,10 +237,197 @@ test "Mach-O view plans linkedit-tail injection and can clear stale code signatu
     const shifted_linkedit = try finalized_view.segmentByName("__LINKEDIT");
     try std.testing.expectEqual(original_linkedit_fileoff + plan.tail_shift, shifted_linkedit.command.fileoff);
     try std.testing.expectEqual(original_linkedit_vmaddr + plan.tail_shift, shifted_linkedit.command.vmaddr);
+    try std.testing.expectEqual(@as(u64, 0), shifted_linkedit.command.fileoff % 0x4000);
+    try std.testing.expectEqual(@as(u64, 0), shifted_linkedit.command.vmaddr % 0x4000);
     try std.testing.expectEqual(original_symtab.offset + plan.tail_shift, (try finalized_view.symbolTableRange()).?.offset);
     try std.testing.expectEqual(original_strtab.offset + plan.tail_shift, (try finalized_view.stringTableRange()).?.offset);
     try std.testing.expectEqual(@as(u64, @intCast(final_size)), shifted_linkedit.command.fileoff + shifted_linkedit.command.filesize);
     try std.testing.expect((try finalized_view.codeSignatureRange()) == null);
+}
+
+test "Mach-O executable injection preserves text references into shifted data segments" {
+    if (builtin.os.tag != .macos or builtin.cpu.arch != .aarch64) {
+        return error.SkipZigTest;
+    }
+
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const tmp_dir_path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(tmp_dir_path);
+
+    const input_path = try std.fs.path.join(allocator, &.{ tmp_dir_path, "macho_shifted_data_ref" });
+    defer allocator.free(input_path);
+    const output_path = try std.fs.path.join(allocator, &.{ tmp_dir_path, "macho_shifted_data_ref.shifted" });
+    defer allocator.free(output_path);
+
+    try runCommand(allocator, &.{
+        "xcrun",
+        "--sdk",
+        "macosx",
+        "clang",
+        "-arch",
+        "arm64",
+        "-Wl,-e,_main",
+        "tests/fixtures/macho_shifted_data_ref.S",
+        "-o",
+        input_path,
+    });
+
+    const original_bytes = try std.fs.cwd().readFileAlloc(allocator, input_path, std.math.maxInt(usize));
+    defer allocator.free(original_bytes);
+
+    const mutable_bytes = try allocator.dupe(u8, original_bytes);
+    defer allocator.free(mutable_bytes);
+
+    const view = try zrwrite.format.macho.View.parse(mutable_bytes);
+    const split_plan = try view.planSplitInjection(0x100, 0, 16);
+    try std.testing.expect(!split_plan.executable.fitsExistingSlack());
+
+    const output_bytes = try view.materializeSplitInjectedImage(allocator, split_plan);
+    defer allocator.free(output_bytes);
+
+    const output_view = try zrwrite.format.macho.View.parse(output_bytes);
+    const final_size = try output_view.finalizeSplitInjectedImage(split_plan);
+    try std.fs.cwd().writeFile(.{
+        .sub_path = output_path,
+        .data = output_bytes[0..final_size],
+    });
+
+    try runCommand(allocator, &.{ "chmod", "+x", output_path });
+    try runCommand(allocator, &.{ "codesign", "-f", "-s", "-", output_path });
+    try runCommandExpectExitCode(allocator, &.{output_path}, 7);
+}
+
+test "Mach-O segment shifting preserves Objective-C relative method metadata" {
+    if (builtin.os.tag != .macos or builtin.cpu.arch != .aarch64) {
+        return error.SkipZigTest;
+    }
+
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const tmp_dir_path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(tmp_dir_path);
+
+    const input_path = try std.fs.path.join(allocator, &.{ tmp_dir_path, "macho_objc_methodlist" });
+    defer allocator.free(input_path);
+    const output_path = try std.fs.path.join(allocator, &.{ tmp_dir_path, "macho_objc_methodlist.shifted" });
+    defer allocator.free(output_path);
+
+    try runCommand(allocator, &.{
+        "xcrun",
+        "--sdk",
+        "macosx",
+        "clang",
+        "-arch",
+        "arm64",
+        "-O0",
+        "-g0",
+        "-fobjc-arc",
+        "tests/fixtures/macho_objc_methodlist.m",
+        "-framework",
+        "Foundation",
+        "-o",
+        input_path,
+    });
+
+    const original_bytes = try std.fs.cwd().readFileAlloc(allocator, input_path, std.math.maxInt(usize));
+    defer allocator.free(original_bytes);
+
+    const mutable_bytes = try allocator.dupe(u8, original_bytes);
+    defer allocator.free(mutable_bytes);
+
+    const view = try zrwrite.format.macho.View.parse(mutable_bytes);
+    const split_plan = try view.planSplitInjection(0x100, 0, 16);
+    try std.testing.expect(!split_plan.executable.fitsExistingSlack());
+
+    const output_bytes = try view.materializeSplitInjectedImage(allocator, split_plan);
+    defer allocator.free(output_bytes);
+
+    const output_view = try zrwrite.format.macho.View.parse(output_bytes);
+    const final_size = try output_view.finalizeSplitInjectedImage(split_plan);
+    try std.fs.cwd().writeFile(.{
+        .sub_path = output_path,
+        .data = output_bytes[0..final_size],
+    });
+
+    try runCommand(allocator, &.{ "chmod", "+x", output_path });
+    try runCommand(allocator, &.{ "codesign", "-f", "-s", "-", output_path });
+    try runCommandExpectExitCode(allocator, &.{output_path}, 7);
+
+    const objc_info = try runCommandCaptureStdout(allocator, &.{ "xcrun", "dyld_info", "-objc", output_path });
+    defer allocator.free(objc_info);
+    try std.testing.expect(std.mem.indexOf(u8, objc_info, "-[ArMethodListDemo answer]") != null);
+}
+
+test "Mach-O split injection with writable payload keeps Objective-C chained fixups parseable" {
+    if (builtin.os.tag != .macos or builtin.cpu.arch != .aarch64) {
+        return error.SkipZigTest;
+    }
+
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const tmp_dir_path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(tmp_dir_path);
+
+    const input_path = try std.fs.path.join(allocator, &.{ tmp_dir_path, "macho_objc_methodlist_split" });
+    defer allocator.free(input_path);
+    const output_path = try std.fs.path.join(allocator, &.{ tmp_dir_path, "macho_objc_methodlist_split.shifted" });
+    defer allocator.free(output_path);
+
+    try runCommand(allocator, &.{
+        "xcrun",
+        "--sdk",
+        "macosx",
+        "clang",
+        "-arch",
+        "arm64",
+        "-O0",
+        "-g0",
+        "-fobjc-arc",
+        "tests/fixtures/macho_objc_methodlist.m",
+        "-framework",
+        "Foundation",
+        "-o",
+        input_path,
+    });
+
+    const original_bytes = try std.fs.cwd().readFileAlloc(allocator, input_path, std.math.maxInt(usize));
+    defer allocator.free(original_bytes);
+
+    const mutable_bytes = try allocator.dupe(u8, original_bytes);
+    defer allocator.free(mutable_bytes);
+
+    const view = try zrwrite.format.macho.View.parse(mutable_bytes);
+    const split_plan = try view.planSplitInjection(0x100, 0x100, 16);
+    try std.testing.expect(split_plan.hasWritableRegion());
+    try std.testing.expect(!split_plan.executable.fitsExistingSlack());
+
+    const output_bytes = try view.materializeSplitInjectedImage(allocator, split_plan);
+    defer allocator.free(output_bytes);
+
+    const output_view = try zrwrite.format.macho.View.parse(output_bytes);
+    const final_size = try output_view.finalizeSplitInjectedImage(split_plan);
+    try std.fs.cwd().writeFile(.{
+        .sub_path = output_path,
+        .data = output_bytes[0..final_size],
+    });
+
+    try runCommand(allocator, &.{ "chmod", "+x", output_path });
+    try runCommand(allocator, &.{ "codesign", "-f", "-s", "-", output_path });
+    try runCommandExpectExitCode(allocator, &.{output_path}, 7);
+
+    const objc_info = try runCommandCaptureStdout(allocator, &.{ "xcrun", "dyld_info", "-objc", output_path });
+    defer allocator.free(objc_info);
+    try std.testing.expect(std.mem.indexOf(u8, objc_info, "-[ArMethodListDemo answer]") != null);
 }
 
 test "Mach-O rewriter applies native instrument payload with rodata/data/bss relocations" {
@@ -3287,7 +3474,7 @@ test "payload linker rejects GOT-style external data relocations for ET_DYN targ
     );
 
     const diagnostic = zrwrite.lastLinkDiagnosticMessage() orelse return error.MissingDiagnostic;
-    try std.testing.expect(std.mem.indexOf(u8, diagnostic, "ADR_GOT_PAGE") != null);
+    try std.testing.expect(std.mem.indexOf(u8, diagnostic, "synthetic GOT slot") != null);
     try std.testing.expect(std.mem.indexOf(u8, diagnostic, "target_value") != null);
     try std.testing.expect(std.mem.indexOf(u8, diagnostic, "ET_DYN") != null);
 }
@@ -3498,7 +3685,65 @@ test "payload mini-linker patches MOVW_UABS relocation sequences" {
     try std.testing.expectEqual(image_base_address + 20, materialized_address);
 }
 
-test "payload linker stores unsupported relocation diagnostics with relocation and symbol names" {
+test "payload mini-linker patches MOVW_PREL relocation sequences" {
+    const allocator = std.testing.allocator;
+
+    const source =
+        \\.section .text.helper,"ax",@progbits
+        \\.p2align 2
+        \\.global helper
+        \\.type helper,%function
+        \\helper:
+        \\    ret
+        \\.size helper, .-helper
+        \\
+        \\.text
+        \\.p2align 2
+        \\.global on_hit
+        \\.type on_hit,%function
+        \\on_hit:
+        \\    movz x0, #:prel_g0:helper
+        \\    movk x1, #:prel_g1_nc:helper
+        \\    movk x2, #:prel_g2_nc:helper
+        \\    movk x3, #:prel_g3:helper
+        \\    ret
+        \\.size on_hit, .-on_hit
+        \\
+    ;
+
+    const object_bytes = try compileAarch64AssemblyObject(allocator, "movw_prel_payload.S", source);
+    defer allocator.free(object_bytes);
+
+    const image_base_address: u64 = 0x6100_0000;
+    const helper_layout = try zrwrite.payload.analyzeObjectBytes(allocator, object_bytes, "helper");
+    const loaded = try zrwrite.payload.linkObjectBytes(allocator, object_bytes, "on_hit", image_base_address, null);
+    defer allocator.free(loaded.image);
+
+    const helper_address = image_base_address + helper_layout.entry_offset;
+    const on_hit_address = image_base_address + loaded.entry_offset;
+
+    const opcode0 = try readLeU32(loaded.image, loaded.entry_offset + 0);
+    const opcode1 = try readLeU32(loaded.image, loaded.entry_offset + 4);
+    const opcode2 = try readLeU32(loaded.image, loaded.entry_offset + 8);
+    const opcode3 = try readLeU32(loaded.image, loaded.entry_offset + 12);
+
+    const delta0: i64 = @intCast(@as(i128, @intCast(helper_address)) - @as(i128, @intCast(on_hit_address + 0)));
+    const delta1: i64 = @intCast(@as(i128, @intCast(helper_address)) - @as(i128, @intCast(on_hit_address + 4)));
+    const delta2: i64 = @intCast(@as(i128, @intCast(helper_address)) - @as(i128, @intCast(on_hit_address + 8)));
+    const delta3: i64 = @intCast(@as(i128, @intCast(helper_address)) - @as(i128, @intCast(on_hit_address + 12)));
+
+    try std.testing.expectEqual(@as(u2, if (delta0 < 0) 0 else 2), extractMoveWideOpcode(opcode0));
+    try std.testing.expectEqual(@as(u2, 3), extractMoveWideOpcode(opcode1));
+    try std.testing.expectEqual(@as(u2, 3), extractMoveWideOpcode(opcode2));
+    try std.testing.expectEqual(@as(u2, 3), extractMoveWideOpcode(opcode3));
+
+    try std.testing.expectEqual(expectedSignedMoveWideImmediate(delta0, 0, delta0 < 0), extractMovWideImmediate(opcode0));
+    try std.testing.expectEqual(expectedSignedMoveWideImmediate(delta1, 16, false), extractMovWideImmediate(opcode1));
+    try std.testing.expectEqual(expectedSignedMoveWideImmediate(delta2, 32, false), extractMovWideImmediate(opcode2));
+    try std.testing.expectEqual(expectedSignedMoveWideImmediate(delta3, 48, false), extractMovWideImmediate(opcode3));
+}
+
+test "payload mini-linker patches MOVW_SABS relocation sequences" {
     const allocator = std.testing.allocator;
 
     const source =
@@ -3507,7 +3752,9 @@ test "payload linker stores unsupported relocation diagnostics with relocation a
         \\.global on_hit
         \\.type on_hit,%function
         \\on_hit:
-        \\    movz x0, #:prel_g0:helper
+        \\    movz x0, #:abs_g0_s:helper
+        \\    movz x1, #:abs_g1_s:helper
+        \\    movz x2, #:abs_g2_s:helper
         \\    ret
         \\.size on_hit, .-on_hit
         \\
@@ -3521,8 +3768,294 @@ test "payload linker stores unsupported relocation diagnostics with relocation a
         \\
     ;
 
-    const object_bytes = try compileAarch64AssemblyObject(allocator, "unsupported_prel_movw.S", source);
+    const object_bytes = try compileAarch64AssemblyObject(allocator, "movw_sabs_payload.S", source);
     defer allocator.free(object_bytes);
+
+    const image_base_address: u64 = 0x1000;
+    const helper_layout = try zrwrite.payload.analyzeObjectBytes(allocator, object_bytes, "helper");
+    const loaded = try zrwrite.payload.linkObjectBytes(allocator, object_bytes, "on_hit", image_base_address, null);
+    defer allocator.free(loaded.image);
+
+    const helper_address = image_base_address + helper_layout.entry_offset;
+
+    const opcode0 = try readLeU32(loaded.image, 0);
+    const opcode1 = try readLeU32(loaded.image, 4);
+    const opcode2 = try readLeU32(loaded.image, 8);
+
+    try std.testing.expectEqual(@as(u2, 2), extractMoveWideOpcode(opcode0));
+    try std.testing.expectEqual(@as(u2, 2), extractMoveWideOpcode(opcode1));
+    try std.testing.expectEqual(@as(u2, 2), extractMoveWideOpcode(opcode2));
+
+    const signed_helper: i64 = @intCast(helper_address);
+    try std.testing.expectEqual(expectedSignedMoveWideImmediate(signed_helper, 0, false), extractMovWideImmediate(opcode0));
+    try std.testing.expectEqual(expectedSignedMoveWideImmediate(signed_helper, 16, false), extractMovWideImmediate(opcode1));
+    try std.testing.expectEqual(expectedSignedMoveWideImmediate(signed_helper, 32, false), extractMovWideImmediate(opcode2));
+}
+
+test "payload mini-linker patches GOT_LD_PREL19 relocations through synthetic GOT slots" {
+    const allocator = std.testing.allocator;
+
+    const source =
+        \\.text
+        \\.p2align 2
+        \\.global on_hit
+        \\.type on_hit,%function
+        \\on_hit:
+        \\    ldr x0, :got:helper
+        \\    ret
+        \\.size on_hit, .-on_hit
+        \\
+        \\.section .text.helper,"ax",@progbits
+        \\.p2align 2
+        \\.global helper
+        \\.type helper,%function
+        \\helper:
+        \\    ret
+        \\.size helper, .-helper
+        \\
+    ;
+
+    const object_bytes = try compileAarch64AssemblyObject(allocator, "got_ld_prel19_payload.S", source);
+    defer allocator.free(object_bytes);
+
+    const image_base_address: u64 = 0x6300_0000;
+    const layout = try zrwrite.payload.analyzeObjectBytes(allocator, object_bytes, "on_hit");
+    const helper_layout = try zrwrite.payload.analyzeObjectBytes(allocator, object_bytes, "helper");
+    const loaded = try zrwrite.payload.linkObjectBytes(allocator, object_bytes, "on_hit", image_base_address, null);
+    defer allocator.free(loaded.image);
+
+    const slot_address = image_base_address + layout.image_size - @sizeOf(u64);
+    const ldr_opcode = try readLeU32(loaded.image, 0);
+    const literal_target = try decodePcRelativeTarget(ldr_opcode, image_base_address, 19);
+
+    try std.testing.expectEqual(slot_address, literal_target);
+    try std.testing.expectEqual(image_base_address + helper_layout.entry_offset, try readLeU64(loaded.image, layout.image_size - @sizeOf(u64)));
+}
+
+test "payload mini-linker patches LD64_GOTPAGE_LO15 relocations through synthetic GOT slots" {
+    const allocator = std.testing.allocator;
+
+    const source =
+        \\.text
+        \\.p2align 2
+        \\.global on_hit
+        \\.type on_hit,%function
+        \\on_hit:
+        \\    adrp x0, _GLOBAL_OFFSET_TABLE_
+        \\    ldr x0, [x0, #:gotpage_lo15:helper]
+        \\    ret
+        \\.size on_hit, .-on_hit
+        \\
+        \\.section .text.helper,"ax",@progbits
+        \\.p2align 2
+        \\.global helper
+        \\.type helper,%function
+        \\helper:
+        \\    ret
+        \\.size helper, .-helper
+        \\
+    ;
+
+    const object_bytes = try compileAarch64AssemblyObject(allocator, "gotpage_lo15_payload.S", source);
+    defer allocator.free(object_bytes);
+
+    const image_base_address: u64 = 0x6400_0000;
+    const layout = try zrwrite.payload.analyzeObjectBytes(allocator, object_bytes, "on_hit");
+    const helper_layout = try zrwrite.payload.analyzeObjectBytes(allocator, object_bytes, "helper");
+    const loaded = try zrwrite.payload.linkObjectBytes(allocator, object_bytes, "on_hit", image_base_address, null);
+    defer allocator.free(loaded.image);
+
+    const slot_address = image_base_address + layout.image_size - @sizeOf(u64);
+    const adrp_opcode = try readLeU32(loaded.image, 0);
+    const ldr_opcode = try readLeU32(loaded.image, 4);
+
+    const slot_page = try decodeAdrpPageTarget(adrp_opcode, image_base_address);
+    const slot_offset = extractUnsignedLoadStoreImmediate(ldr_opcode, 3);
+
+    try std.testing.expectEqual(slot_address & ~@as(u64, 0xFFF), slot_page);
+    try std.testing.expectEqual(slot_address, slot_page + slot_offset);
+    try std.testing.expectEqual(image_base_address + helper_layout.entry_offset, try readLeU64(loaded.image, layout.image_size - @sizeOf(u64)));
+}
+
+test "payload mini-linker patches GOTREL64 and GOTREL32 relocations against the synthetic GOT base" {
+    const allocator = std.testing.allocator;
+
+    const source =
+        \\.text
+        \\.p2align 3
+        \\.global on_hit
+        \\.type on_hit,%function
+        \\on_hit:
+        \\    .xword helper
+        \\    .word helper
+        \\    ret
+        \\.size on_hit, .-on_hit
+        \\
+        \\.section .text.helper,"ax",@progbits
+        \\.p2align 2
+        \\.global helper
+        \\.type helper,%function
+        \\helper:
+        \\    ret
+        \\.size helper, .-helper
+        \\
+    ;
+
+    const object_bytes = try compileAarch64AssemblyObject(allocator, "gotrel_payload.S", source);
+    defer allocator.free(object_bytes);
+
+    try overwriteRelaTypeAtIndex(object_bytes, 0, @intFromEnum(std.elf.R_AARCH64.GOTREL64));
+    try overwriteRelaTypeAtIndex(object_bytes, 1, @intFromEnum(std.elf.R_AARCH64.GOTREL32));
+
+    const image_base_address: u64 = 0x6500_0000;
+    const layout = try zrwrite.payload.analyzeObjectBytes(allocator, object_bytes, "on_hit");
+    const helper_layout = try zrwrite.payload.analyzeObjectBytes(allocator, object_bytes, "helper");
+    const loaded = try zrwrite.payload.linkObjectBytes(allocator, object_bytes, "on_hit", image_base_address, null);
+    defer allocator.free(loaded.image);
+
+    const got_base_address = image_base_address + layout.image_size;
+    const helper_address = image_base_address + helper_layout.entry_offset;
+    const expected_delta: i64 = @intCast(@as(i128, @intCast(helper_address)) - @as(i128, @intCast(got_base_address)));
+
+    try std.testing.expectEqual(expected_delta, try readLeI64(loaded.image, loaded.entry_offset + 0));
+    try std.testing.expectEqual(@as(i32, @intCast(expected_delta)), try readLeI32(loaded.image, loaded.entry_offset + 8));
+}
+
+test "payload mini-linker patches MOVW_GOTOFF relocation sequences through synthetic GOT slots" {
+    const allocator = std.testing.allocator;
+
+    const source =
+        \\.text
+        \\.p2align 2
+        \\.global on_hit
+        \\.type on_hit,%function
+        \\on_hit:
+        \\    ldr x9, :got:helper0
+        \\    movz x0, #:prel_g0:helper1
+        \\    movk x1, #:prel_g1_nc:helper1
+        \\    movk x2, #:prel_g2_nc:helper1
+        \\    movk x3, #:prel_g3:helper1
+        \\    ret
+        \\.size on_hit, .-on_hit
+        \\
+        \\.section .text.helper0,"ax",@progbits
+        \\.p2align 2
+        \\.global helper0
+        \\.type helper0,%function
+        \\helper0:
+        \\    ret
+        \\.size helper0, .-helper0
+        \\
+        \\.section .text.helper1,"ax",@progbits
+        \\.p2align 2
+        \\.global helper1
+        \\.type helper1,%function
+        \\helper1:
+        \\    ret
+        \\.size helper1, .-helper1
+        \\
+    ;
+
+    const object_bytes = try compileAarch64AssemblyObject(allocator, "movw_gotoff_payload.S", source);
+    defer allocator.free(object_bytes);
+
+    try overwriteRelaTypeAtIndex(object_bytes, 1, @intFromEnum(std.elf.R_AARCH64.MOVW_GOTOFF_G0));
+    try overwriteRelaTypeAtIndex(object_bytes, 2, @intFromEnum(std.elf.R_AARCH64.MOVW_GOTOFF_G1_NC));
+    try overwriteRelaTypeAtIndex(object_bytes, 3, @intFromEnum(std.elf.R_AARCH64.MOVW_GOTOFF_G2_NC));
+    try overwriteRelaTypeAtIndex(object_bytes, 4, @intFromEnum(std.elf.R_AARCH64.MOVW_GOTOFF_G3));
+
+    const loaded = try zrwrite.payload.linkObjectBytes(allocator, object_bytes, "on_hit", 0x6600_0000, null);
+    defer allocator.free(loaded.image);
+
+    const opcode0 = try readLeU32(loaded.image, loaded.entry_offset + 4);
+    const opcode1 = try readLeU32(loaded.image, loaded.entry_offset + 8);
+    const opcode2 = try readLeU32(loaded.image, loaded.entry_offset + 12);
+    const opcode3 = try readLeU32(loaded.image, loaded.entry_offset + 16);
+
+    try std.testing.expectEqual(@as(u2, 2), extractMoveWideOpcode(opcode0));
+    try std.testing.expectEqual(@as(u2, 3), extractMoveWideOpcode(opcode1));
+    try std.testing.expectEqual(@as(u2, 3), extractMoveWideOpcode(opcode2));
+    try std.testing.expectEqual(@as(u2, 3), extractMoveWideOpcode(opcode3));
+
+    try std.testing.expectEqual(@as(u16, 8), extractMovWideImmediate(opcode0));
+    try std.testing.expectEqual(@as(u16, 0), extractMovWideImmediate(opcode1));
+    try std.testing.expectEqual(@as(u16, 0), extractMovWideImmediate(opcode2));
+    try std.testing.expectEqual(@as(u16, 0), extractMovWideImmediate(opcode3));
+}
+
+test "payload mini-linker patches LD64_GOTOFF_LO15 relocations through synthetic GOT slots" {
+    const allocator = std.testing.allocator;
+
+    const source =
+        \\.text
+        \\.p2align 2
+        \\.global on_hit
+        \\.type on_hit,%function
+        \\on_hit:
+        \\    ldr x9, :got:helper0
+        \\    adrp x0, _GLOBAL_OFFSET_TABLE_
+        \\    add x0, x0, #:lo12:_GLOBAL_OFFSET_TABLE_
+        \\    ldr x0, [x0, #:gotpage_lo15:helper1]
+        \\    ret
+        \\.size on_hit, .-on_hit
+        \\
+        \\.section .text.helper0,"ax",@progbits
+        \\.p2align 2
+        \\.global helper0
+        \\.type helper0,%function
+        \\helper0:
+        \\    ret
+        \\.size helper0, .-helper0
+        \\
+        \\.section .text.helper1,"ax",@progbits
+        \\.p2align 2
+        \\.global helper1
+        \\.type helper1,%function
+        \\helper1:
+        \\    ret
+        \\.size helper1, .-helper1
+        \\
+    ;
+
+    const object_bytes = try compileAarch64AssemblyObject(allocator, "gotoff_lo15_payload.S", source);
+    defer allocator.free(object_bytes);
+
+    try overwriteRelaTypeAtIndex(object_bytes, 3, @intFromEnum(std.elf.R_AARCH64.LD64_GOTOFF_LO15));
+
+    const loaded = try zrwrite.payload.linkObjectBytes(allocator, object_bytes, "on_hit", 0x6700_0000, null);
+    defer allocator.free(loaded.image);
+
+    const ldr_opcode = try readLeU32(loaded.image, loaded.entry_offset + 12);
+    try std.testing.expectEqual(@as(u64, 8), extractUnsignedLoadStoreImmediate(ldr_opcode, 3));
+}
+
+test "payload linker stores unsupported relocation diagnostics with relocation and symbol names" {
+    const allocator = std.testing.allocator;
+
+    const source =
+        \\.text
+        \\.p2align 2
+        \\.global on_hit
+        \\.type on_hit,%function
+        \\on_hit:
+        \\    ldr x0, :got:helper
+        \\    ret
+        \\.size on_hit, .-on_hit
+        \\
+        \\.section .text.helper,"ax",@progbits
+        \\.p2align 2
+        \\.global helper
+        \\.type helper,%function
+        \\helper:
+        \\    ret
+        \\.size helper, .-helper
+        \\
+    ;
+
+    const object_bytes = try compileAarch64AssemblyObject(allocator, "unsupported_relocation_payload.S", source);
+    defer allocator.free(object_bytes);
+
+    try overwriteFirstRelaType(object_bytes, @intFromEnum(std.elf.R_AARCH64.TLSIE_LD_GOTTPREL_PREL19));
 
     zrwrite.clearLastLinkDiagnostic();
     try std.testing.expectError(
@@ -3531,7 +4064,7 @@ test "payload linker stores unsupported relocation diagnostics with relocation a
     );
 
     const diagnostic = zrwrite.lastLinkDiagnosticMessage() orelse return error.MissingDiagnostic;
-    try std.testing.expect(std.mem.indexOf(u8, diagnostic, "MOVW_PREL_G0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, diagnostic, "TLSIE_LD_GOTTPREL_PREL19") != null);
     try std.testing.expect(std.mem.indexOf(u8, diagnostic, "helper") != null);
 }
 
@@ -3582,6 +4115,64 @@ fn readLeU32(bytes: []const u8, offset: usize) !u32 {
     return std.mem.readInt(u32, ptr, .little);
 }
 
+fn readLeU64(bytes: []const u8, offset: usize) !u64 {
+    if (offset + @sizeOf(u64) > bytes.len) return error.EndOfStream;
+    const ptr: *const [8]u8 = @ptrCast(bytes[offset .. offset + 8].ptr);
+    return std.mem.readInt(u64, ptr, .little);
+}
+
+fn readLeI32(bytes: []const u8, offset: usize) !i32 {
+    if (offset + @sizeOf(i32) > bytes.len) return error.EndOfStream;
+    const ptr: *const [4]u8 = @ptrCast(bytes[offset .. offset + 4].ptr);
+    return std.mem.readInt(i32, ptr, .little);
+}
+
+fn readLeI64(bytes: []const u8, offset: usize) !i64 {
+    if (offset + @sizeOf(i64) > bytes.len) return error.EndOfStream;
+    const ptr: *const [8]u8 = @ptrCast(bytes[offset .. offset + 8].ptr);
+    return std.mem.readInt(i64, ptr, .little);
+}
+
+fn writeLeU64(bytes: []u8, offset: usize, value: u64) !void {
+    if (offset + @sizeOf(u64) > bytes.len) return error.EndOfStream;
+    var le = std.mem.nativeToLittle(u64, value);
+    @memcpy(bytes[offset .. offset + @sizeOf(u64)], std.mem.asBytes(&le));
+}
+
+fn overwriteFirstRelaType(object_bytes: []u8, relocation_type: u32) !void {
+    return overwriteRelaTypeAtIndex(object_bytes, 0, relocation_type);
+}
+
+fn overwriteRelaTypeAtIndex(object_bytes: []u8, relocation_index: usize, relocation_type: u32) !void {
+    const view = try zrwrite.elf.View.parse(object_bytes);
+    var seen: usize = 0;
+
+    for (view.shdrs) |shdr| {
+        if (shdr.sh_type != std.elf.SHT_RELA or shdr.sh_size == 0) continue;
+
+        if (shdr.sh_entsize != @sizeOf(std.elf.Elf64_Rela)) return error.InvalidRelocationTable;
+        const rela_count: usize = @intCast(shdr.sh_size / shdr.sh_entsize);
+        const rela_base: usize = @intCast(shdr.sh_offset);
+
+        for (0..rela_count) |local_index| {
+            if (seen != relocation_index) {
+                seen += 1;
+                continue;
+            }
+
+            const rela_offset = rela_base + local_index * @sizeOf(std.elf.Elf64_Rela);
+            const info_offset = rela_offset + @offsetOf(std.elf.Elf64_Rela, "r_info");
+            const old_info = try readLeU64(object_bytes, info_offset);
+            const symbol_index = old_info >> 32;
+            const new_info = (symbol_index << 32) | relocation_type;
+            try writeLeU64(object_bytes, info_offset, new_info);
+            return;
+        }
+    }
+
+    return error.MissingRelocationSection;
+}
+
 fn hexStringAlloc(allocator: std.mem.Allocator, bytes: []const u8) ![]u8 {
     const out = try allocator.alloc(u8, bytes.len * 2);
     errdefer allocator.free(out);
@@ -3608,6 +4199,32 @@ fn countOccurrences(haystack: []const u8, needle: []const u8) usize {
 
 fn extractMovWideImmediate(opcode: u32) u16 {
     return @intCast((opcode >> 5) & 0xFFFF);
+}
+
+fn extractMoveWideOpcode(opcode: u32) u2 {
+    return @intCast((opcode >> 29) & 0x3);
+}
+
+fn expectedSignedMoveWideImmediate(value: i64, shift: u6, negate_slice: bool) u16 {
+    const raw: u64 = @bitCast(value);
+    const slice: u16 = @intCast((raw >> shift) & 0xFFFF);
+    return if (negate_slice) ~slice else slice;
+}
+
+fn decodeAdrpPageTarget(opcode: u32, site_address: u64) !u64 {
+    const immlo = (opcode >> 29) & 0x3;
+    const immhi = (opcode >> 5) & 0x7FFFF;
+    const raw = immlo | (immhi << 2);
+    const page_delta = try decodeSignedScaledImmediate(raw, 21, 12);
+    const site_page = site_address & ~@as(u64, 0xFFF);
+    const result = @as(i128, @intCast(site_page)) + @as(i128, page_delta);
+    if (result < 0 or result > std.math.maxInt(u64)) return error.Overflow;
+    return @intCast(result);
+}
+
+fn extractUnsignedLoadStoreImmediate(opcode: u32, shift: u6) u64 {
+    const imm12 = (opcode >> 10) & 0xFFF;
+    return @as(u64, imm12) << shift;
 }
 
 fn decodePcRelativeTarget(opcode: u32, site_address: u64, imm_bits: u6) !u64 {
@@ -3652,6 +4269,26 @@ fn runCommand(allocator: std.mem.Allocator, argv: []const []const u8) !void {
         });
         return error.CommandFailed;
     }
+}
+
+fn runCommandCaptureStdout(allocator: std.mem.Allocator, argv: []const []const u8) ![]u8 {
+    const result = try std.process.Child.run(.{
+        .allocator = allocator,
+        .argv = argv,
+    });
+    defer allocator.free(result.stderr);
+
+    if (result.term.Exited != 0) {
+        defer allocator.free(result.stdout);
+        std.debug.print("command failed: {s}\n{s}\n{s}\n", .{
+            argv[0],
+            result.stdout,
+            result.stderr,
+        });
+        return error.CommandFailed;
+    }
+
+    return result.stdout;
 }
 
 fn runCommandExpectExitCode(

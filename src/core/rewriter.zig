@@ -82,6 +82,35 @@ const ResolvedTarget = struct {
     file_offset: usize,
 };
 
+/// One hook locator resolved against both the pristine input image and the
+/// currently-mutated working image.
+///
+/// Bundle author intent should be stable across multi-hook rewrites:
+/// - symbol / pattern / address locators describe the original binary the user
+///   inspected
+/// - expected-bytes guards should validate that original inspected image
+/// - the concrete patch write still has to happen at the target's *current*
+///   file offset after earlier injections may have shifted later ranges
+const ResolvedPatchTarget = struct {
+    address: u64,
+    original_file_offset: usize,
+    current_file_offset: usize,
+
+    fn original(self: ResolvedPatchTarget) ResolvedTarget {
+        return .{
+            .address = self.address,
+            .file_offset = self.original_file_offset,
+        };
+    }
+
+    fn current(self: ResolvedPatchTarget) ResolvedTarget {
+        return .{
+            .address = self.address,
+            .file_offset = self.current_file_offset,
+        };
+    }
+};
+
 const IncomingBranchRetarget = struct {
     source_address: u64,
     source_file_offset: usize,
@@ -236,29 +265,53 @@ pub const Rewriter = struct {
         clearLastRewriteDiagnostic();
         const base_bytes = self.workingBytes();
         const input_view = try image_backend.View.parseAs(base_bytes, binary_format);
+        const original_input_view = try image_backend.View.parseAs(self.input_bytes, binary_format);
         // Repeated instrument attachments of the same payload object should
         // look like multiple entry points into one payload module, not like N
         // silently duplicated modules with isolated global state.
         const shared_payload = self.findSharedInstrumentPayload(binary_format, spec.payload_object_bytes);
         return switch (input_view) {
-            .elf => |view| self.addInstrumentHookObjectElf(view, spec, shared_payload),
-            .macho => |view| self.addInstrumentHookObjectMachO(view, spec, shared_payload),
+            .elf => |view| self.addInstrumentHookObjectElf(
+                view,
+                original_input_view.elf,
+                spec,
+                shared_payload,
+            ),
+            .macho => |view| self.addInstrumentHookObjectMachO(
+                view,
+                original_input_view.macho,
+                spec,
+                shared_payload,
+            ),
         };
     }
 
     fn addInstrumentHookObjectElf(
         self: *Rewriter,
         input_view: ElfView,
+        original_input_view: ElfView,
         spec: InstrumentObjectSpec,
         shared_payload: ?SharedInstrumentPayload,
     ) !InstrumentRewriteReport {
         const target_view: image_backend.View = .{ .elf = input_view };
+        const original_target_view: image_backend.View = .{ .elf = original_input_view };
         const base_bytes = self.workingBytes();
-        const target = try resolveTargetLocation(self.allocator, target_view, spec.target);
+        const resolved_target = try resolvePatchTargetLocation(
+            self.allocator,
+            original_target_view,
+            target_view,
+            spec.target,
+        );
+        const target = resolved_target.current();
         const stolen_instruction_count = try validateStolenInstructionCount(spec.stolen_instruction_count);
         const stolen_window_size = stolen_instruction_count * @sizeOf(u32);
-        try validatePatchWindowMapping(target_view, target, stolen_instruction_count);
-        try validateExpectedBytes(self.allocator, base_bytes, target, spec.expected_bytes);
+        try validatePatchWindowMapping(original_target_view, resolved_target.original(), stolen_instruction_count);
+        try validateExpectedBytes(
+            self.allocator,
+            self.input_bytes,
+            resolved_target.original(),
+            spec.expected_bytes,
+        );
 
         const window_plan = try analyzeInstrumentWindowPlan(
             base_bytes,
@@ -434,16 +487,28 @@ pub const Rewriter = struct {
     fn addInstrumentHookObjectMachO(
         self: *Rewriter,
         input_view: MachOView,
+        original_input_view: MachOView,
         spec: InstrumentObjectSpec,
         shared_payload: ?SharedInstrumentPayload,
     ) !InstrumentRewriteReport {
         const target_view: image_backend.View = .{ .macho = input_view };
-        const base_bytes = self.workingBytes();
-        const target = try resolveTargetLocation(self.allocator, target_view, spec.target);
+        const original_target_view: image_backend.View = .{ .macho = original_input_view };
+        const resolved_target = try resolvePatchTargetLocation(
+            self.allocator,
+            original_target_view,
+            target_view,
+            spec.target,
+        );
+        const target = resolved_target.current();
         const stolen_instruction_count = try validateStolenInstructionCount(spec.stolen_instruction_count);
         const stolen_window_size = stolen_instruction_count * @sizeOf(u32);
-        try validatePatchWindowMapping(target_view, target, stolen_instruction_count);
-        try validateExpectedBytes(self.allocator, base_bytes, target, spec.expected_bytes);
+        try validatePatchWindowMapping(original_target_view, resolved_target.original(), stolen_instruction_count);
+        try validateExpectedBytes(
+            self.allocator,
+            self.input_bytes,
+            resolved_target.original(),
+            spec.expected_bytes,
+        );
 
         // All detour / trampoline / incoming-branch logic is shared with the
         // ELF path. Once the Mach-O image backend can plan/finalize injection
@@ -454,21 +519,13 @@ pub const Rewriter = struct {
         // - mapping target addresses/file offsets in the input image
         // - choosing where the injected blob will live in the output image
         // - linking a native Mach-O payload object against that final address
-        const window_plan = try analyzeInstrumentWindowPlan(
-            base_bytes,
-            target,
+        const preliminary_window_plan = try analyzeInstrumentWindowPlan(
+            self.input_bytes,
+            resolved_target.original(),
             stolen_instruction_count,
         );
-        const incoming_branches = try collectIncomingBranchRetargets(
-            self.allocator,
-            target_view,
-            target.address,
-            stolen_instruction_count,
-            window_plan,
-        );
-        defer self.allocator.free(incoming_branches);
-        const replay_plan = window_plan.singleReplayPlan() orelse aarch64.ReplayPlan{ .trampoline = {} };
-        const needs_raw_trampoline = windowNeedsRawTrampoline(window_plan);
+        const preliminary_replay_plan = preliminary_window_plan.singleReplayPlan() orelse aarch64.ReplayPlan{ .trampoline = {} };
+        const needs_raw_trampoline = windowNeedsRawTrampoline(preliminary_window_plan);
         const enable_bti = target_view.hasAarch64BtiProperty();
         const bti_prefix_size: usize = if (enable_bti) @sizeOf(u32) else 0;
 
@@ -483,7 +540,7 @@ pub const Rewriter = struct {
         const writable_image_size: usize = if (shared_payload == null) payload_layout.writable_image_size else 0;
         const trampoline_offset = std.mem.alignForward(usize, payload_image_size, 8);
         const trampoline_size = if (needs_raw_trampoline)
-            if (stolen_instruction_count == 1 and replay_plan.requiresRawTrampoline())
+            if (stolen_instruction_count == 1 and preliminary_replay_plan.requiresRawTrampoline())
                 aarch64.original_trampoline_size + bti_prefix_size
             else
                 stolen_window_size + aarch64.long_detour_size + bti_prefix_size
@@ -497,8 +554,8 @@ pub const Rewriter = struct {
             .callback_address = 0,
             .trampoline_address = 0,
             .stub_address = 0,
-            .replay_plan = replay_plan,
-            .window_plan = window_plan,
+            .replay_plan = preliminary_replay_plan,
+            .window_plan = preliminary_window_plan,
             .enable_bti = enable_bti,
             .log_message = spec.log_message,
         });
@@ -522,22 +579,55 @@ pub const Rewriter = struct {
             0;
         const stub_address = split_plan.executable.payload_base_address + stub_offset;
 
-        const fixed_stub = try aarch64.buildInstrumentStub(.{
+        var output = try input_view.materializeSplitInjectedImage(self.allocator, split_plan);
+        errdefer self.allocator.free(output);
+        output = try finalizeMachOSplitOutput(self.allocator, output, split_plan);
+
+        const finalized_view = try MachOView.parse(output);
+        const finalized_target_view: image_backend.View = .{ .macho = finalized_view };
+        const finalized_target = ResolvedTarget{
+            .address = target.address,
+            .file_offset = try finalized_target_view.addressToOffset(target.address),
+        };
+        const finalized_window_plan = try analyzeInstrumentWindowPlan(
+            output,
+            finalized_target,
+            stolen_instruction_count,
+        );
+        const finalized_replay_plan = finalized_window_plan.singleReplayPlan() orelse aarch64.ReplayPlan{ .trampoline = {} };
+        const finalized_needs_raw_trampoline = windowNeedsRawTrampoline(finalized_window_plan);
+
+        if (finalized_needs_raw_trampoline != needs_raw_trampoline) {
+            recordRewriteDiagnostic(
+                "Mach-O relocated patch window at 0x{x} changed replay shape after segment-shift fixups; planned raw-trampoline={s}, finalized raw-trampoline={s}",
+                .{
+                    target.address,
+                    if (needs_raw_trampoline) "true" else "false",
+                    if (finalized_needs_raw_trampoline) "true" else "false",
+                },
+            );
+            return error.UnsupportedRelocatedPatchWindow;
+        }
+
+        const finalized_stub = try aarch64.buildInstrumentStub(.{
             .allocator = self.allocator,
             .site_address = target.address,
             .callback_address = callback_address,
             .trampoline_address = trampoline_address,
             .stub_address = stub_address,
-            .replay_plan = replay_plan,
-            .window_plan = window_plan,
+            .replay_plan = finalized_replay_plan,
+            .window_plan = finalized_window_plan,
             .enable_bti = enable_bti,
             .log_message = spec.log_message,
         });
-        defer self.allocator.free(fixed_stub);
-        std.debug.assert(fixed_stub.len == stub_size);
-
-        var output = try input_view.materializeSplitInjectedImage(self.allocator, split_plan);
-        errdefer self.allocator.free(output);
+        defer self.allocator.free(finalized_stub);
+        if (finalized_stub.len > stub_size) {
+            recordRewriteDiagnostic(
+                "Mach-O relocated patch window at 0x{x} needs a larger bridge after segment-shift fixups ({d} bytes > reserved {d})",
+                .{ target.address, finalized_stub.len, stub_size },
+            );
+            return error.UnsupportedRelocatedPatchWindow;
+        }
 
         if (shared_payload == null) {
             var loaded_payload = try payload.linkObjectBytesForFormatWithImageBases(
@@ -549,7 +639,7 @@ pub const Rewriter = struct {
                     .primary = split_plan.executable.payload_base_address,
                     .writable = if (split_plan.writable) |region| region.payload_base_address else null,
                 },
-                target_view,
+                finalized_target_view,
             );
             defer loaded_payload.deinit(self.allocator);
             std.debug.assert(loaded_payload.entry_offset == payload_layout.entry_offset);
@@ -574,14 +664,14 @@ pub const Rewriter = struct {
             }
         }
 
-        if (needs_raw_trampoline) {
-            const stolen_bytes = base_bytes[target.file_offset .. target.file_offset + stolen_window_size];
-            if (stolen_instruction_count == 1 and replay_plan.requiresRawTrampoline()) {
-                var original_instruction: [4]u8 = undefined;
-                @memcpy(&original_instruction, stolen_bytes);
+        if (finalized_needs_raw_trampoline) {
+            const stolen_bytes = output[finalized_target.file_offset .. finalized_target.file_offset + stolen_window_size];
+            if (stolen_instruction_count == 1 and finalized_replay_plan.requiresRawTrampoline()) {
+                var relocated_instruction: [4]u8 = undefined;
+                @memcpy(&relocated_instruction, stolen_bytes);
                 const trampoline = try aarch64.buildOriginalTrampolineBytes(
                     self.allocator,
-                    original_instruction,
+                    relocated_instruction,
                     trampoline_address,
                     target.address + 4,
                     enable_bti,
@@ -608,16 +698,23 @@ pub const Rewriter = struct {
         }
 
         @memcpy(
-            output[split_plan.executable.injection_offset + stub_offset .. split_plan.executable.injection_offset + stub_offset + fixed_stub.len],
-            fixed_stub,
+            output[split_plan.executable.injection_offset + stub_offset .. split_plan.executable.injection_offset + stub_offset + finalized_stub.len],
+            finalized_stub,
         );
 
-        output = try finalizeMachOSplitOutput(self.allocator, output, split_plan);
+        const incoming_branches = try collectIncomingBranchRetargets(
+            self.allocator,
+            finalized_target_view,
+            finalized_target.address,
+            stolen_instruction_count,
+            finalized_window_plan,
+        );
+        defer self.allocator.free(incoming_branches);
 
         try writeInstrumentDetourPatch(
             output,
-            target.file_offset,
-            target.address,
+            finalized_target.file_offset,
+            finalized_target.address,
             stub_address,
             stolen_instruction_count,
         );
@@ -625,7 +722,7 @@ pub const Rewriter = struct {
             try retargetIncomingBranches(
                 output,
                 incoming_branches,
-                window_plan,
+                finalized_window_plan,
                 trampoline_address,
                 enable_bti,
             );
@@ -641,10 +738,10 @@ pub const Rewriter = struct {
         self.installOutput(output);
 
         return .{
-            .target_address = target.address,
-            .target_file_offset = target.file_offset,
+            .target_address = finalized_target.address,
+            .target_file_offset = finalized_target.file_offset,
             .payload_entry_address = callback_address,
-            .trampoline_address = if (needs_raw_trampoline) trampoline_address else null,
+            .trampoline_address = if (finalized_needs_raw_trampoline) trampoline_address else null,
             .stub_address = stub_address,
             .injection_offset = split_plan.executable.injection_offset,
             .injected_size = executable_injected_size + writable_image_size,
@@ -699,21 +796,35 @@ pub const Rewriter = struct {
         clearLastRewriteDiagnostic();
         const base_bytes = self.workingBytes();
         const input_view = try image_backend.View.parseAs(base_bytes, binary_format);
+        const original_input_view = try image_backend.View.parseAs(self.input_bytes, binary_format);
         return switch (input_view) {
-            .elf => |view| self.addReplaceHookObjectElf(view, spec),
-            .macho => |view| self.addReplaceHookObjectMachO(view, spec),
+            .elf => |view| self.addReplaceHookObjectElf(view, original_input_view.elf, spec),
+            .macho => |view| self.addReplaceHookObjectMachO(view, original_input_view.macho, spec),
         };
     }
 
     fn addReplaceHookObjectElf(
         self: *Rewriter,
         input_view: ElfView,
+        original_input_view: ElfView,
         spec: ReplaceObjectSpec,
     ) !ReplaceRewriteReport {
         const target_view: image_backend.View = .{ .elf = input_view };
+        const original_target_view: image_backend.View = .{ .elf = original_input_view };
         const base_bytes = self.workingBytes();
-        const target = try resolveTargetLocation(self.allocator, target_view, spec.target);
-        try validateExpectedBytes(self.allocator, base_bytes, target, spec.expected_bytes);
+        const resolved_target = try resolvePatchTargetLocation(
+            self.allocator,
+            original_target_view,
+            target_view,
+            spec.target,
+        );
+        const target = resolved_target.current();
+        try validateExpectedBytes(
+            self.allocator,
+            self.input_bytes,
+            resolved_target.original(),
+            spec.expected_bytes,
+        );
 
         // Replace hooks reuse the same two-phase payload mini-linker pipeline as
         // instrument hooks; they simply do not need the extra trampoline/stub
@@ -766,12 +877,24 @@ pub const Rewriter = struct {
     fn addReplaceHookObjectMachO(
         self: *Rewriter,
         input_view: MachOView,
+        original_input_view: MachOView,
         spec: ReplaceObjectSpec,
     ) !ReplaceRewriteReport {
         const target_view: image_backend.View = .{ .macho = input_view };
-        const base_bytes = self.workingBytes();
-        const target = try resolveTargetLocation(self.allocator, target_view, spec.target);
-        try validateExpectedBytes(self.allocator, base_bytes, target, spec.expected_bytes);
+        const original_target_view: image_backend.View = .{ .macho = original_input_view };
+        const resolved_target = try resolvePatchTargetLocation(
+            self.allocator,
+            original_target_view,
+            target_view,
+            spec.target,
+        );
+        const target = resolved_target.current();
+        try validateExpectedBytes(
+            self.allocator,
+            self.input_bytes,
+            resolved_target.original(),
+            spec.expected_bytes,
+        );
 
         // Replace hooks are the smallest end-to-end Mach-O payload exercise:
         // no trampoline is needed, but we still prove that the new Mach-O
@@ -973,6 +1096,20 @@ fn resolveTargetLocation(
             .file_offset = @intCast(target.file_offset),
         },
         .pattern => try resolvePatternTargetLocation(allocator, view, target),
+    };
+}
+
+fn resolvePatchTargetLocation(
+    allocator: std.mem.Allocator,
+    original_view: image_backend.View,
+    current_view: image_backend.View,
+    target: bundle.HookLocator,
+) !ResolvedPatchTarget {
+    const original = try resolveTargetLocation(allocator, original_view, target);
+    return .{
+        .address = original.address,
+        .original_file_offset = original.file_offset,
+        .current_file_offset = try current_view.addressToOffset(original.address),
     };
 }
 
