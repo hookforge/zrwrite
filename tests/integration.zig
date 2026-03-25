@@ -850,6 +850,248 @@ test "Mach-O replace output can be ad-hoc codesigned and executed on macOS arm64
     try runCommandExpectExitCode(allocator, &.{output_path}, 63);
 }
 
+test "Mach-O instrument payload resolves external target data through synthetic GOT slots on macOS arm64" {
+    if (builtin.os.tag != .macos or builtin.cpu.arch != .aarch64) {
+        return error.SkipZigTest;
+    }
+
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const tmp_dir_path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(tmp_dir_path);
+
+    const input_path = try std.fs.path.join(allocator, &.{ tmp_dir_path, "macho_external_data_target" });
+    defer allocator.free(input_path);
+    const payload_path = try std.fs.path.join(allocator, &.{ tmp_dir_path, "macho_external_data_runtime.o" });
+    defer allocator.free(payload_path);
+    const output_path = try std.fs.path.join(allocator, &.{ tmp_dir_path, "macho_external_data_target.instrumented" });
+    defer allocator.free(output_path);
+
+    try runCommand(allocator, &.{
+        "zig",
+        "cc",
+        "-target",
+        "aarch64-macos",
+        "-O0",
+        "-g0",
+        "-fno-sanitize=undefined",
+        "-fno-stack-protector",
+        "-fno-asynchronous-unwind-tables",
+        "tests/fixtures/macho_external_data_patchpoint.S",
+        "tests/fixtures/macho_external_data_target.c",
+        "-o",
+        input_path,
+    });
+
+    const emit_bin_arg = try std.fmt.allocPrint(allocator, "-femit-bin={s}", .{payload_path});
+    defer allocator.free(emit_bin_arg);
+
+    try runCommand(allocator, &.{
+        "zig",
+        "build-obj",
+        "-target",
+        "aarch64-macos",
+        "-O",
+        "ReleaseSmall",
+        "-fstrip",
+        "-I",
+        "include",
+        emit_bin_arg,
+        "tests/fixtures/zig_external_data_runtime.zig",
+    });
+
+    const input_bytes = try std.fs.cwd().readFileAlloc(allocator, input_path, std.math.maxInt(usize));
+    defer allocator.free(input_bytes);
+    const target_view = try zrwrite.format.macho.View.parse(@constCast(input_bytes));
+    try std.testing.expect(target_view.isPie());
+
+    const payload_bytes = try std.fs.cwd().readFileAlloc(allocator, payload_path, std.math.maxInt(usize));
+    defer allocator.free(payload_bytes);
+
+    const layout = try zrwrite.payload.analyzeObjectBytesForFormat(
+        allocator,
+        .macho,
+        payload_bytes,
+        "on_hit",
+    );
+    try std.testing.expect(layout.writable_image_size >= @sizeOf(u64));
+
+    var rw = try zrwrite.Rewriter.initPath(allocator, input_path);
+    defer rw.deinit();
+
+    _ = try rw.addInstrumentHookObjectForFormat(.macho, .{
+        .payload_object_bytes = payload_bytes,
+        .target = zrwrite.bundle.HookLocator.fromSymbol("macho_external_data_patchpoint"),
+        .handler_symbol = "on_hit",
+    });
+    try rw.writeToPath(output_path);
+
+    try runCommand(allocator, &.{ "codesign", "-f", "-s", "-", output_path });
+    try runCommandExpectExitCode(allocator, &.{output_path}, 0);
+}
+
+test "Mach-O instrument payload resolves writable internal absolute pointers on macOS arm64" {
+    if (builtin.os.tag != .macos or builtin.cpu.arch != .aarch64) {
+        return error.SkipZigTest;
+    }
+
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const tmp_dir_path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(tmp_dir_path);
+
+    const input_path = try std.fs.path.join(allocator, &.{ tmp_dir_path, "macho_internal_pointer_target" });
+    defer allocator.free(input_path);
+    const payload_path = try std.fs.path.join(allocator, &.{ tmp_dir_path, "macho_internal_pointer_payload.o" });
+    defer allocator.free(payload_path);
+    const output_path = try std.fs.path.join(allocator, &.{ tmp_dir_path, "macho_internal_pointer_target.instrumented" });
+    defer allocator.free(output_path);
+
+    try runCommand(allocator, &.{
+        "zig",
+        "cc",
+        "-target",
+        "aarch64-macos",
+        "-O0",
+        "-g0",
+        "-fno-sanitize=undefined",
+        "-fno-stack-protector",
+        "-fno-asynchronous-unwind-tables",
+        "tests/fixtures/macho_external_data_patchpoint.S",
+        "tests/fixtures/macho_external_data_target.c",
+        "-o",
+        input_path,
+    });
+
+    try runCommand(allocator, &.{
+        "zig",
+        "cc",
+        "-target",
+        "aarch64-macos",
+        "-c",
+        "-O0",
+        "-g0",
+        "-fno-sanitize=undefined",
+        "-fno-stack-protector",
+        "-fno-asynchronous-unwind-tables",
+        "-I",
+        "include",
+        "tests/fixtures/macho_internal_pointer_payload.c",
+        "-o",
+        payload_path,
+    });
+
+    const input_bytes = try std.fs.cwd().readFileAlloc(allocator, input_path, std.math.maxInt(usize));
+    defer allocator.free(input_bytes);
+    const target_view = try zrwrite.format.macho.View.parse(@constCast(input_bytes));
+    try std.testing.expect(target_view.isPie());
+
+    const payload_bytes = try std.fs.cwd().readFileAlloc(allocator, payload_path, std.math.maxInt(usize));
+    defer allocator.free(payload_bytes);
+
+    const layout = try zrwrite.payload.analyzeObjectBytesForFormat(
+        allocator,
+        .macho,
+        payload_bytes,
+        "on_hit",
+    );
+    try std.testing.expect(layout.writable_image_size >= @sizeOf(u64) * 3);
+
+    var rw = try zrwrite.Rewriter.initPath(allocator, input_path);
+    defer rw.deinit();
+
+    _ = try rw.addInstrumentHookObjectForFormat(.macho, .{
+        .payload_object_bytes = payload_bytes,
+        .target = zrwrite.bundle.HookLocator.fromSymbol("macho_external_data_patchpoint"),
+        .handler_symbol = "on_hit",
+    });
+    try rw.writeToPath(output_path);
+
+    try runCommand(allocator, &.{ "codesign", "-f", "-s", "-", output_path });
+    try runCommandExpectExitCode(allocator, &.{output_path}, 0);
+}
+
+test "Mach-O payload linker keeps explicit PIE diagnostics for read-only absolute pointers" {
+    if (builtin.os.tag != .macos or builtin.cpu.arch != .aarch64) {
+        return error.SkipZigTest;
+    }
+
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const tmp_dir_path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(tmp_dir_path);
+
+    const input_path = try std.fs.path.join(allocator, &.{ tmp_dir_path, "macho_readonly_pointer_target" });
+    defer allocator.free(input_path);
+    const payload_path = try std.fs.path.join(allocator, &.{ tmp_dir_path, "macho_readonly_pointer_payload.o" });
+    defer allocator.free(payload_path);
+
+    try runCommand(allocator, &.{
+        "zig",
+        "cc",
+        "-target",
+        "aarch64-macos",
+        "-O0",
+        "-g0",
+        "-fno-sanitize=undefined",
+        "-fno-stack-protector",
+        "-fno-asynchronous-unwind-tables",
+        "tests/fixtures/macho_external_data_patchpoint.S",
+        "tests/fixtures/macho_external_data_target.c",
+        "-o",
+        input_path,
+    });
+
+    try runCommand(allocator, &.{
+        "clang",
+        "-target",
+        "arm64-apple-macos11",
+        "-c",
+        "tests/fixtures/macho_readonly_pointer_payload.S",
+        "-o",
+        payload_path,
+    });
+
+    const input_bytes = try std.fs.cwd().readFileAlloc(allocator, input_path, std.math.maxInt(usize));
+    defer allocator.free(input_bytes);
+    const target_view = try zrwrite.format.macho.View.parse(@constCast(input_bytes));
+    try std.testing.expect(target_view.isPie());
+
+    const payload_bytes = try std.fs.cwd().readFileAlloc(allocator, payload_path, std.math.maxInt(usize));
+    defer allocator.free(payload_bytes);
+
+    zrwrite.clearLastLinkDiagnostic();
+    try std.testing.expectError(
+        error.UnsupportedPayloadRelocation,
+        zrwrite.payload.linkObjectBytesForFormatWithImageBases(
+            allocator,
+            .macho,
+            payload_bytes,
+            "on_hit",
+            .{
+                .primary = 0x1_0000_0000,
+                .writable = 0x1_0001_0000,
+            },
+            .{ .macho = target_view },
+        ),
+    );
+
+    const diagnostic = zrwrite.lastLinkDiagnosticMessage() orelse return error.MissingDiagnostic;
+    try std.testing.expect(std.mem.indexOf(u8, diagnostic, "ARM64_RELOC_UNSIGNED") != null);
+    try std.testing.expect(std.mem.indexOf(u8, diagnostic, "local_value") != null);
+    try std.testing.expect(std.mem.indexOf(u8, diagnostic, "primary read-only payload image") != null);
+    try std.testing.expect(std.mem.indexOf(u8, diagnostic, "unable to apply Mach-O arm64 payload relocation") == null);
+}
+
 test "bundle -> apply supports replace hook via virtual address locator" {
     const allocator = std.testing.allocator;
 
