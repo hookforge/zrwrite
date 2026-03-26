@@ -21,9 +21,23 @@ pub fn main() !void {
         if (rewriter.lastRewriteDiagnosticMessage()) |message| {
             std.log.err("{s}", .{message});
         }
-        return err;
+        std.log.err("{s}", .{@errorName(err)});
+        if (isCliUsageError(err)) {
+            printUsageForArgs(args);
+            std.process.exit(2);
+        }
+        std.process.exit(1);
     };
 }
+
+const Command = enum {
+    help,
+    bundle,
+    apply,
+    rewrite,
+    inspect,
+    unknown,
+};
 
 fn dispatchCommand(allocator: std.mem.Allocator, args: []const []const u8) !void {
     if (args.len < 2) {
@@ -31,21 +45,36 @@ fn dispatchCommand(allocator: std.mem.Allocator, args: []const []const u8) !void
         return;
     }
 
-    if (std.mem.eql(u8, args[1], "bundle")) {
-        try commandBundle(allocator, args[2..]);
-    } else if (std.mem.eql(u8, args[1], "apply")) {
-        try commandApply(allocator, args[2..]);
-    } else if (std.mem.eql(u8, args[1], "rewrite")) {
-        try commandRewriteShortcut(allocator, args[2..]);
-    } else if (std.mem.eql(u8, args[1], "inspect")) {
-        try commandInspect(allocator, args[2..]);
-    } else {
+    if (isHelpToken(args[1])) {
         printUsage();
-        return error.InvalidArgument;
+        return;
+    }
+
+    switch (parseCommand(args[1])) {
+        .help => {
+            if (args.len >= 3) {
+                printCommandUsage(parseCommand(args[2]));
+            } else {
+                printUsage();
+            }
+            return;
+        },
+        .bundle => try commandBundle(allocator, args[2..]),
+        .apply => try commandApply(allocator, args[2..]),
+        .rewrite => try commandRewriteShortcut(allocator, args[2..]),
+        .inspect => try commandInspect(allocator, args[2..]),
+        .unknown => {
+            return error.InvalidArgument;
+        },
     }
 }
 
 fn commandBundle(allocator: std.mem.Allocator, args: []const []const u8) !void {
+    if (isSingleHelpArgument(args)) {
+        printBundleUsage();
+        return;
+    }
+
     var output_path: ?[]const u8 = null;
     var meta_path: ?[]const u8 = null;
     var payload_path: ?[]const u8 = null;
@@ -61,58 +90,41 @@ fn commandBundle(allocator: std.mem.Allocator, args: []const []const u8) !void {
     while (index < args.len) : (index += 1) {
         const flag = args[index];
         if (std.mem.eql(u8, flag, "--output")) {
-            index += 1;
-            output_path = args[index];
+            output_path = try requireFlagValue(args, &index);
         } else if (std.mem.eql(u8, flag, "--meta")) {
-            index += 1;
-            meta_path = args[index];
+            meta_path = try requireFlagValue(args, &index);
         } else if (std.mem.eql(u8, flag, "--payload")) {
-            index += 1;
-            payload_path = args[index];
+            payload_path = try requireFlagValue(args, &index);
         } else if (std.mem.eql(u8, flag, "--handler-symbol")) {
-            index += 1;
-            pending_hook.handler_symbol = args[index];
+            pending_hook.handler_symbol = try requireFlagValue(args, &index);
         } else if (std.mem.eql(u8, flag, "--log-message")) {
-            index += 1;
-            pending_hook.log_message = args[index];
+            pending_hook.log_message = try requireFlagValue(args, &index);
         } else if (std.mem.eql(u8, flag, "--expected-bytes")) {
-            index += 1;
-            pending_hook.expected_bytes = args[index];
+            pending_hook.expected_bytes = try requireFlagValue(args, &index);
         } else if (std.mem.eql(u8, flag, "--stolen-instructions")) {
-            index += 1;
-            pending_hook.stolen_instruction_count = try parseStolenInstructionCount(args[index]);
+            pending_hook.stolen_instruction_count = try parseStolenInstructionCount(try requireFlagValue(args, &index));
         } else if (std.mem.eql(u8, flag, "--hook-kind")) {
-            index += 1;
-            pending_hook.kind = try parseHookKind(args[index]);
+            pending_hook.kind = try parseHookKind(try requireFlagValue(args, &index));
         } else if (std.mem.eql(u8, flag, "--target-symbol")) {
-            index += 1;
-            try pending_hook.locator.setSymbol(args[index]);
+            try pending_hook.locator.setSymbol(try requireFlagValue(args, &index));
         } else if (std.mem.eql(u8, flag, "--target-vaddr")) {
-            index += 1;
-            try pending_hook.locator.setVirtualAddress(try parseInteger(args[index]));
+            try pending_hook.locator.setVirtualAddress(try parseInteger(try requireFlagValue(args, &index)));
         } else if (std.mem.eql(u8, flag, "--target-file-offset")) {
-            index += 1;
-            try pending_hook.locator.setFileOffset(try parseInteger(args[index]));
+            try pending_hook.locator.setFileOffset(try parseInteger(try requireFlagValue(args, &index)));
         } else if (std.mem.eql(u8, flag, "--target-pattern")) {
-            index += 1;
-            try pending_hook.locator.setPattern(args[index]);
+            try pending_hook.locator.setPattern(try requireFlagValue(args, &index));
         } else if (std.mem.eql(u8, flag, "--target-pattern-offset")) {
-            index += 1;
-            try pending_hook.locator.setPatternOffset(try parseInteger(args[index]));
+            try pending_hook.locator.setPatternOffset(try parseInteger(try requireFlagValue(args, &index)));
         } else if (std.mem.eql(u8, flag, "--next-hook")) {
             try pending_hook.appendTo(allocator, &hooks);
         } else if (std.mem.eql(u8, flag, "--target-os")) {
-            index += 1;
-            target_os = try parseOs(args[index]);
+            target_os = try parseOs(try requireFlagValue(args, &index));
         } else if (std.mem.eql(u8, flag, "--target-format")) {
-            index += 1;
-            target_format = try parseBinaryFormat(args[index]);
+            target_format = try parseBinaryFormat(try requireFlagValue(args, &index));
         } else if (std.mem.eql(u8, flag, "--target-arch")) {
-            index += 1;
-            target_arch = try parseArchitecture(args[index]);
+            target_arch = try parseArchitecture(try requireFlagValue(args, &index));
         } else if (std.mem.eql(u8, flag, "--payload-format")) {
-            index += 1;
-            payload_format = try parseObjectFormat(args[index]);
+            payload_format = try parseObjectFormat(try requireFlagValue(args, &index));
         } else {
             return error.InvalidArgument;
         }
@@ -158,6 +170,11 @@ fn commandBundle(allocator: std.mem.Allocator, args: []const []const u8) !void {
 }
 
 fn commandApply(allocator: std.mem.Allocator, args: []const []const u8) !void {
+    if (isSingleHelpArgument(args)) {
+        printApplyUsage();
+        return;
+    }
+
     var bundle_path: ?[]const u8 = null;
     var input_path: ?[]const u8 = null;
     var output_path: ?[]const u8 = null;
@@ -166,14 +183,11 @@ fn commandApply(allocator: std.mem.Allocator, args: []const []const u8) !void {
     while (index < args.len) : (index += 1) {
         const flag = args[index];
         if (std.mem.eql(u8, flag, "--bundle")) {
-            index += 1;
-            bundle_path = args[index];
+            bundle_path = try requireFlagValue(args, &index);
         } else if (std.mem.eql(u8, flag, "--input")) {
-            index += 1;
-            input_path = args[index];
+            input_path = try requireFlagValue(args, &index);
         } else if (std.mem.eql(u8, flag, "--output")) {
-            index += 1;
-            output_path = args[index];
+            output_path = try requireFlagValue(args, &index);
         } else {
             return error.InvalidArgument;
         }
@@ -188,6 +202,11 @@ fn commandApply(allocator: std.mem.Allocator, args: []const []const u8) !void {
 }
 
 fn commandRewriteShortcut(allocator: std.mem.Allocator, args: []const []const u8) !void {
+    if (isSingleHelpArgument(args)) {
+        printRewriteUsage();
+        return;
+    }
+
     var input_path: ?[]const u8 = null;
     var output_path: ?[]const u8 = null;
     var meta_path: ?[]const u8 = null;
@@ -200,47 +219,33 @@ fn commandRewriteShortcut(allocator: std.mem.Allocator, args: []const []const u8
     while (index < args.len) : (index += 1) {
         const flag = args[index];
         if (std.mem.eql(u8, flag, "--input")) {
-            index += 1;
-            input_path = args[index];
+            input_path = try requireFlagValue(args, &index);
         } else if (std.mem.eql(u8, flag, "--output")) {
-            index += 1;
-            output_path = args[index];
+            output_path = try requireFlagValue(args, &index);
         } else if (std.mem.eql(u8, flag, "--meta")) {
-            index += 1;
-            meta_path = args[index];
+            meta_path = try requireFlagValue(args, &index);
         } else if (std.mem.eql(u8, flag, "--payload")) {
-            index += 1;
-            payload_path = args[index];
+            payload_path = try requireFlagValue(args, &index);
         } else if (std.mem.eql(u8, flag, "--handler-symbol")) {
-            index += 1;
-            pending_hook.handler_symbol = args[index];
+            pending_hook.handler_symbol = try requireFlagValue(args, &index);
         } else if (std.mem.eql(u8, flag, "--log-message")) {
-            index += 1;
-            pending_hook.log_message = args[index];
+            pending_hook.log_message = try requireFlagValue(args, &index);
         } else if (std.mem.eql(u8, flag, "--expected-bytes")) {
-            index += 1;
-            pending_hook.expected_bytes = args[index];
+            pending_hook.expected_bytes = try requireFlagValue(args, &index);
         } else if (std.mem.eql(u8, flag, "--stolen-instructions")) {
-            index += 1;
-            pending_hook.stolen_instruction_count = try parseStolenInstructionCount(args[index]);
+            pending_hook.stolen_instruction_count = try parseStolenInstructionCount(try requireFlagValue(args, &index));
         } else if (std.mem.eql(u8, flag, "--hook-kind")) {
-            index += 1;
-            pending_hook.kind = try parseHookKind(args[index]);
+            pending_hook.kind = try parseHookKind(try requireFlagValue(args, &index));
         } else if (std.mem.eql(u8, flag, "--target-symbol")) {
-            index += 1;
-            try pending_hook.locator.setSymbol(args[index]);
+            try pending_hook.locator.setSymbol(try requireFlagValue(args, &index));
         } else if (std.mem.eql(u8, flag, "--target-vaddr")) {
-            index += 1;
-            try pending_hook.locator.setVirtualAddress(try parseInteger(args[index]));
+            try pending_hook.locator.setVirtualAddress(try parseInteger(try requireFlagValue(args, &index)));
         } else if (std.mem.eql(u8, flag, "--target-file-offset")) {
-            index += 1;
-            try pending_hook.locator.setFileOffset(try parseInteger(args[index]));
+            try pending_hook.locator.setFileOffset(try parseInteger(try requireFlagValue(args, &index)));
         } else if (std.mem.eql(u8, flag, "--target-pattern")) {
-            index += 1;
-            try pending_hook.locator.setPattern(args[index]);
+            try pending_hook.locator.setPattern(try requireFlagValue(args, &index));
         } else if (std.mem.eql(u8, flag, "--target-pattern-offset")) {
-            index += 1;
-            try pending_hook.locator.setPatternOffset(try parseInteger(args[index]));
+            try pending_hook.locator.setPatternOffset(try parseInteger(try requireFlagValue(args, &index)));
         } else if (std.mem.eql(u8, flag, "--next-hook")) {
             try pending_hook.appendTo(allocator, &hooks);
         } else {
@@ -295,6 +300,11 @@ fn commandRewriteShortcut(allocator: std.mem.Allocator, args: []const []const u8
 }
 
 fn commandInspect(allocator: std.mem.Allocator, args: []const []const u8) !void {
+    if (isSingleHelpArgument(args)) {
+        printInspectUsage();
+        return;
+    }
+
     var input_path: ?[]const u8 = null;
     var locator: ParsedLocator = .{};
     var pattern_bytes: usize = 16;
@@ -303,26 +313,19 @@ fn commandInspect(allocator: std.mem.Allocator, args: []const []const u8) !void 
     while (index < args.len) : (index += 1) {
         const flag = args[index];
         if (std.mem.eql(u8, flag, "--input")) {
-            index += 1;
-            input_path = args[index];
+            input_path = try requireFlagValue(args, &index);
         } else if (std.mem.eql(u8, flag, "--symbol")) {
-            index += 1;
-            try locator.setSymbol(args[index]);
+            try locator.setSymbol(try requireFlagValue(args, &index));
         } else if (std.mem.eql(u8, flag, "--vaddr")) {
-            index += 1;
-            try locator.setVirtualAddress(try parseInteger(args[index]));
+            try locator.setVirtualAddress(try parseInteger(try requireFlagValue(args, &index)));
         } else if (std.mem.eql(u8, flag, "--file-offset")) {
-            index += 1;
-            try locator.setFileOffset(try parseInteger(args[index]));
+            try locator.setFileOffset(try parseInteger(try requireFlagValue(args, &index)));
         } else if (std.mem.eql(u8, flag, "--pattern")) {
-            index += 1;
-            try locator.setPattern(args[index]);
+            try locator.setPattern(try requireFlagValue(args, &index));
         } else if (std.mem.eql(u8, flag, "--pattern-offset")) {
-            index += 1;
-            try locator.setPatternOffset(try parseInteger(args[index]));
+            try locator.setPatternOffset(try parseInteger(try requireFlagValue(args, &index)));
         } else if (std.mem.eql(u8, flag, "--pattern-bytes")) {
-            index += 1;
-            pattern_bytes = @intCast(try parseInteger(args[index]));
+            pattern_bytes = @intCast(try parseInteger(try requireFlagValue(args, &index)));
         } else {
             return error.InvalidArgument;
         }
@@ -474,6 +477,51 @@ fn parseStolenInstructionCount(value: []const u8) !u8 {
     return @intCast(parsed);
 }
 
+fn parseCommand(token: []const u8) Command {
+    if (std.mem.eql(u8, token, "help")) return .help;
+    if (std.mem.eql(u8, token, "bundle")) return .bundle;
+    if (std.mem.eql(u8, token, "apply")) return .apply;
+    if (std.mem.eql(u8, token, "rewrite")) return .rewrite;
+    if (std.mem.eql(u8, token, "inspect")) return .inspect;
+    return .unknown;
+}
+
+fn isSingleHelpArgument(args: []const []const u8) bool {
+    return args.len == 1 and
+        (isHelpToken(args[0]) or std.mem.eql(u8, args[0], "help"));
+}
+
+fn requireFlagValue(args: []const []const u8, index: *usize) ![]const u8 {
+    index.* += 1;
+    if (index.* >= args.len) return error.MissingFlagValue;
+    return args[index.*];
+}
+
+fn isCliUsageError(err: anyerror) bool {
+    return switch (err) {
+        error.InvalidArgument,
+        error.MissingFlagValue,
+        error.MissingBundlePath,
+        error.MissingInputPath,
+        error.MissingOutputPath,
+        error.MissingPayloadPath,
+        error.MissingHookSpecification,
+        error.MissingHandlerSymbol,
+        error.MissingTargetLocator,
+        error.MultipleTargetLocators,
+        error.MixedMetaAndInlineBundleFlags,
+        error.InvalidArchitecture,
+        error.InvalidHookKind,
+        error.InvalidOperatingSystem,
+        error.InvalidBinaryFormat,
+        error.InvalidObjectFormat,
+        error.InvalidPatternOffset,
+        error.InvalidStolenInstructionCount,
+        => true,
+        else => false,
+    };
+}
+
 const ParsedLocator = struct {
     seen: bool = false,
     locator: bundle.HookLocator = .{},
@@ -587,7 +635,41 @@ fn rewriteInlineSpecPresent(
     return payload_path != null or hooks_len != 0 or pending_hook.hasAnyField();
 }
 
-fn printUsage() void {
+fn isHelpToken(token: []const u8) bool {
+    return std.mem.eql(u8, token, "-h") or
+        std.mem.eql(u8, token, "--help");
+}
+
+fn printUsageForArgs(args: []const []const u8) void {
+    if (args.len < 2 or isHelpToken(args[1])) {
+        printUsage();
+        return;
+    }
+
+    const command = parseCommand(args[1]);
+    if (command == .help) {
+        if (args.len >= 3) {
+            printCommandUsage(parseCommand(args[2]));
+        } else {
+            printUsage();
+        }
+        return;
+    }
+
+    printCommandUsage(command);
+}
+
+fn printCommandUsage(command: Command) void {
+    switch (command) {
+        .bundle => printBundleUsage(),
+        .apply => printApplyUsage(),
+        .rewrite => printRewriteUsage(),
+        .inspect => printInspectUsage(),
+        .help, .unknown => printUsage(),
+    }
+}
+
+fn printBundleUsage() void {
     std.debug.print(
         \\usage:
         \\  zrwrite bundle --output <patch.zrpb> --payload <handler.o> --handler-symbol <symbol>
@@ -606,7 +688,21 @@ fn printUsage() void {
         \\                 [--log-message <message>] [--target-arch aarch64|x86_64]
         \\                 [--target-os linux|macos] [--target-format elf|macho]
         \\                 [--payload-format elf|macho]
+        \\
+    , .{});
+}
+
+fn printApplyUsage() void {
+    std.debug.print(
+        \\usage:
         \\  zrwrite apply --bundle <patch.zrpb> --input <binary> --output <binary>
+        \\
+    , .{});
+}
+
+fn printRewriteUsage() void {
+    std.debug.print(
+        \\usage:
         \\  zrwrite rewrite --input <binary> --output <binary> --payload <handler.o>
         \\                  [--meta <bundle.meta.json>]
         \\                  --handler-symbol <symbol>
@@ -622,10 +718,31 @@ fn printUsage() void {
         \\                               --target-pattern <hex> [--target-pattern-offset <off>])
         \\                              [--log-message <message>]]
         \\                  [--log-message <message>]
+        \\
+    , .{});
+}
+
+fn printInspectUsage() void {
+    std.debug.print(
+        \\usage:
         \\  zrwrite inspect --input <binary>
         \\                  (--symbol <symbol> | --vaddr <addr> | --file-offset <off> |
         \\                   --pattern <hex> [--pattern-offset <off>])
         \\                  [--pattern-bytes <count>]
         \\
     , .{});
+}
+
+fn printUsage() void {
+    std.debug.print(
+        \\usage:
+        \\  zrwrite help [bundle|apply|rewrite|inspect]
+        \\  zrwrite --help
+        \\
+        \\
+    , .{});
+    printBundleUsage();
+    printApplyUsage();
+    printRewriteUsage();
+    printInspectUsage();
 }
