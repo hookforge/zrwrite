@@ -128,7 +128,14 @@ pub const mem = struct {
 
     pub fn copy(dest: []u8, src: []const u8) ![]u8 {
         if (dest.len < src.len) return error.NoSpaceLeft;
-        @memcpy(dest[0..src.len], src);
+
+        // Keep the payload-side helper self-contained. Using `@memcpy` here can
+        // cause Zig to lower larger copies to an external helper call such as
+        // `_memcpy`, which defeats the "no hidden runtime dependency" goal of
+        // `zrstd`.
+        for (src, 0..) |byte, index| {
+            dest[index] = byte;
+        }
         return dest[0..src.len];
     }
 
