@@ -168,6 +168,18 @@ const SharedInstrumentPayload = struct {
     }
 };
 
+/// Session-local record of how much tail space a Mach-O carrier segment has
+/// already consumed during this rewrite.
+///
+/// Section tables only describe the original binary layout. Once we have
+/// appended payload bytes into a segment tail, later planning passes need an
+/// explicit "used through here" watermark or they will try to reuse the same
+/// slack and overlap earlier injections.
+const MachOCarrierOccupancy = struct {
+    segment_index: usize,
+    used_end_fileoff: usize,
+};
+
 pub const Rewriter = struct {
     allocator: std.mem.Allocator,
     input_bytes: []u8,
@@ -181,6 +193,7 @@ pub const Rewriter = struct {
     /// - shared only within one `Rewriter`
     /// - replace hooks still inject their own standalone payload image
     shared_instrument_payloads: std.ArrayListUnmanaged(SharedInstrumentPayload) = .empty,
+    macho_carrier_occupancy: std.ArrayListUnmanaged(MachOCarrierOccupancy) = .empty,
 
     pub fn initPath(allocator: std.mem.Allocator, input_path: []const u8) !Rewriter {
         const input_bytes = try std.fs.cwd().readFileAlloc(allocator, input_path, std.math.maxInt(usize));
@@ -198,6 +211,7 @@ pub const Rewriter = struct {
     pub fn deinit(self: *Rewriter) void {
         for (self.shared_instrument_payloads.items) |*entry| entry.deinit(self.allocator);
         self.shared_instrument_payloads.deinit(self.allocator);
+        self.macho_carrier_occupancy.deinit(self.allocator);
         if (self.output_bytes) |output| self.allocator.free(output);
         self.allocator.free(self.input_bytes);
         self.* = undefined;
@@ -214,6 +228,90 @@ pub const Rewriter = struct {
     fn installOutput(self: *Rewriter, output: []u8) void {
         if (self.output_bytes) |previous| self.allocator.free(previous);
         self.output_bytes = output;
+    }
+
+    fn effectiveMachOCarrierUsedEnd(
+        self: *const Rewriter,
+        input_view: MachOView,
+        carrier: macho_format.SegmentRef,
+    ) !usize {
+        var used_end = try input_view.segmentUsedEndFileOffset(carrier);
+        for (self.macho_carrier_occupancy.items) |entry| {
+            if (entry.segment_index != carrier.load_command_index) continue;
+            used_end = @max(used_end, entry.used_end_fileoff);
+        }
+        return used_end;
+    }
+
+    fn rememberMachOCarrierUsedEnd(
+        self: *Rewriter,
+        segment_index: usize,
+        used_end_fileoff: usize,
+    ) !void {
+        for (self.macho_carrier_occupancy.items) |*entry| {
+            if (entry.segment_index != segment_index) continue;
+            entry.used_end_fileoff = @max(entry.used_end_fileoff, used_end_fileoff);
+            return;
+        }
+        try self.macho_carrier_occupancy.append(self.allocator, .{
+            .segment_index = segment_index,
+            .used_end_fileoff = used_end_fileoff,
+        });
+    }
+
+    fn rememberMachORegionOccupancy(
+        self: *Rewriter,
+        region: macho_format.RegionInjectionPlan,
+    ) !void {
+        if (region.usesSyntheticSegment()) return;
+        try self.rememberMachOCarrierUsedEnd(region.carrier_segment_index, region.injection_end_offset);
+    }
+
+    fn rememberMachOSplitOccupancy(
+        self: *Rewriter,
+        plan: MachOSplitInjectionPlan,
+    ) !void {
+        try self.rememberMachORegionOccupancy(plan.executable);
+        if (plan.writable) |region| try self.rememberMachORegionOccupancy(region);
+    }
+
+    fn planMachOInjectedImage(
+        self: *const Rewriter,
+        input_view: MachOView,
+        injected_size: usize,
+    ) !MachOInjectionPlan {
+        const carrier = try input_view.carrierSegmentForInjection();
+        const used_end = try self.effectiveMachOCarrierUsedEnd(input_view, carrier);
+        return try input_view.planInjectionWithUsedEnd(injected_size, 16, used_end);
+    }
+
+    fn planMachOSplitInjection(
+        self: *const Rewriter,
+        input_view: MachOView,
+        executable_size: usize,
+        writable_size: usize,
+        alignment: usize,
+    ) !MachOSplitInjectionPlan {
+        const executable_carrier = try input_view.executableCarrierSegmentForInjection();
+        const executable_used_end = try self.effectiveMachOCarrierUsedEnd(input_view, executable_carrier);
+
+        const writable_used_end: ?usize = if (writable_size == 0)
+            null
+        else blk: {
+            const writable_carrier = input_view.writableCarrierSegmentForInjection() catch |err| switch (err) {
+                error.NoInjectableSegment => break :blk null,
+                else => return err,
+            };
+            break :blk try self.effectiveMachOCarrierUsedEnd(input_view, writable_carrier);
+        };
+
+        return try input_view.planSplitInjectionWithUsedEnds(
+            executable_size,
+            writable_size,
+            alignment,
+            executable_used_end,
+            writable_used_end,
+        );
     }
 
     pub fn writeToPath(self: *const Rewriter, output_path: []const u8) !void {
@@ -564,7 +662,8 @@ pub const Rewriter = struct {
         std.debug.assert(stub.len == stub_size);
 
         const executable_injected_size = stub_offset + stub_size;
-        const split_plan = try input_view.planSplitInjection(
+        const split_plan = try self.planMachOSplitInjection(
+            input_view,
             executable_injected_size,
             writable_image_size,
             16,
@@ -735,6 +834,7 @@ pub const Rewriter = struct {
                 split_plan.executable.payload_base_address,
             );
         }
+        try self.rememberMachOSplitOccupancy(split_plan);
         self.installOutput(output);
 
         return .{
@@ -907,7 +1007,8 @@ pub const Rewriter = struct {
             spec.replacement_symbol,
         );
 
-        const split_plan = try input_view.planSplitInjection(
+        const split_plan = try self.planMachOSplitInjection(
+            input_view,
             payload_layout.image_size,
             payload_layout.writable_image_size,
             16,
@@ -962,6 +1063,7 @@ pub const Rewriter = struct {
         };
         writeU32(output[target.file_offset .. target.file_offset + 4], branch_opcode);
 
+        try self.rememberMachOSplitOccupancy(split_plan);
         self.installOutput(output);
 
         return .{

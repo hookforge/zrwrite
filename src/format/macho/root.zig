@@ -89,8 +89,15 @@ pub const InjectionPlan = struct {
     }
 };
 
+pub const RegionPlacement = enum {
+    carrier_extension,
+    synthetic_segment,
+};
+
 pub const RegionInjectionPlan = struct {
+    placement: RegionPlacement = .carrier_extension,
     carrier_segment_index: usize,
+    segment_span_size: usize = 0,
     injection_offset: usize,
     injection_end_offset: usize,
     tail_offset: usize,
@@ -100,6 +107,10 @@ pub const RegionInjectionPlan = struct {
 
     pub fn fitsExistingSlack(self: RegionInjectionPlan) bool {
         return self.tail_shift == 0;
+    }
+
+    pub fn usesSyntheticSegment(self: RegionInjectionPlan) bool {
+        return self.placement == .synthetic_segment;
     }
 };
 
@@ -111,13 +122,42 @@ pub const RegionInjectionPlan = struct {
 /// - `.data/.bss` state lives in the writable region
 /// - the patched output therefore does not rely on a single segment being both
 ///   executable and writable after ad-hoc signing
+///
+/// There are now two planning modes:
+/// - `carrier_extensions`: grow existing segments and, if necessary, repair the
+///   metadata fallout from later segment movement
+/// - `synthetic_segments`: append brand-new payload segments in front of
+///   `__LINKEDIT`, which keeps the original `__DATA` / `__DATA_CONST` layout
+///   completely stable for larger payloads on dyld-info binaries
 pub const SplitInjectionPlan = struct {
+    placement: enum {
+        carrier_extensions,
+        mixed,
+        synthetic_segments,
+    } = .carrier_extensions,
     executable: RegionInjectionPlan,
     writable: ?RegionInjectionPlan = null,
     total_len: usize,
+    synthetic_tail_offset: usize = 0,
+    synthetic_tail_shift: usize = 0,
 
     pub fn hasWritableRegion(self: SplitInjectionPlan) bool {
         return self.writable != null;
+    }
+
+    pub fn usesSyntheticSegments(self: SplitInjectionPlan) bool {
+        if (self.executable.usesSyntheticSegment()) return true;
+        if (self.writable) |region| return region.usesSyntheticSegment();
+        return false;
+    }
+
+    pub fn syntheticSegmentCount(self: SplitInjectionPlan) usize {
+        var count: usize = 0;
+        if (self.executable.usesSyntheticSegment()) count += 1;
+        if (self.writable) |region| {
+            if (region.usesSyntheticSegment()) count += 1;
+        }
+        return count;
     }
 };
 
@@ -369,11 +409,105 @@ pub const View = struct {
         writable_size: usize,
         alignment: usize,
     ) !SplitInjectionPlan {
+        return self.planSplitInjectionWithUsedEnds(
+            executable_size,
+            writable_size,
+            alignment,
+            null,
+            null,
+        );
+    }
+
+    /// Variant of `planSplitInjection` that lets callers provide the effective
+    /// tail occupancy of the chosen carrier segments.
+    ///
+    /// This is important for multi-hook rewrite sessions: once a previous hook
+    /// has already consumed some of the original tail slack, the section table
+    /// alone is no longer enough to recover the next free byte. Higher layers
+    /// can therefore feed the known post-injection end back into the planner
+    /// and keep later hooks from overlapping earlier payloads.
+    pub fn planSplitInjectionWithUsedEnds(
+        self: View,
+        executable_size: usize,
+        writable_size: usize,
+        alignment: usize,
+        executable_used_end_override: ?usize,
+        writable_used_end_override: ?usize,
+    ) !SplitInjectionPlan {
+        const carrier_plan = self.planCarrierSplitInjectionWithUsedEnds(
+            executable_size,
+            writable_size,
+            alignment,
+            executable_used_end_override,
+            writable_used_end_override,
+        ) catch |err| switch (err) {
+            error.NoInjectableSegment, error.UnsupportedMachOSplitCarrierOrder => null,
+            else => return err,
+        };
+
+        if (carrier_plan) |plan| {
+            if (plan.executable.fitsExistingSlack()) return plan;
+        }
+
+        if (try self.planHybridSplitInjection(
+            executable_size,
+            writable_size,
+            alignment,
+            executable_used_end_override,
+            writable_used_end_override,
+        )) |plan| {
+            return plan;
+        }
+
+        if (try self.planSyntheticSplitInjection(executable_size, writable_size, alignment)) |plan| {
+            return plan;
+        }
+
+        return carrier_plan orelse error.NoInjectableSegment;
+    }
+
+    /// Forces the legacy "extend existing segments" split planner.
+    ///
+    /// This remains valuable for targeted regression tests because it exercises
+    /// the metadata-rewrite path that becomes necessary once original later
+    /// segments actually move.
+    pub fn planCarrierSplitInjection(
+        self: View,
+        executable_size: usize,
+        writable_size: usize,
+        alignment: usize,
+    ) !SplitInjectionPlan {
+        return self.planCarrierSplitInjectionWithUsedEnds(
+            executable_size,
+            writable_size,
+            alignment,
+            null,
+            null,
+        );
+    }
+
+    /// Carrier-only split planner with explicit carrier tail occupancy
+    /// overrides.
+    ///
+    /// The caller-provided values are interpreted as "already consumed up to
+    /// here", so the planner always takes the max of the on-disk section end
+    /// and the session-known injected end.
+    pub fn planCarrierSplitInjectionWithUsedEnds(
+        self: View,
+        executable_size: usize,
+        writable_size: usize,
+        alignment: usize,
+        executable_used_end_override: ?usize,
+        writable_used_end_override: ?usize,
+    ) !SplitInjectionPlan {
         if (alignment == 0) return error.InvalidAlignment;
 
         const executable_carrier = try self.executableCarrierSegmentForInjection();
         const executable_tail_offset = try self.nextFileBackedOffsetAfter(executable_carrier.command.fileoff);
-        const executable_used_end = try self.segmentUsedEndFileOffset(executable_carrier);
+        const executable_used_end = @max(
+            try self.segmentUsedEndFileOffset(executable_carrier),
+            executable_used_end_override orelse 0,
+        );
         const executable_plan = try planRegionInjectionFromState(.{
             .carrier_segment_index = executable_carrier.load_command_index,
             .carrier_fileoff = executable_carrier.command.fileoff,
@@ -391,6 +525,7 @@ pub const View = struct {
 
         if (writable_size == 0) {
             return .{
+                .placement = .carrier_extensions,
                 .executable = executable_plan,
                 .writable = null,
                 .total_len = total_len,
@@ -403,7 +538,10 @@ pub const View = struct {
         }
 
         const writable_tail_offset = try self.nextFileBackedOffsetAfter(writable_carrier.command.fileoff);
-        const writable_used_end = try self.segmentUsedEndFileOffset(writable_carrier);
+        const writable_used_end = @max(
+            try self.segmentUsedEndFileOffset(writable_carrier),
+            writable_used_end_override orelse 0,
+        );
         const writable_plan = try planRegionInjectionFromState(.{
             .carrier_segment_index = writable_carrier.load_command_index,
             .carrier_fileoff = writable_carrier.command.fileoff + shiftAmountAtOrAfter(writable_carrier.command.fileoff, executable_plan.tail_offset, executable_plan.tail_shift),
@@ -419,9 +557,183 @@ pub const View = struct {
         total_len += writable_plan.tail_shift;
 
         return .{
+            .placement = .carrier_extensions,
             .executable = executable_plan,
             .writable = writable_plan,
             .total_len = total_len,
+        };
+    }
+
+    /// Plans a split injection by appending dedicated payload segments in front
+    /// of `__LINKEDIT`.
+    ///
+    /// Why this path exists:
+    /// - growing `__TEXT` for a larger payload eventually shifts the original
+    ///   `__DATA` / `__DATA_CONST` segments
+    /// - real Swift / Objective-C binaries then require a long tail of
+    ///   metadata repair just to preserve their original startup behavior
+    /// - if we can instead reserve two brand-new payload segments before
+    ///   `__LINKEDIT`, the original data layout stays untouched and the runtime
+    ///   blast radius becomes much smaller
+    ///
+    /// Current safety policy:
+    /// - require enough existing load-command slack to append one or two
+    ///   `LC_SEGMENT_64` commands
+    /// - require `__LINKEDIT` to start on the normal 16 KiB arm64 segment page
+    /// - currently skip binaries that use `LC_DYLD_CHAINED_FIXUPS`, because the
+    ///   chained-fixups segment-count table would need an additional resize
+    ///   pass once new segments are introduced
+    fn planSyntheticSplitInjection(
+        self: View,
+        executable_size: usize,
+        writable_size: usize,
+        alignment: usize,
+    ) !?SplitInjectionPlan {
+        _ = alignment;
+
+        if ((try self.dyldChainedFixupsCommand()) != null) return null;
+
+        const linkedit = try self.segmentByName("__LINKEDIT");
+        const page_size: usize = @intCast(machOSegmentPageSize());
+        if ((linkedit.command.fileoff % page_size) != 0) return null;
+        if ((linkedit.command.vmaddr % page_size) != 0) return null;
+
+        const synthetic_segment_count: usize = if (writable_size != 0) 2 else 1;
+        if (!try self.canAppendSyntheticSegmentCommands(synthetic_segment_count)) return null;
+
+        const tail_offset: usize = @intCast(linkedit.command.fileoff);
+        const executable_span_size = std.mem.alignForward(usize, executable_size, page_size);
+        const executable_region = RegionInjectionPlan{
+            .placement = .synthetic_segment,
+            .carrier_segment_index = 0,
+            .segment_span_size = executable_span_size,
+            .injection_offset = tail_offset,
+            .injection_end_offset = tail_offset + executable_size,
+            .tail_offset = tail_offset,
+            .tail_shift = 0, // filled once the total reserved span is known
+            .payload_base_address = linkedit.command.vmaddr,
+            .make_executable = true,
+        };
+
+        if (writable_size == 0) {
+            return .{
+                .placement = .synthetic_segments,
+                .executable = .{ .tail_shift = executable_span_size, .tail_offset = tail_offset, .payload_base_address = executable_region.payload_base_address, .injection_offset = executable_region.injection_offset, .injection_end_offset = executable_region.injection_end_offset, .carrier_segment_index = executable_region.carrier_segment_index, .segment_span_size = executable_region.segment_span_size, .make_executable = executable_region.make_executable, .placement = executable_region.placement },
+                .writable = null,
+                .total_len = self.bytes.len + executable_span_size,
+                .synthetic_tail_offset = tail_offset,
+                .synthetic_tail_shift = executable_span_size,
+            };
+        }
+
+        const writable_offset = tail_offset + executable_span_size;
+        const writable_span_size = std.mem.alignForward(usize, writable_size, page_size);
+        const total_shift = executable_span_size + writable_span_size;
+
+        return .{
+            .placement = .synthetic_segments,
+            .executable = .{
+                .placement = .synthetic_segment,
+                .carrier_segment_index = 0,
+                .segment_span_size = executable_span_size,
+                .injection_offset = tail_offset,
+                .injection_end_offset = tail_offset + executable_size,
+                .tail_offset = tail_offset,
+                .tail_shift = total_shift,
+                .payload_base_address = linkedit.command.vmaddr,
+                .make_executable = true,
+            },
+            .writable = .{
+                .placement = .synthetic_segment,
+                .carrier_segment_index = 0,
+                .segment_span_size = writable_span_size,
+                .injection_offset = writable_offset,
+                .injection_end_offset = writable_offset + writable_size,
+                .tail_offset = tail_offset,
+                .tail_shift = total_shift,
+                .payload_base_address = linkedit.command.vmaddr + executable_span_size,
+                .make_executable = false,
+            },
+            .total_len = self.bytes.len + total_shift,
+            .synthetic_tail_offset = tail_offset,
+            .synthetic_tail_shift = total_shift,
+        };
+    }
+
+    /// Plans the common "large RX payload, tiny RW state" Mach-O shape:
+    /// - reserve one brand-new executable segment before `__LINKEDIT`
+    /// - keep writable payload state on the original writable carrier
+    ///
+    /// This is intentionally narrower than the full synthetic two-segment path.
+    /// It exists because many real app binaries do not leave enough load-command
+    /// slack for *two* fresh `LC_SEGMENT_64` commands, but reclaiming a handful
+    /// of optional metadata commands is often enough for exactly one.
+    ///
+    /// Current policy:
+    /// - only useful when the payload actually has writable state
+    /// - require the writable carrier plan to stay within existing slack
+    /// - still skip chained-fixups images for now because the extra segment
+    ///   count changes dyld's segment table semantics
+    fn planHybridSplitInjection(
+        self: View,
+        executable_size: usize,
+        writable_size: usize,
+        alignment: usize,
+        executable_used_end_override: ?usize,
+        writable_used_end_override: ?usize,
+    ) !?SplitInjectionPlan {
+        if (writable_size == 0) return null;
+        if ((try self.dyldChainedFixupsCommand()) != null) return null;
+
+        const linkedit = try self.segmentByName("__LINKEDIT");
+        const page_size: usize = @intCast(machOSegmentPageSize());
+        if ((linkedit.command.fileoff % page_size) != 0) return null;
+        if ((linkedit.command.vmaddr % page_size) != 0) return null;
+        if (!try self.canAppendSyntheticSegmentCommands(1)) return null;
+
+        const writable_carrier = self.writableCarrierSegmentForInjection() catch |err| switch (err) {
+            error.NoInjectableSegment => return null,
+            else => return err,
+        };
+        const writable_tail_offset = try self.nextFileBackedOffsetAfter(writable_carrier.command.fileoff);
+        const writable_used_end = @max(
+            try self.segmentUsedEndFileOffset(writable_carrier),
+            writable_used_end_override orelse 0,
+        );
+        const writable_plan = try planRegionInjectionFromState(.{
+            .carrier_segment_index = writable_carrier.load_command_index,
+            .carrier_fileoff = writable_carrier.command.fileoff,
+            .carrier_used_end_fileoff = writable_used_end,
+            .carrier_filesize = writable_carrier.command.filesize,
+            .carrier_vmaddr = writable_carrier.command.vmaddr,
+            .carrier_vmsize = writable_carrier.command.vmsize,
+            .tail_offset = writable_tail_offset,
+            .injected_size = writable_size,
+            .alignment = alignment,
+            .make_executable = false,
+        });
+        if (!writable_plan.fitsExistingSlack()) return null;
+
+        _ = executable_used_end_override;
+        const tail_offset: usize = @intCast(linkedit.command.fileoff);
+        const executable_span_size = std.mem.alignForward(usize, executable_size, page_size);
+        return .{
+            .placement = .mixed,
+            .executable = .{
+                .placement = .synthetic_segment,
+                .carrier_segment_index = 0,
+                .segment_span_size = executable_span_size,
+                .injection_offset = tail_offset,
+                .injection_end_offset = tail_offset + executable_size,
+                .tail_offset = tail_offset,
+                .tail_shift = executable_span_size,
+                .payload_base_address = linkedit.command.vmaddr,
+                .make_executable = true,
+            },
+            .writable = writable_plan,
+            .total_len = self.bytes.len + executable_span_size,
+            .synthetic_tail_offset = tail_offset,
+            .synthetic_tail_shift = executable_span_size,
         };
     }
 
@@ -431,11 +743,28 @@ pub const View = struct {
     /// The segment still preserves the file/vm delta that was already present
     /// in the original image.
     pub fn planInjection(self: View, injected_size: usize, alignment: usize) !InjectionPlan {
+        return self.planInjectionWithUsedEnd(injected_size, alignment, null);
+    }
+
+    /// Single-region planner with an explicit "already occupied through here"
+    /// override for the carrier segment tail.
+    ///
+    /// This lets the rewriter reuse original slack on the first injection while
+    /// still treating previously injected bytes as owned on subsequent passes.
+    pub fn planInjectionWithUsedEnd(
+        self: View,
+        injected_size: usize,
+        alignment: usize,
+        carrier_used_end_override: ?usize,
+    ) !InjectionPlan {
         if (alignment == 0) return error.InvalidAlignment;
 
         const carrier = try self.carrierSegmentForInjection();
         const linkedit = try self.segmentByName("__LINKEDIT");
-        const carrier_used_end = try self.segmentUsedEndFileOffset(carrier);
+        const carrier_used_end = @max(
+            try self.segmentUsedEndFileOffset(carrier),
+            carrier_used_end_override orelse 0,
+        );
         const injection_offset = std.mem.alignForward(usize, carrier_used_end, alignment);
         const injection_end_offset = try std.math.add(usize, injection_offset, injected_size);
         const tail_offset: usize = @intCast(linkedit.command.fileoff);
@@ -497,6 +826,37 @@ pub const View = struct {
         allocator: std.mem.Allocator,
         plan: SplitInjectionPlan,
     ) ![]u8 {
+        if (plan.usesSyntheticSegments()) {
+            const output = try allocator.alloc(u8, plan.total_len);
+            errdefer allocator.free(output);
+            @memset(output, 0);
+
+            @memcpy(output[0..self.bytes.len], self.bytes);
+
+            if (plan.writable) |region| {
+                if (!region.usesSyntheticSegment()) {
+                    var current_len = self.bytes.len;
+                    applyMaterializedRegion(output, current_len, region);
+                    current_len += region.tail_shift;
+                    std.debug.assert(current_len == self.bytes.len);
+                }
+            }
+
+            const tail_len = self.bytes.len - plan.synthetic_tail_offset;
+            std.mem.copyBackwards(
+                u8,
+                output[plan.synthetic_tail_offset + plan.synthetic_tail_shift .. plan.synthetic_tail_offset + plan.synthetic_tail_shift + tail_len],
+                output[plan.synthetic_tail_offset .. plan.synthetic_tail_offset + tail_len],
+            );
+            @memset(output[plan.executable.injection_offset..plan.executable.injection_end_offset], 0);
+            if (plan.writable) |region| {
+                if (region.usesSyntheticSegment()) {
+                    @memset(output[region.injection_offset..region.injection_end_offset], 0);
+                }
+            }
+            return output;
+        }
+
         const output = try allocator.alloc(u8, plan.total_len);
         errdefer allocator.free(output);
         @memset(output, 0);
@@ -551,6 +911,24 @@ pub const View = struct {
     /// materialized.
     pub fn finalizeSplitInjectedImage(self: View, plan: SplitInjectionPlan) !usize {
         clearLastDiagnostic();
+
+        if (plan.usesSyntheticSegments()) {
+            if (plan.writable) |region| {
+                if (!region.usesSyntheticSegment()) {
+                    if (region.tail_shift != 0) return error.UnsupportedMachOMixedSyntheticWritableShift;
+                    try self.applyRegionInjectionMetadataRaw(region);
+                }
+            }
+            try self.shiftFileOffsetsAtOrAfterRaw(plan.synthetic_tail_offset, plan.synthetic_tail_shift);
+            try self.reclaimLoadCommandSpaceForSyntheticSegments(plan.syntheticSegmentCount());
+            try self.appendSyntheticSegmentLoadCommand(synthetic_executable_segment_name, plan.executable);
+            if (plan.writable) |region| {
+                if (region.usesSyntheticSegment()) {
+                    try self.appendSyntheticSegmentLoadCommand(synthetic_writable_segment_name, region);
+                }
+            }
+            return try self.stripCodeSignatureForResigning();
+        }
 
         // `materializeSplitInjectedImage` has already inserted *both* holes in
         // the backing byte stream before we start mutating load commands.
@@ -847,7 +1225,7 @@ pub const View = struct {
     /// section and the end of the segment. Reusing that already-owned space is
     /// much cheaper than growing the segment and shifting every later segment,
     /// because it avoids large cascades of metadata rewrites.
-    fn segmentUsedEndFileOffset(self: View, segment: SegmentRef) !usize {
+    pub fn segmentUsedEndFileOffset(self: View, segment: SegmentRef) !usize {
         _ = self;
 
         const segment_end = try std.math.add(u64, segment.command.fileoff, segment.command.filesize);
@@ -865,6 +1243,40 @@ pub const View = struct {
         }
 
         return @intCast(used_end);
+    }
+
+    /// Returns the first file offset occupied by mapped image content.
+    ///
+    /// Load commands live inside the initial bytes of `__TEXT`, before the
+    /// first real section payload. Appending synthetic segment commands is only
+    /// safe while we still stay inside that header slack region.
+    fn firstMappedContentOffset(self: View) !usize {
+        var result: ?usize = null;
+
+        var cursor = loadCommandCursor(self);
+        while (try cursor.next()) |command| {
+            if (command.cmd != .SEGMENT_64) continue;
+
+            const segment = command.segment64();
+            if (segment.filesize == 0) continue;
+
+            if (segment.nsects == 0) {
+                if (segment.fileoff != 0) {
+                    result = if (result) |best| @min(best, @as(usize, @intCast(segment.fileoff))) else @as(usize, @intCast(segment.fileoff));
+                }
+                continue;
+            }
+
+            for (command.sections64()) |section| {
+                if (section.isZerofill()) continue;
+                if (section.size == 0) continue;
+                if (section.offset == 0) continue;
+
+                result = if (result) |best| @min(best, section.offset) else section.offset;
+            }
+        }
+
+        return result orelse self.bytes.len;
     }
 
     fn findCarrierSegmentByProtection(
@@ -938,6 +1350,19 @@ pub const View = struct {
         try self.applyMetadataFixupsAfterSegmentShift(region.tail_offset, region.tail_shift);
     }
 
+    fn loadCommandBytes(self: View) []u8 {
+        const offset = @sizeOf(macho.mach_header_64);
+        const size: usize = @intCast(self.header.sizeofcmds);
+        return self.bytes[offset .. offset + size];
+    }
+
+    fn loadCommandStorageBytes(self: View) ![]u8 {
+        const offset = @sizeOf(macho.mach_header_64);
+        const end = try self.firstMappedContentOffset();
+        if (end < offset) return error.InvalidMachOLoadCommands;
+        return self.bytes[offset..end];
+    }
+
     fn codeSignatureCommand(self: View) !?LoadCommandView {
         var cursor = loadCommandCursor(self);
         while (try cursor.next()) |command| {
@@ -962,8 +1387,96 @@ pub const View = struct {
         return null;
     }
 
+    fn canAppendSyntheticSegmentCommands(self: View, segment_count: usize) !bool {
+        const storage = try self.loadCommandStorageBytes();
+        const needed = try std.math.mul(usize, segment_count, @sizeOf(macho.segment_command_64));
+        const current: usize = @intCast(self.header.sizeofcmds);
+        const reclaimable = try self.reclaimableSyntheticLoadCommandBytes();
+        return current + needed <= storage.len + reclaimable;
+    }
+
+    fn reclaimableSyntheticLoadCommandBytes(self: View) !usize {
+        var total: usize = 0;
+        var cursor = loadCommandCursor(self);
+        while (try cursor.next()) |command| {
+            if (!isSyntheticLoadCommandReclaimable(command.cmd)) continue;
+            total += command.bytes.len;
+        }
+        return total;
+    }
+
+    fn reclaimLoadCommandSpaceForSyntheticSegments(self: View, segment_count: usize) !void {
+        const storage = try self.loadCommandStorageBytes();
+        const needed = try std.math.mul(usize, segment_count, @sizeOf(macho.segment_command_64));
+
+        while (true) {
+            const current: usize = @intCast(self.header.sizeofcmds);
+            if (current + needed <= storage.len) return;
+
+            var removed_any = false;
+            for (synthetic_load_command_reclaim_order) |cmd| {
+                const command = (try self.findFirstLoadCommandByType(cmd)) orelse continue;
+                self.removeLoadCommand(command);
+                removed_any = true;
+                break;
+            }
+
+            if (!removed_any) return error.InsufficientMachOLoadCommandSlack;
+        }
+    }
+
+    fn findFirstLoadCommandByType(self: View, cmd: macho.LC) !?LoadCommandView {
+        var cursor = loadCommandCursor(self);
+        while (try cursor.next()) |command| {
+            if (command.cmd == cmd) return command;
+        }
+        return null;
+    }
+
+    fn appendSyntheticSegmentLoadCommand(
+        self: View,
+        segment_name: []const u8,
+        region: RegionInjectionPlan,
+    ) !void {
+        if (!region.usesSyntheticSegment()) return error.InvalidSyntheticMachOSegmentPlan;
+        if (segment_name.len > synthetic_segment_name_len) return error.InvalidSyntheticMachOSegmentName;
+
+        const storage = try self.loadCommandStorageBytes();
+        const command_size = @sizeOf(macho.segment_command_64);
+        const old_sizeofcmds: usize = @intCast(self.header.sizeofcmds);
+        if (old_sizeofcmds + command_size > storage.len) {
+            return error.InsufficientMachOLoadCommandSlack;
+        }
+
+        const bytes = storage[old_sizeofcmds .. old_sizeofcmds + command_size];
+        @memset(bytes, 0);
+
+        const segment = std.mem.bytesAsValue(
+            macho.segment_command_64,
+            bytes[0..@sizeOf(macho.segment_command_64)],
+        );
+        segment.cmd = .SEGMENT_64;
+        segment.cmdsize = @sizeOf(macho.segment_command_64);
+        @memcpy(segment.segname[0..segment_name.len], segment_name);
+        segment.vmaddr = region.payload_base_address;
+        segment.vmsize = region.segment_span_size;
+        segment.fileoff = region.injection_offset;
+        segment.filesize = region.segment_span_size;
+        segment.maxprot = if (region.make_executable)
+            macho.PROT.READ | macho.PROT.EXEC
+        else
+            macho.PROT.READ | macho.PROT.WRITE;
+        segment.initprot = segment.maxprot;
+        segment.nsects = 0;
+        segment.flags = 0;
+
+        self.header.ncmds += 1;
+        self.header.sizeofcmds += @intCast(command_size);
+    }
+
     fn removeLoadCommand(self: View, command: LoadCommandView) void {
-        const command_offset = @as(usize, @intCast(@intFromPtr(command.bytes.ptr) - @intFromPtr(self.load_commands.ptr)));
+        const load_commands = self.loadCommandBytes();
+        const command_offset = @as(usize, @intCast(@intFromPtr(command.bytes.ptr) - @intFromPtr(load_commands.ptr)));
         const command_size = command.bytes.len;
         const old_sizeofcmds: usize = @intCast(self.header.sizeofcmds);
         std.debug.assert(command_offset + command_size <= old_sizeofcmds);
@@ -973,12 +1486,12 @@ pub const View = struct {
         if (trailing_len != 0) {
             std.mem.copyForwards(
                 u8,
-                self.load_commands[command_offset .. command_offset + trailing_len],
-                self.load_commands[trailing_start .. trailing_start + trailing_len],
+                load_commands[command_offset .. command_offset + trailing_len],
+                load_commands[trailing_start .. trailing_start + trailing_len],
             );
         }
 
-        @memset(self.load_commands[old_sizeofcmds - command_size .. old_sizeofcmds], 0);
+        @memset(load_commands[old_sizeofcmds - command_size .. old_sizeofcmds], 0);
         self.header.ncmds -= 1;
         self.header.sizeofcmds -= @intCast(command_size);
     }
@@ -1775,6 +2288,9 @@ const rebase_opcode_do_rebase_add_addr_uleb: u8 = 0x70;
 const rebase_opcode_do_rebase_uleb_times_skipping_uleb: u8 = 0x80;
 const rebase_type_pointer: u8 = 1;
 const rebase_pointer_stride: u64 = @sizeOf(u64);
+const synthetic_segment_name_len: usize = 16;
+const synthetic_executable_segment_name = "__ZR_TEXT";
+const synthetic_writable_segment_name = "__ZR_DATA";
 
 const dyld_chained_ptr_start_none: u16 = 0xFFFF;
 const dyld_chained_ptr_start_multi: u16 = 0x8000;
@@ -1856,7 +2372,7 @@ fn shiftAmountAtOrAfter(value: u64, threshold: usize, delta: usize) u64 {
 
 fn loadCommandCursor(view: View) LoadCommandCursor {
     return .{
-        .bytes = view.load_commands,
+        .bytes = view.loadCommandBytes(),
         .remaining = view.header.ncmds,
     };
 }
@@ -1885,6 +2401,26 @@ fn shiftU32Offset(field: *align(1) u32, threshold: usize, delta: usize) void {
     if (field.* == 0) return;
     if (field.* < threshold) return;
     field.* += @intCast(delta);
+}
+
+const synthetic_load_command_reclaim_order = [_]macho.LC{
+    .CODE_SIGNATURE,
+    .FUNCTION_STARTS,
+    .DATA_IN_CODE,
+    .SOURCE_VERSION,
+    .UUID,
+};
+
+fn isSyntheticLoadCommandReclaimable(cmd: macho.LC) bool {
+    return switch (cmd) {
+        .CODE_SIGNATURE,
+        .FUNCTION_STARTS,
+        .DATA_IN_CODE,
+        .SOURCE_VERSION,
+        .UUID,
+        => true,
+        else => false,
+    };
 }
 
 fn isLinkeditDataCommand(cmd: macho.LC) bool {
