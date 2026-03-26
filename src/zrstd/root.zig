@@ -209,6 +209,7 @@ pub const FixedBuffer = struct {
 
 const FormatKind = enum {
     default,
+    string,
     hex_lower,
 };
 
@@ -221,6 +222,7 @@ const FormatSpec = struct {
 ///
 /// Deliberately supported today:
 /// - `{}`
+/// - `{s}`
 /// - `{x}`
 /// - `{x:0>8}` style lowercase hex with zero-left-padding
 ///
@@ -231,6 +233,7 @@ const FormatSpec = struct {
 /// payloads, exactly the environment `zrwrite` wants to support.
 fn parseFormatSpec(comptime spec: []const u8) FormatSpec {
     if (spec.len == 0) return .{};
+    if (std.mem.eql(u8, spec, "s")) return .{ .kind = .string };
     if (std.mem.eql(u8, spec, "x")) return .{ .kind = .hex_lower };
 
     if (std.mem.startsWith(u8, spec, "x:0>")) {
@@ -249,7 +252,7 @@ fn parseFormatSpec(comptime spec: []const u8) FormatSpec {
         };
     }
 
-    @compileError("unsupported zrstd format specifier; supported forms are {}, {x}, and {x:0>width}.");
+    @compileError("unsupported zrstd format specifier; supported forms are {}, {s}, {x}, and {x:0>width}.");
 }
 
 fn placeholderEnd(comptime fmt_str: []const u8, comptime start: usize) usize {
@@ -319,8 +322,70 @@ fn writeFormattedValue(writer: *FixedBuffer, comptime spec_text: []const u8, val
     const spec = comptime parseFormatSpec(spec_text);
     switch (spec.kind) {
         .default => try writeDefaultValue(writer, value),
+        .string => try writeStringValue(writer, value),
         .hex_lower => try writeHexValue(writer, value, spec.min_width),
     }
+}
+
+/// Explicit `{s}` formatting accepts the common payload-side string shapes:
+/// - `[]const u8` / `[]u8`
+/// - `[N]u8` and `[N:0]u8`
+/// - `*const [N]u8`
+/// - `[*:0]const u8`
+///
+/// Keeping this explicit matters because payload authors often recover or
+/// build strings in several ABI-driven forms. `{s}` should therefore behave
+/// predictably without forcing them to first normalize everything into a slice.
+fn writeStringValue(writer: *FixedBuffer, value: anytype) !void {
+    try writer.writeAll(stringBytes(value));
+}
+
+fn stringBytes(value: anytype) []const u8 {
+    const T = @TypeOf(value);
+    return switch (@typeInfo(T)) {
+        .pointer => |pointer| switch (pointer.size) {
+            .slice => blk: {
+                if (pointer.child != u8) {
+                    @compileError("zrstd {s} formatting supports byte strings only.");
+                }
+                break :blk value;
+            },
+            .many => blk: {
+                if (pointer.child != u8) {
+                    @compileError("zrstd {s} formatting supports byte strings only.");
+                }
+                const sentinel = pointer.sentinel() orelse
+                    @compileError("zrstd {s} formatting requires a sentinel-terminated many-pointer string.");
+                if (sentinel != 0) {
+                    @compileError("zrstd {s} formatting only supports zero-terminated many-pointer strings.");
+                }
+                break :blk value[0..zeroTerminatedLen(value)];
+            },
+            .one => switch (@typeInfo(pointer.child)) {
+                .array => |array| blk: {
+                    if (array.child != u8) {
+                        @compileError("zrstd {s} formatting supports byte strings only.");
+                    }
+                    break :blk value[0..];
+                },
+                else => @compileError("zrstd {s} formatting supports slices, byte arrays, and zero-terminated byte pointers only."),
+            },
+            else => @compileError("zrstd {s} formatting supports slices, byte arrays, and zero-terminated byte pointers only."),
+        },
+        .array => |array| blk: {
+            if (array.child != u8) {
+                @compileError("zrstd {s} formatting supports byte strings only.");
+            }
+            break :blk value[0..];
+        },
+        else => @compileError("zrstd {s} formatting supports slices, byte arrays, and zero-terminated byte pointers only."),
+    };
+}
+
+fn zeroTerminatedLen(bytes: anytype) usize {
+    var index: usize = 0;
+    while (bytes[index] != 0) : (index += 1) {}
+    return index;
 }
 
 fn writeDefaultValue(writer: *FixedBuffer, value: anytype) !void {
@@ -614,6 +679,18 @@ test "formatInto supports payload-safe decimal and padded hex formatting" {
     );
 
     try std.testing.expectEqualStrings("trace block=3 word=2 out=0x0000abcd ok=true", rendered);
+}
+
+test "formatInto supports explicit {s} string formatting" {
+    var storage: [96]u8 = undefined;
+    const zt: [*:0]const u8 = "payload";
+    const rendered = try formatInto(
+        &storage,
+        "kind={s} msg={s} raw={}",
+        .{ "trace", zt, "ok" },
+    );
+
+    try std.testing.expectEqualStrings("kind=trace msg=payload raw=ok", rendered);
 }
 
 test "mem helpers keep payload buffers explicit and bounded" {

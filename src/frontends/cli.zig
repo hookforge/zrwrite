@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const bundle = @import("../core/bundle.zig");
 const apply = @import("../core/apply.zig");
 const image_backend = @import("../core/image_backend.zig");
@@ -32,6 +33,7 @@ pub fn main() !void {
 
 const Command = enum {
     help,
+    init_meta,
     bundle,
     apply,
     rewrite,
@@ -59,6 +61,7 @@ fn dispatchCommand(allocator: std.mem.Allocator, args: []const []const u8) !void
             }
             return;
         },
+        .init_meta => try commandInitMeta(args[2..]),
         .bundle => try commandBundle(allocator, args[2..]),
         .apply => try commandApply(allocator, args[2..]),
         .rewrite => try commandRewriteShortcut(allocator, args[2..]),
@@ -67,6 +70,82 @@ fn dispatchCommand(allocator: std.mem.Allocator, args: []const []const u8) !void
             return error.InvalidArgument;
         },
     }
+}
+
+fn commandInitMeta(args: []const []const u8) !void {
+    if (isSingleHelpArgument(args)) {
+        printInitMetaUsage();
+        return;
+    }
+
+    var output_path: []const u8 = "bundle.meta.json";
+    var force = false;
+    var target_arch: bundle.Architecture = .aarch64;
+    var target_os: ?bundle.OperatingSystem = null;
+    var target_format: ?bundle.BinaryFormat = null;
+    var payload_format: ?bundle.ObjectFormat = null;
+    var hook_kind: bundle.HookKind = .instrument;
+    var target_kind: bundle.HookTargetKind = .virtual_address;
+    var payload_object_path: []const u8 = "payload.o";
+    var handler_symbol: ?[]const u8 = null;
+
+    var index: usize = 0;
+    while (index < args.len) : (index += 1) {
+        const flag = args[index];
+        if (flagMatches(flag, "--output", "-o")) {
+            output_path = try requireFlagValue(args, &index);
+        } else if (std.mem.eql(u8, flag, "--force")) {
+            force = true;
+        } else if (std.mem.eql(u8, flag, "--target-arch")) {
+            target_arch = try parseArchitecture(try requireFlagValue(args, &index));
+        } else if (std.mem.eql(u8, flag, "--target-os")) {
+            target_os = try parseOs(try requireFlagValue(args, &index));
+        } else if (std.mem.eql(u8, flag, "--target-format")) {
+            target_format = try parseBinaryFormat(try requireFlagValue(args, &index));
+        } else if (std.mem.eql(u8, flag, "--payload-format")) {
+            payload_format = try parseObjectFormat(try requireFlagValue(args, &index));
+        } else if (std.mem.eql(u8, flag, "--hook-kind")) {
+            hook_kind = try parseHookKind(try requireFlagValue(args, &index));
+        } else if (std.mem.eql(u8, flag, "--target-kind")) {
+            target_kind = try parseHookTargetKind(try requireFlagValue(args, &index));
+        } else if (std.mem.eql(u8, flag, "--payload-object")) {
+            payload_object_path = try requireFlagValue(args, &index);
+        } else if (std.mem.eql(u8, flag, "--handler-symbol")) {
+            handler_symbol = try requireFlagValue(args, &index);
+        } else {
+            return error.InvalidArgument;
+        }
+    }
+
+    const resolved_target_os = target_os orelse defaultTemplateTargetOs();
+    const resolved_target_format = target_format orelse defaultBinaryFormatForOs(resolved_target_os);
+    const resolved_payload_format = payload_format orelse objectFormatForBinaryFormat(resolved_target_format);
+    const resolved_handler_symbol = handler_symbol orelse defaultTemplateHandlerSymbol(hook_kind);
+
+    const file = std.fs.cwd().createFile(output_path, .{
+        .truncate = true,
+        .exclusive = !force,
+    }) catch |err| switch (err) {
+        error.PathAlreadyExists => return error.MetaTemplateAlreadyExists,
+        else => return err,
+    };
+    defer file.close();
+
+    var file_buffer: [4096]u8 = undefined;
+    var file_writer = file.writer(&file_buffer);
+    try writeMetaTemplate(&file_writer.interface, .{
+        .target_arch = target_arch,
+        .target_os = resolved_target_os,
+        .target_format = resolved_target_format,
+        .payload_object_path = payload_object_path,
+        .payload_format = resolved_payload_format,
+        .hook_kind = hook_kind,
+        .target_kind = target_kind,
+        .handler_symbol = resolved_handler_symbol,
+    });
+    try file_writer.interface.flush();
+
+    std.debug.print("wrote {s}\n", .{output_path});
 }
 
 fn commandBundle(allocator: std.mem.Allocator, args: []const []const u8) !void {
@@ -89,11 +168,11 @@ fn commandBundle(allocator: std.mem.Allocator, args: []const []const u8) !void {
     var index: usize = 0;
     while (index < args.len) : (index += 1) {
         const flag = args[index];
-        if (std.mem.eql(u8, flag, "--output")) {
+        if (flagMatches(flag, "--output", "-o")) {
             output_path = try requireFlagValue(args, &index);
-        } else if (std.mem.eql(u8, flag, "--meta")) {
+        } else if (flagMatches(flag, "--meta", "-m")) {
             meta_path = try requireFlagValue(args, &index);
-        } else if (std.mem.eql(u8, flag, "--payload")) {
+        } else if (flagMatches(flag, "--payload", "-p")) {
             payload_path = try requireFlagValue(args, &index);
         } else if (std.mem.eql(u8, flag, "--handler-symbol")) {
             pending_hook.handler_symbol = try requireFlagValue(args, &index);
@@ -182,11 +261,11 @@ fn commandApply(allocator: std.mem.Allocator, args: []const []const u8) !void {
     var index: usize = 0;
     while (index < args.len) : (index += 1) {
         const flag = args[index];
-        if (std.mem.eql(u8, flag, "--bundle")) {
+        if (flagMatches(flag, "--bundle", "-b")) {
             bundle_path = try requireFlagValue(args, &index);
-        } else if (std.mem.eql(u8, flag, "--input")) {
+        } else if (flagMatches(flag, "--input", "-i")) {
             input_path = try requireFlagValue(args, &index);
-        } else if (std.mem.eql(u8, flag, "--output")) {
+        } else if (flagMatches(flag, "--output", "-o")) {
             output_path = try requireFlagValue(args, &index);
         } else {
             return error.InvalidArgument;
@@ -218,13 +297,13 @@ fn commandRewriteShortcut(allocator: std.mem.Allocator, args: []const []const u8
     var index: usize = 0;
     while (index < args.len) : (index += 1) {
         const flag = args[index];
-        if (std.mem.eql(u8, flag, "--input")) {
+        if (flagMatches(flag, "--input", "-i")) {
             input_path = try requireFlagValue(args, &index);
-        } else if (std.mem.eql(u8, flag, "--output")) {
+        } else if (flagMatches(flag, "--output", "-o")) {
             output_path = try requireFlagValue(args, &index);
-        } else if (std.mem.eql(u8, flag, "--meta")) {
+        } else if (flagMatches(flag, "--meta", "-m")) {
             meta_path = try requireFlagValue(args, &index);
-        } else if (std.mem.eql(u8, flag, "--payload")) {
+        } else if (flagMatches(flag, "--payload", "-p")) {
             payload_path = try requireFlagValue(args, &index);
         } else if (std.mem.eql(u8, flag, "--handler-symbol")) {
             pending_hook.handler_symbol = try requireFlagValue(args, &index);
@@ -312,7 +391,7 @@ fn commandInspect(allocator: std.mem.Allocator, args: []const []const u8) !void 
     var index: usize = 0;
     while (index < args.len) : (index += 1) {
         const flag = args[index];
-        if (std.mem.eql(u8, flag, "--input")) {
+        if (flagMatches(flag, "--input", "-i")) {
             input_path = try requireFlagValue(args, &index);
         } else if (std.mem.eql(u8, flag, "--symbol")) {
             try locator.setSymbol(try requireFlagValue(args, &index));
@@ -479,6 +558,7 @@ fn parseStolenInstructionCount(value: []const u8) !u8 {
 
 fn parseCommand(token: []const u8) Command {
     if (std.mem.eql(u8, token, "help")) return .help;
+    if (std.mem.eql(u8, token, "init-meta")) return .init_meta;
     if (std.mem.eql(u8, token, "bundle")) return .bundle;
     if (std.mem.eql(u8, token, "apply")) return .apply;
     if (std.mem.eql(u8, token, "rewrite")) return .rewrite;
@@ -486,9 +566,21 @@ fn parseCommand(token: []const u8) Command {
     return .unknown;
 }
 
+fn parseHookTargetKind(value: []const u8) !bundle.HookTargetKind {
+    if (std.mem.eql(u8, value, "symbol")) return .symbol;
+    if (std.mem.eql(u8, value, "virtual_address")) return .virtual_address;
+    if (std.mem.eql(u8, value, "file_offset")) return .file_offset;
+    if (std.mem.eql(u8, value, "pattern")) return .pattern;
+    return error.InvalidHookTargetKind;
+}
+
 fn isSingleHelpArgument(args: []const []const u8) bool {
     return args.len == 1 and
         (isHelpToken(args[0]) or std.mem.eql(u8, args[0], "help"));
+}
+
+fn flagMatches(flag: []const u8, long_name: []const u8, short_name: []const u8) bool {
+    return std.mem.eql(u8, flag, long_name) or std.mem.eql(u8, flag, short_name);
 }
 
 fn requireFlagValue(args: []const []const u8, index: *usize) ![]const u8 {
@@ -512,6 +604,7 @@ fn isCliUsageError(err: anyerror) bool {
         error.MixedMetaAndInlineBundleFlags,
         error.InvalidArchitecture,
         error.InvalidHookKind,
+        error.InvalidHookTargetKind,
         error.InvalidOperatingSystem,
         error.InvalidBinaryFormat,
         error.InvalidObjectFormat,
@@ -520,6 +613,107 @@ fn isCliUsageError(err: anyerror) bool {
         => true,
         else => false,
     };
+}
+
+const MetaTemplateOptions = struct {
+    target_arch: bundle.Architecture,
+    target_os: bundle.OperatingSystem,
+    target_format: bundle.BinaryFormat,
+    payload_object_path: []const u8,
+    payload_format: bundle.ObjectFormat,
+    hook_kind: bundle.HookKind,
+    target_kind: bundle.HookTargetKind,
+    handler_symbol: []const u8,
+};
+
+fn defaultTemplateTargetOs() bundle.OperatingSystem {
+    return switch (builtin.os.tag) {
+        .macos => .macos,
+        else => .linux,
+    };
+}
+
+fn defaultBinaryFormatForOs(os: bundle.OperatingSystem) bundle.BinaryFormat {
+    return switch (os) {
+        .linux => .elf,
+        .macos => .macho,
+    };
+}
+
+fn objectFormatForBinaryFormat(format: bundle.BinaryFormat) bundle.ObjectFormat {
+    return switch (format) {
+        .elf => .elf,
+        .macho => .macho,
+    };
+}
+
+fn defaultTemplateHandlerSymbol(kind: bundle.HookKind) []const u8 {
+    return switch (kind) {
+        .instrument => "on_hit",
+        .replace => "replacement_entry",
+    };
+}
+
+// Emit the template manually so the output stays stable and the placeholder
+// values are obvious to users editing the file for the first time.
+fn writeMetaTemplate(writer: anytype, options: MetaTemplateOptions) !void {
+    try writer.writeAll("{\n");
+    try writer.writeAll("  \"target\": {\n");
+    try writer.writeAll("    \"arch\": ");
+    try writeJsonString(writer, @tagName(options.target_arch));
+    try writer.writeAll(",\n    \"os\": ");
+    try writeJsonString(writer, @tagName(options.target_os));
+    try writer.writeAll(",\n    \"binary_format\": ");
+    try writeJsonString(writer, @tagName(options.target_format));
+    try writer.writeAll("\n  },\n");
+    try writer.writeAll("  \"payload\": {\n");
+    try writer.writeAll("    \"object_path\": ");
+    try writeJsonString(writer, options.payload_object_path);
+    try writer.writeAll(",\n    \"object_format\": ");
+    try writeJsonString(writer, @tagName(options.payload_format));
+    try writer.writeAll("\n  },\n");
+    try writer.writeAll("  \"hooks\": [\n");
+    try writer.writeAll("    {\n");
+    try writer.writeAll("      \"kind\": ");
+    try writeJsonString(writer, @tagName(options.hook_kind));
+    try writer.writeAll(",\n");
+    try writer.writeAll("      \"target\": {\n");
+    try writer.writeAll("        \"kind\": ");
+    try writeJsonString(writer, @tagName(options.target_kind));
+    switch (options.target_kind) {
+        .symbol => {
+            try writer.writeAll(",\n        \"symbol\": ");
+            try writeJsonString(writer, "<fill-me-symbol>");
+        },
+        .virtual_address => {
+            try writer.writeAll(",\n        \"virtual_address\": ");
+            try writeJsonString(writer, "<fill-me-linked-vaddr>");
+        },
+        .file_offset => {
+            try writer.writeAll(",\n        \"file_offset\": ");
+            try writeJsonString(writer, "<fill-me-file-offset>");
+        },
+        .pattern => {
+            try writer.writeAll(",\n        \"pattern\": ");
+            try writeJsonString(writer, "<fill-me-hex-pattern>");
+            try writer.writeAll(",\n        \"pattern_offset\": ");
+            try writeJsonString(writer, "0x0");
+        },
+    }
+    try writer.writeAll("\n      }");
+    if (options.hook_kind == .instrument) {
+        try writer.writeAll(",\n      \"expected_bytes\": ");
+        try writeJsonString(writer, "<fill-me-expected-bytes>");
+    }
+    try writer.writeAll(",\n      \"handler_symbol\": ");
+    try writeJsonString(writer, options.handler_symbol);
+    try writer.writeAll("\n    }\n");
+    try writer.writeAll("  ]\n");
+    try writer.writeAll("}\n");
+}
+
+fn writeJsonString(writer: anytype, value: []const u8) !void {
+    try std.json.Stringify.value(value, .{}, writer);
 }
 
 const ParsedLocator = struct {
@@ -661,6 +855,7 @@ fn printUsageForArgs(args: []const []const u8) void {
 
 fn printCommandUsage(command: Command) void {
     switch (command) {
+        .init_meta => printInitMetaUsage(),
         .bundle => printBundleUsage(),
         .apply => printApplyUsage(),
         .rewrite => printRewriteUsage(),
@@ -669,11 +864,27 @@ fn printCommandUsage(command: Command) void {
     }
 }
 
+fn printInitMetaUsage() void {
+    std.debug.print(
+        \\usage:
+        \\  zrwrite init-meta [--output|-o <bundle.meta.json>] [--force]
+        \\                    [--hook-kind instrument|replace]
+        \\                    [--target-kind symbol|virtual_address|file_offset|pattern]
+        \\                    [--target-arch aarch64|x86_64]
+        \\                    [--target-os linux|macos]
+        \\                    [--target-format elf|macho]
+        \\                    [--payload-object <payload.o>]
+        \\                    [--payload-format elf|macho]
+        \\                    [--handler-symbol <symbol>]
+        \\
+    , .{});
+}
+
 fn printBundleUsage() void {
     std.debug.print(
         \\usage:
-        \\  zrwrite bundle --output <patch.zrpb> --payload <handler.o> --handler-symbol <symbol>
-        \\                 [--meta <bundle.meta.json>]
+        \\  zrwrite bundle --output|-o <patch.zrpb> --payload|-p <handler.o> --handler-symbol <symbol>
+        \\                 [--meta|-m <bundle.meta.json>]
         \\                 [--hook-kind instrument|replace]
         \\                 [--stolen-instructions <count>]
         \\                 [--expected-bytes <hex>]
@@ -695,7 +906,7 @@ fn printBundleUsage() void {
 fn printApplyUsage() void {
     std.debug.print(
         \\usage:
-        \\  zrwrite apply --bundle <patch.zrpb> --input <binary> --output <binary>
+        \\  zrwrite apply --bundle|-b <patch.zrpb> --input|-i <binary> --output|-o <binary>
         \\
     , .{});
 }
@@ -703,8 +914,8 @@ fn printApplyUsage() void {
 fn printRewriteUsage() void {
     std.debug.print(
         \\usage:
-        \\  zrwrite rewrite --input <binary> --output <binary> --payload <handler.o>
-        \\                  [--meta <bundle.meta.json>]
+        \\  zrwrite rewrite --input|-i <binary> --output|-o <binary> --payload|-p <handler.o>
+        \\                  [--meta|-m <bundle.meta.json>]
         \\                  --handler-symbol <symbol>
         \\                  [--hook-kind instrument|replace]
         \\                  [--stolen-instructions <count>]
@@ -725,7 +936,7 @@ fn printRewriteUsage() void {
 fn printInspectUsage() void {
     std.debug.print(
         \\usage:
-        \\  zrwrite inspect --input <binary>
+        \\  zrwrite inspect --input|-i <binary>
         \\                  (--symbol <symbol> | --vaddr <addr> | --file-offset <off> |
         \\                   --pattern <hex> [--pattern-offset <off>])
         \\                  [--pattern-bytes <count>]
@@ -736,11 +947,12 @@ fn printInspectUsage() void {
 fn printUsage() void {
     std.debug.print(
         \\usage:
-        \\  zrwrite help [bundle|apply|rewrite|inspect]
+        \\  zrwrite help [init-meta|bundle|apply|rewrite|inspect]
         \\  zrwrite --help
         \\
         \\
     , .{});
+    printInitMetaUsage();
     printBundleUsage();
     printApplyUsage();
     printRewriteUsage();

@@ -72,6 +72,16 @@ The normal workflow has three steps:
 2. Describe the hook(s) in a meta JSON or pass them through CLI flags.
 3. Build a `.zrpb` bundle and apply it to the target binary.
 
+If you want a quick starting template in the current directory:
+
+```bash
+zrwrite init-meta
+```
+
+That creates `bundle.meta.json` with editable placeholder fields. Use
+`zrwrite help init-meta` to switch the template between `instrument` /
+`replace`, different target locator kinds, or overwrite an existing file.
+
 Typical commands:
 
 ```bash

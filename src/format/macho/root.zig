@@ -373,9 +373,11 @@ pub const View = struct {
 
         const executable_carrier = try self.executableCarrierSegmentForInjection();
         const executable_tail_offset = try self.nextFileBackedOffsetAfter(executable_carrier.command.fileoff);
+        const executable_used_end = try self.segmentUsedEndFileOffset(executable_carrier);
         const executable_plan = try planRegionInjectionFromState(.{
             .carrier_segment_index = executable_carrier.load_command_index,
             .carrier_fileoff = executable_carrier.command.fileoff,
+            .carrier_used_end_fileoff = executable_used_end,
             .carrier_filesize = executable_carrier.command.filesize,
             .carrier_vmaddr = executable_carrier.command.vmaddr,
             .carrier_vmsize = executable_carrier.command.vmsize,
@@ -401,9 +403,11 @@ pub const View = struct {
         }
 
         const writable_tail_offset = try self.nextFileBackedOffsetAfter(writable_carrier.command.fileoff);
+        const writable_used_end = try self.segmentUsedEndFileOffset(writable_carrier);
         const writable_plan = try planRegionInjectionFromState(.{
             .carrier_segment_index = writable_carrier.load_command_index,
             .carrier_fileoff = writable_carrier.command.fileoff + shiftAmountAtOrAfter(writable_carrier.command.fileoff, executable_plan.tail_offset, executable_plan.tail_shift),
+            .carrier_used_end_fileoff = writable_used_end + shiftAmountAtOrAfter(writable_used_end, executable_plan.tail_offset, executable_plan.tail_shift),
             .carrier_filesize = writable_carrier.command.filesize,
             .carrier_vmaddr = writable_carrier.command.vmaddr + shiftAmountAtOrAfter(writable_carrier.command.fileoff, executable_plan.tail_offset, executable_plan.tail_shift),
             .carrier_vmsize = writable_carrier.command.vmsize,
@@ -431,11 +435,8 @@ pub const View = struct {
 
         const carrier = try self.carrierSegmentForInjection();
         const linkedit = try self.segmentByName("__LINKEDIT");
-
-        const carrier_end_file_offset: usize = @intCast(
-            carrier.command.fileoff + @max(carrier.command.filesize, carrier.command.vmsize),
-        );
-        const injection_offset = std.mem.alignForward(usize, carrier_end_file_offset, alignment);
+        const carrier_used_end = try self.segmentUsedEndFileOffset(carrier);
+        const injection_offset = std.mem.alignForward(usize, carrier_used_end, alignment);
         const injection_end_offset = try std.math.add(usize, injection_offset, injected_size);
         const tail_offset: usize = @intCast(linkedit.command.fileoff);
         const tail_shift = planTailShiftForInjectedRange(tail_offset, injection_end_offset);
@@ -531,7 +532,9 @@ pub const View = struct {
         clearLastDiagnostic();
 
         const carrier = try self.segmentAtLoadCommandIndex(plan.carrier_segment_index);
-        const new_segment_size = plan.injection_end_offset - @as(usize, @intCast(carrier.command.fileoff));
+        const existing_segment_size: usize = @intCast(@max(carrier.command.filesize, carrier.command.vmsize));
+        const required_segment_size = plan.injection_end_offset - @as(usize, @intCast(carrier.command.fileoff));
+        const new_segment_size = @max(existing_segment_size, required_segment_size);
         carrier.command.filesize = @intCast(new_segment_size);
         carrier.command.vmsize = @intCast(new_segment_size);
         if (make_executable) {
@@ -613,34 +616,28 @@ pub const View = struct {
     /// - we only want to emit "runtime-ready" outputs from the rewriter once we
     ///   have a coherent `__LINKEDIT` tail again
     ///
-    /// The current policy intentionally mirrors the conservative strategy used
-    /// by `insert-dylib`:
-    /// - `LC_CODE_SIGNATURE` must be the last load command
+    /// Current safety policy:
     /// - `__LINKEDIT` must currently end at the end of file
     /// - the code-signature blob must occupy the tail of `__LINKEDIT`
     /// - the string table must end immediately before that blob, modulo a tiny
     ///   alignment pad that can safely be absorbed into `LC_SYMTAB.strsize`
+    /// - `LC_CODE_SIGNATURE` itself may now appear before later load commands;
+    ///   we compact the load-command area after removing it
     ///
     /// On success:
     /// - the stale blob is logically removed
     /// - `__LINKEDIT.filesize/vmsize` are shrunk
     /// - `LC_SYMTAB.strsize` is normalized when there was a small tail pad
-    /// - the trailing `LC_CODE_SIGNATURE` load command is removed
+    /// - the `LC_CODE_SIGNATURE` load command is removed, even when later load
+    ///   commands follow it in the header
     /// - the new logical file size is returned so the caller can truncate the
     ///   physical output bytes
     fn stripCodeSignatureForResigning(self: View) !usize {
         const command = (try self.codeSignatureCommand()) orelse return self.bytes.len;
-        if (command.index + 1 != self.header.ncmds) {
-            recordDiagnostic(
-                "Mach-O codesign closure refused: LC_CODE_SIGNATURE is load command {d}/{d}, not the last one",
-                .{ command.index + 1, self.header.ncmds },
-            );
-            return error.UnsafeMachOCodeSignatureLayout;
-        }
 
         const signature = command.linkeditData();
         if (signature.dataoff == 0 or signature.datasize == 0) {
-            self.removeTrailingLoadCommand(command);
+            self.removeLoadCommand(command);
             return self.bytes.len;
         }
 
@@ -713,7 +710,7 @@ pub const View = struct {
 
         linkedit.command.filesize -= signature.datasize;
         linkedit.command.vmsize = alignedSegmentVmSize(linkedit.command.filesize);
-        self.removeTrailingLoadCommand(command);
+        self.removeLoadCommand(command);
         return new_file_size;
     }
 
@@ -795,6 +792,7 @@ pub const View = struct {
     fn applyMetadataFixupsAfterSegmentShift(self: View, threshold: usize, delta: usize) !void {
         if (delta == 0) return;
 
+        try self.rewriteDyldInfoRebasesAfterSegmentShift(threshold, delta);
         try self.rewriteDyldChainedFixupsAfterSegmentShift(threshold, delta);
         try self.rewriteAarch64PcRelativeTargetsAfterSegmentShift(threshold, delta);
         try self.rewriteObjcRelativeMetadataAfterSegmentShift(threshold, delta);
@@ -840,6 +838,33 @@ pub const View = struct {
             };
         }
         return error.InvalidSegmentLoadCommandIndex;
+    }
+
+    /// Returns the first free file offset at the tail of an existing carrier
+    /// segment.
+    ///
+    /// Many real Mach-O binaries leave page-tail slack between the last mapped
+    /// section and the end of the segment. Reusing that already-owned space is
+    /// much cheaper than growing the segment and shifting every later segment,
+    /// because it avoids large cascades of metadata rewrites.
+    fn segmentUsedEndFileOffset(self: View, segment: SegmentRef) !usize {
+        _ = self;
+
+        const segment_end = try std.math.add(u64, segment.command.fileoff, segment.command.filesize);
+        var used_end = segment.command.fileoff;
+
+        if (segment.command.nsects == 0) return @intCast(segment_end);
+
+        for (segment.sections) |section| {
+            if (section.isZerofill()) continue;
+            if (section.size == 0) continue;
+
+            const section_end = try std.math.add(u64, section.offset, section.size);
+            if (section_end > segment_end) return error.InvalidMachOSegmentCommand;
+            used_end = @max(used_end, section_end);
+        }
+
+        return @intCast(used_end);
     }
 
     fn findCarrierSegmentByProtection(
@@ -895,7 +920,9 @@ pub const View = struct {
 
     fn applyRegionInjectionMetadataRaw(self: View, region: RegionInjectionPlan) !void {
         const carrier = try self.segmentAtLoadCommandIndex(region.carrier_segment_index);
-        const new_segment_size = region.injection_end_offset - @as(usize, @intCast(carrier.command.fileoff));
+        const existing_segment_size: usize = @intCast(@max(carrier.command.filesize, carrier.command.vmsize));
+        const required_segment_size = region.injection_end_offset - @as(usize, @intCast(carrier.command.fileoff));
+        const new_segment_size = @max(existing_segment_size, required_segment_size);
         carrier.command.filesize = @intCast(new_segment_size);
         carrier.command.vmsize = @intCast(new_segment_size);
         if (region.make_executable) {
@@ -919,6 +946,14 @@ pub const View = struct {
         return null;
     }
 
+    fn dyldInfoCommand(self: View) !?LoadCommandView {
+        var cursor = loadCommandCursor(self);
+        while (try cursor.next()) |command| {
+            if (command.cmd == .DYLD_INFO or command.cmd == .DYLD_INFO_ONLY) return command;
+        }
+        return null;
+    }
+
     fn dyldChainedFixupsCommand(self: View) !?LoadCommandView {
         var cursor = loadCommandCursor(self);
         while (try cursor.next()) |command| {
@@ -927,11 +962,25 @@ pub const View = struct {
         return null;
     }
 
-    fn removeTrailingLoadCommand(self: View, command: LoadCommandView) void {
-        std.debug.assert(command.index + 1 == self.header.ncmds);
-        @memset(command.bytes, 0);
+    fn removeLoadCommand(self: View, command: LoadCommandView) void {
+        const command_offset = @as(usize, @intCast(@intFromPtr(command.bytes.ptr) - @intFromPtr(self.load_commands.ptr)));
+        const command_size = command.bytes.len;
+        const old_sizeofcmds: usize = @intCast(self.header.sizeofcmds);
+        std.debug.assert(command_offset + command_size <= old_sizeofcmds);
+
+        const trailing_start = command_offset + command_size;
+        const trailing_len = old_sizeofcmds - trailing_start;
+        if (trailing_len != 0) {
+            std.mem.copyForwards(
+                u8,
+                self.load_commands[command_offset .. command_offset + trailing_len],
+                self.load_commands[trailing_start .. trailing_start + trailing_len],
+            );
+        }
+
+        @memset(self.load_commands[old_sizeofcmds - command_size .. old_sizeofcmds], 0);
         self.header.ncmds -= 1;
-        self.header.sizeofcmds -= @intCast(command.bytes.len);
+        self.header.sizeofcmds -= @intCast(command_size);
     }
 
     /// Returns the preferred unslid image base used by dyld chained fixups.
@@ -967,6 +1016,172 @@ pub const View = struct {
         }
 
         return count;
+    }
+
+    fn segmentCommandAtOrdinal(self: View, ordinal: usize) !*align(1) macho.segment_command_64 {
+        var segment_ordinal: usize = 0;
+
+        var cursor = loadCommandCursor(self);
+        while (try cursor.next()) |command| {
+            if (command.cmd != .SEGMENT_64) continue;
+            if (segment_ordinal == ordinal) return command.segment64();
+            segment_ordinal += 1;
+        }
+
+        return error.InvalidMachODyldInfoRebase;
+    }
+
+    /// Repairs classic `LC_DYLD_INFO{,_ONLY}` rebase slots after a segment move.
+    ///
+    /// Why this matters:
+    /// - pre-chained Mach-O images write the local unslid target address
+    ///   directly into each rebased slot
+    /// - the rebase opcode stream only tells dyld where those slots live so it
+    ///   can add the ASLR slide later
+    /// - when we move `__DATA` / `__DATA_CONST`, every local pointer that
+    ///   originally targeted one of those segments must therefore be rewritten
+    ///   on disk; otherwise dyld will happily slide an address that is already
+    ///   stale in the new image layout
+    ///
+    /// The real Arc-mobile Mach-O smoke exposed exactly this gap: entries in
+    /// `__objc_classlist` still pointed at the pre-shift class addresses, so
+    /// libobjc started treating selector-name bytes as `objc_class`.
+    fn rewriteDyldInfoRebasesAfterSegmentShift(self: View, threshold: usize, delta: usize) !void {
+        const command = (try self.dyldInfoCommand()) orelse return;
+        const dyld_info = command.dyldInfo();
+        if (dyld_info.rebase_off == 0 or dyld_info.rebase_size == 0) return;
+
+        const blob_offset: usize = dyld_info.rebase_off;
+        const blob_size: usize = dyld_info.rebase_size;
+        if (blob_offset + blob_size > self.bytes.len) return error.InvalidMachODyldInfoRebase;
+
+        const blob = self.bytes[blob_offset .. blob_offset + blob_size];
+        var blob_cursor: usize = 0;
+        var rebase_type: u8 = rebase_type_pointer;
+        var segment_ordinal: ?usize = null;
+        var segment_offset: u64 = 0;
+
+        while (blob_cursor < blob.len) {
+            const instruction = blob[blob_cursor];
+            blob_cursor += 1;
+
+            const opcode = instruction & rebase_opcode_mask;
+            const immediate = instruction & rebase_immediate_mask;
+
+            switch (opcode) {
+                rebase_opcode_done => break,
+                rebase_opcode_set_type_imm => rebase_type = immediate,
+                rebase_opcode_set_segment_and_offset_uleb => {
+                    segment_ordinal = immediate;
+                    segment_offset = try readUleb128(blob, &blob_cursor);
+                },
+                rebase_opcode_add_addr_uleb => {
+                    segment_offset = try std.math.add(
+                        u64,
+                        segment_offset,
+                        try readUleb128(blob, &blob_cursor),
+                    );
+                },
+                rebase_opcode_add_addr_imm_scaled => {
+                    segment_offset = try std.math.add(
+                        u64,
+                        segment_offset,
+                        @as(u64, immediate) * rebase_pointer_stride,
+                    );
+                },
+                rebase_opcode_do_rebase_imm_times => {
+                    const ordinal = segment_ordinal orelse return error.InvalidMachODyldInfoRebase;
+                    var remaining: usize = immediate;
+                    while (remaining != 0) : (remaining -= 1) {
+                        try self.rewriteDyldInfoRebaseSlot(
+                            rebase_type,
+                            ordinal,
+                            segment_offset,
+                            threshold,
+                            delta,
+                        );
+                        segment_offset = try std.math.add(u64, segment_offset, rebase_pointer_stride);
+                    }
+                },
+                rebase_opcode_do_rebase_uleb_times => {
+                    const ordinal = segment_ordinal orelse return error.InvalidMachODyldInfoRebase;
+                    var remaining = try readUleb128(blob, &blob_cursor);
+                    while (remaining != 0) : (remaining -= 1) {
+                        try self.rewriteDyldInfoRebaseSlot(
+                            rebase_type,
+                            ordinal,
+                            segment_offset,
+                            threshold,
+                            delta,
+                        );
+                        segment_offset = try std.math.add(u64, segment_offset, rebase_pointer_stride);
+                    }
+                },
+                rebase_opcode_do_rebase_add_addr_uleb => {
+                    const ordinal = segment_ordinal orelse return error.InvalidMachODyldInfoRebase;
+                    try self.rewriteDyldInfoRebaseSlot(
+                        rebase_type,
+                        ordinal,
+                        segment_offset,
+                        threshold,
+                        delta,
+                    );
+                    segment_offset = try std.math.add(
+                        u64,
+                        segment_offset,
+                        rebase_pointer_stride + try readUleb128(blob, &blob_cursor),
+                    );
+                },
+                rebase_opcode_do_rebase_uleb_times_skipping_uleb => {
+                    const ordinal = segment_ordinal orelse return error.InvalidMachODyldInfoRebase;
+                    var remaining = try readUleb128(blob, &blob_cursor);
+                    const skip = try readUleb128(blob, &blob_cursor);
+                    while (remaining != 0) : (remaining -= 1) {
+                        try self.rewriteDyldInfoRebaseSlot(
+                            rebase_type,
+                            ordinal,
+                            segment_offset,
+                            threshold,
+                            delta,
+                        );
+                        segment_offset = try std.math.add(
+                            u64,
+                            segment_offset,
+                            rebase_pointer_stride + skip,
+                        );
+                    }
+                },
+                else => return error.UnsupportedMachODyldInfoRebaseOpcode,
+            }
+        }
+    }
+
+    fn rewriteDyldInfoRebaseSlot(
+        self: View,
+        rebase_type: u8,
+        segment_ordinal: usize,
+        segment_offset: u64,
+        threshold: usize,
+        delta: usize,
+    ) !void {
+        if (rebase_type != rebase_type_pointer) {
+            return error.UnsupportedMachODyldInfoRebaseType;
+        }
+
+        const segment = try self.segmentCommandAtOrdinal(segment_ordinal);
+        const slot_end = try std.math.add(u64, segment_offset, rebase_pointer_stride);
+        if (slot_end > segment.filesize) return error.InvalidMachODyldInfoRebase;
+
+        const slot_file_offset_u64 = try std.math.add(u64, segment.fileoff, segment_offset);
+        const slot_file_offset: usize = @intCast(slot_file_offset_u64);
+        if (slot_file_offset + @sizeOf(u64) > self.bytes.len) return error.InvalidMachODyldInfoRebase;
+
+        const slot_bytes = self.bytes[slot_file_offset .. slot_file_offset + @sizeOf(u64)];
+        const old_target = readLittleU64(slot_bytes);
+        const new_target = try self.adjustChainedTargetVmAddress(old_target, threshold, delta);
+        if (new_target != old_target) {
+            writeLittleU64(slot_bytes, new_target);
+        }
     }
 
     /// Repairs `LC_DYLD_CHAINED_FIXUPS` after later file-backed segments moved.
@@ -1495,6 +1710,7 @@ const LoadCommandView = struct {
 const RegionPlanningState = struct {
     carrier_segment_index: usize,
     carrier_fileoff: u64,
+    carrier_used_end_fileoff: usize,
     carrier_filesize: u64,
     carrier_vmaddr: u64,
     carrier_vmsize: u64,
@@ -1546,6 +1762,20 @@ const ObjcRelativeMethodEntry = extern struct {
     imp_offset: i32,
 };
 
+const rebase_opcode_mask: u8 = 0xF0;
+const rebase_immediate_mask: u8 = 0x0F;
+const rebase_opcode_done: u8 = 0x00;
+const rebase_opcode_set_type_imm: u8 = 0x10;
+const rebase_opcode_set_segment_and_offset_uleb: u8 = 0x20;
+const rebase_opcode_add_addr_uleb: u8 = 0x30;
+const rebase_opcode_add_addr_imm_scaled: u8 = 0x40;
+const rebase_opcode_do_rebase_imm_times: u8 = 0x50;
+const rebase_opcode_do_rebase_uleb_times: u8 = 0x60;
+const rebase_opcode_do_rebase_add_addr_uleb: u8 = 0x70;
+const rebase_opcode_do_rebase_uleb_times_skipping_uleb: u8 = 0x80;
+const rebase_type_pointer: u8 = 1;
+const rebase_pointer_stride: u64 = @sizeOf(u64);
+
 const dyld_chained_ptr_start_none: u16 = 0xFFFF;
 const dyld_chained_ptr_start_multi: u16 = 0x8000;
 const dyld_chained_ptr_start_last: u16 = 0x8000;
@@ -1590,8 +1820,7 @@ const LoadCommandCursor = struct {
 };
 
 fn planRegionInjectionFromState(state: RegionPlanningState) !RegionInjectionPlan {
-    const carrier_end_file_offset: usize = @intCast(state.carrier_fileoff + @max(state.carrier_filesize, state.carrier_vmsize));
-    const injection_offset = std.mem.alignForward(usize, carrier_end_file_offset, state.alignment);
+    const injection_offset = std.mem.alignForward(usize, state.carrier_used_end_fileoff, state.alignment);
     const injection_end_offset = try std.math.add(usize, injection_offset, state.injected_size);
     const tail_shift = planTailShiftForInjectedRange(state.tail_offset, injection_end_offset);
     const payload_base_address = state.carrier_vmaddr + (injection_offset - @as(usize, @intCast(state.carrier_fileoff)));
@@ -1788,6 +2017,27 @@ fn addSignedOffset(base: u64, signed_offset: i64) !u64 {
 fn signExtend(comptime bit_count: comptime_int, value: u64) i64 {
     const shift = 64 - bit_count;
     return @as(i64, @bitCast(value << shift)) >> shift;
+}
+
+fn readUleb128(bytes: []const u8, cursor: *usize) !u64 {
+    var result: u64 = 0;
+    var shift: u6 = 0;
+
+    while (true) {
+        if (cursor.* >= bytes.len) return error.InvalidMachODyldInfoRebase;
+        const byte = bytes[cursor.*];
+        cursor.* += 1;
+
+        if (shift >= 64 and (byte & 0x7F) != 0) {
+            return error.InvalidMachODyldInfoRebase;
+        }
+
+        result |= @as(u64, byte & 0x7F) << shift;
+        if ((byte & 0x80) == 0) return result;
+
+        if (shift > 56) return error.InvalidMachODyldInfoRebase;
+        shift += 7;
+    }
 }
 
 fn readLittleU32(bytes: []const u8) u32 {
