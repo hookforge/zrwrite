@@ -10,6 +10,14 @@
 //! `zrstd` intentionally stays small and explicit. It is not a replacement for
 //! Zig's standard library; it is a payload-safe compatibility layer for the
 //! subset we can support reliably today.
+//!
+//! Important runtime design note:
+//! payload tracing now formats directly into the destination file descriptor
+//! instead of first materializing one large stack buffer. The earlier buffered
+//! path produced noticeably larger callback frames in real Mach-O hooks, which
+//! made startup-time instrumentation much harder to reason about. A streaming
+//! formatter keeps the generated payload code smaller and closer to the "just
+//! do a few writes" mental model users expect when they log from hooks.
 const builtin = @import("builtin");
 const std = @import("std");
 
@@ -31,9 +39,10 @@ const darwin_nzcv_carry_mask: usize = 0x2000_0000;
 
 pub const stdout_fd: usize = 1;
 pub const stderr_fd: usize = 2;
-// Keep the default buffer comfortably above the "single rich trace line"
-// workload. Payload authors can still bypass this helper and call
-// `formatInto()` directly when they want tighter control over stack usage.
+// `formatInto()` still needs a bounded caller-owned buffer. The debug print
+// helpers no longer allocate this much stack internally, but the public
+// constant remains useful for payload authors who explicitly want one scratch
+// buffer sized for a "single rich trace line".
 pub const default_print_buffer_len: usize = 2048;
 
 /// Namespace that mirrors the intent of `std.debug` for payload authors.
@@ -266,7 +275,7 @@ fn placeholderEnd(comptime fmt_str: []const u8, comptime start: usize) usize {
     @compileError("unterminated '{' in zrstd format string.");
 }
 
-fn formatIntoWriter(writer: *FixedBuffer, comptime fmt_str: []const u8, args: anytype) !void {
+fn formatIntoWriter(writer: anytype, comptime fmt_str: []const u8, args: anytype) !void {
     const fields = std.meta.fields(@TypeOf(args));
 
     comptime var cursor: usize = 0;
@@ -318,7 +327,7 @@ fn formatIntoWriter(writer: *FixedBuffer, comptime fmt_str: []const u8, args: an
     }
 }
 
-fn writeFormattedValue(writer: *FixedBuffer, comptime spec_text: []const u8, value: anytype) !void {
+fn writeFormattedValue(writer: anytype, comptime spec_text: []const u8, value: anytype) !void {
     const spec = comptime parseFormatSpec(spec_text);
     switch (spec.kind) {
         .default => try writeDefaultValue(writer, value),
@@ -336,7 +345,7 @@ fn writeFormattedValue(writer: *FixedBuffer, comptime spec_text: []const u8, val
 /// Keeping this explicit matters because payload authors often recover or
 /// build strings in several ABI-driven forms. `{s}` should therefore behave
 /// predictably without forcing them to first normalize everything into a slice.
-fn writeStringValue(writer: *FixedBuffer, value: anytype) !void {
+fn writeStringValue(writer: anytype, value: anytype) !void {
     try writer.writeAll(stringBytes(value));
 }
 
@@ -388,7 +397,7 @@ fn zeroTerminatedLen(bytes: anytype) usize {
     return index;
 }
 
-fn writeDefaultValue(writer: *FixedBuffer, value: anytype) !void {
+fn writeDefaultValue(writer: anytype, value: anytype) !void {
     const T = @TypeOf(value);
     switch (@typeInfo(T)) {
         .int => |info| {
@@ -439,7 +448,7 @@ fn writeDefaultValue(writer: *FixedBuffer, value: anytype) !void {
     }
 }
 
-fn writeHexValue(writer: *FixedBuffer, value: anytype, min_width: usize) !void {
+fn writeHexValue(writer: anytype, value: anytype, min_width: usize) !void {
     const T = @TypeOf(value);
     const unsigned_value: u64 = switch (@typeInfo(T)) {
         .int => |info| blk: {
@@ -457,10 +466,11 @@ fn writeHexValue(writer: *FixedBuffer, value: anytype, min_width: usize) !void {
         else => @compileError("zrstd {x} formatting supports integers only."),
     };
 
-    try writer.writeHexU64Lower(unsigned_value, min_width);
+    var scratch: [16]u8 = undefined;
+    try writer.writeAll(try fmt.hexU64Lower(&scratch, unsigned_value, min_width));
 }
 
-fn writeUnsignedDecimal(writer: *FixedBuffer, value: u64) !void {
+fn writeUnsignedDecimal(writer: anytype, value: u64) !void {
     var scratch: [20]u8 = undefined;
     var cursor = scratch.len;
     var remaining = value;
@@ -475,7 +485,7 @@ fn writeUnsignedDecimal(writer: *FixedBuffer, value: u64) !void {
     try writer.writeAll(scratch[cursor..]);
 }
 
-fn writeSignedDecimal(writer: *FixedBuffer, value: i64) !void {
+fn writeSignedDecimal(writer: anytype, value: i64) !void {
     if (value < 0) {
         try writer.writeByte('-');
         const magnitude = @as(u64, @intCast(-(value + 1))) + 1;
@@ -511,6 +521,29 @@ const DarwinSyscallResult = struct {
     }
 };
 
+/// Tiny streaming sink used by `debug.print*`.
+///
+/// The payload formatter intentionally writes segments straight to the target
+/// file descriptor instead of first building a large temporary line on the
+/// stack. That keeps hook-time logging usable even when the callback already
+/// needs a meaningful stack frame for its own work.
+const FdWriter = struct {
+    fd: usize,
+
+    fn writeAll(self: *FdWriter, bytes: []const u8) error{}!void {
+        @This().writeRaw(self.fd, bytes);
+    }
+
+    fn writeByte(self: *FdWriter, byte: u8) error{}!void {
+        var buf = [1]u8{byte};
+        @This().writeRaw(self.fd, &buf);
+    }
+
+    fn writeRaw(fd: usize, bytes: []const u8) void {
+        writeFdAll(fd, bytes);
+    }
+};
+
 /// Executes a raw Darwin/macOS `write(2)` syscall on arm64.
 ///
 /// Why this exists instead of calling libc:
@@ -528,15 +561,26 @@ fn darwinWriteSyscall(fd: usize, bytes: []const u8) DarwinSyscallResult {
     var nzcv: usize = 0;
     const rc = asm volatile (
         \\ svc #0x80
-        \\ mrs x16, nzcv
-        \\ str x16, [x3]
+        \\ mrs %[flags], nzcv
         : [ret] "={x0}" (-> usize),
+          [flags] "={x9}" (nzcv),
         : [arg0] "{x0}" (fd),
           [arg1] "{x1}" (@intFromPtr(bytes.ptr)),
           [arg2] "{x2}" (bytes.len),
-          [flag_ptr] "{x3}" (@intFromPtr(&nzcv)),
           [sysno] "{x16}" (darwin_sys_write),
-        : .{ .memory = true }
+        : .{
+            .memory = true,
+            // Darwin arm64 reports syscall failure through NZCV. Expose that
+            // side effect to the optimizer explicitly instead of relying on it
+            // to infer that `svc` followed by `mrs nzcv` mutates condition
+            // flags.
+            .nzcv = true,
+            // `x16` carries the syscall number on entry and is overwritten by
+            // the trap path before control returns to userspace. Mark it
+            // clobbered so Zig does not keep unrelated live values there
+            // across the inline assembly block.
+            .x16 = true,
+        }
     );
     return .{
         .rc = rc,
@@ -547,7 +591,7 @@ fn darwinWriteSyscall(fd: usize, bytes: []const u8) DarwinSyscallResult {
 /// Writes the full byte slice to the requested file descriptor via raw
 /// platform syscalls. Errors are intentionally swallowed because payload
 /// tracing must not destabilize the patched target process.
-pub fn writeAll(fd: usize, bytes: []const u8) void {
+fn writeFdAll(fd: usize, bytes: []const u8) void {
     var remaining = bytes;
     while (remaining.len != 0) {
         switch (builtin.os.tag) {
@@ -576,6 +620,10 @@ pub fn writeAll(fd: usize, bytes: []const u8) void {
             else => unreachable,
         }
     }
+}
+
+pub fn writeAll(fd: usize, bytes: []const u8) void {
+    writeFdAll(fd, bytes);
 }
 
 pub inline fn writeStdout(bytes: []const u8) void {
@@ -636,14 +684,8 @@ export fn memset(dest: ?*anyopaque, value: c_int, len: usize) callconv(.c) ?*any
 }
 
 fn writeFormat(fd: usize, comptime fmt_str: []const u8, args: anytype) void {
-    var buffer: [default_print_buffer_len]u8 = undefined;
-    const rendered = formatInto(&buffer, fmt_str, args) catch |err| switch (err) {
-        error.NoSpaceLeft => {
-            writeAll(fd, "<zrstd: formatted output truncated>\n");
-            return;
-        },
-    };
-    writeAll(fd, rendered);
+    var writer = FdWriter{ .fd = fd };
+    formatIntoWriter(&writer, fmt_str, args) catch unreachable;
 }
 
 test "hex helpers render stable lowercase output" {
