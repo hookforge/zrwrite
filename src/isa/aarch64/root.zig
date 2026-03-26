@@ -27,6 +27,37 @@ pub const planWindow = replay.planWindow;
 pub const applyReplay = replay.applyReplay;
 pub const replayPlanName = replay.replayPlanName;
 
+pub const SemanticInteriorEntryKind = enum {
+    terminal_control,
+    linear_semantic_slice,
+};
+
+pub const SemanticInteriorEntry = struct {
+    target_index: usize,
+    fallthrough_index: usize,
+    offset: usize,
+    kind: SemanticInteriorEntryKind,
+};
+
+pub const SemanticInteriorEntryLayout = struct {
+    count: usize = 0,
+    total_size: usize = 0,
+    entries: [max_stolen_instruction_count]SemanticInteriorEntry = undefined,
+
+    pub fn addressForTargetIndex(
+        self: *const SemanticInteriorEntryLayout,
+        base_address: u64,
+        target_index: usize,
+    ) ?u64 {
+        for (self.entries[0..self.count]) |entry| {
+            if (entry.target_index == target_index) {
+                return base_address + entry.offset;
+            }
+        }
+        return null;
+    }
+};
+
 /// Per-hook parameters used when synthesizing the injected AArch64 instrument
 /// bridge.
 ///
@@ -67,7 +98,29 @@ pub const InstrumentStubOptions = struct {
     /// Emits BTI-compatible landing pads for injected entrypoints when the
     /// target image advertises Branch Target Identification.
     enable_bti: bool = false,
+    /// Operating-system-specific syscall ABI used by the optional inline
+    /// `log_message` fast path.
+    ///
+    /// Why this is explicit instead of "always Linux":
+    /// - the bridge-level log-message helper is intentionally tiny and cannot
+    ///   rely on a full user payload just to print one static string
+    /// - Linux/AArch64 and Darwin/arm64 use different trap registers and SVC
+    ///   immediates for the same conceptual `write(2, buf, len)` operation
+    /// - using the Linux encoding on macOS does not merely "drop the log"; it
+    ///   actively executes the wrong supervisor call and can terminate the
+    ///   target process as soon as the hook fires
+    ///
+    /// Current scope is intentionally narrow:
+    /// - ELF backend => Linux raw `write` syscall
+    /// - Mach-O backend => Darwin raw `write` syscall
+    /// - richer printing should still live in user payload code / zrstd
+    debug_write_abi: DebugWriteAbi = .linux_aarch64,
     log_message: []const u8,
+};
+
+pub const DebugWriteAbi = enum {
+    linux_aarch64,
+    darwin_arm64,
 };
 
 const HookLayout = struct {
@@ -85,6 +138,13 @@ const HookLayout = struct {
     runtime_site_linked_address_offset: usize = @offsetOf(HookContext, "runtime") + @offsetOf(HookRuntimeInfo, "site_linked_address"),
     runtime_site_runtime_address_offset: usize = @offsetOf(HookContext, "runtime") + @offsetOf(HookRuntimeInfo, "site_runtime_address"),
     scratch_offset: usize = std.mem.alignForward(usize, @sizeOf(HookContext) + @sizeOf(u64), 16) - @sizeOf(u64),
+};
+
+const semantic_terminal_entry_body_size: usize = @sizeOf(u32) + long_detour_size + long_detour_size;
+
+const SemanticInteriorEntryPlan = struct {
+    kind: SemanticInteriorEntryKind,
+    fallthrough_index: usize,
 };
 
 comptime {
@@ -151,6 +211,133 @@ fn windowNeedsRawTrampoline(window_plan: WindowPlan) bool {
         }
     }
     return false;
+}
+
+pub fn planSemanticInteriorEntryLayout(
+    window_plan: WindowPlan,
+    enable_bti: bool,
+) SemanticInteriorEntryLayout {
+    var layout = SemanticInteriorEntryLayout{};
+    const prefix_size = trampolineEntryPrefixSize(enable_bti);
+
+    for (1..window_plan.count) |target_index| {
+        const plan = planSemanticInteriorEntryForTarget(window_plan, target_index) orelse continue;
+        layout.entries[layout.count] = .{
+            .target_index = target_index,
+            .fallthrough_index = plan.fallthrough_index,
+            .offset = layout.total_size,
+            .kind = plan.kind,
+        };
+        layout.count += 1;
+        layout.total_size += prefix_size + semanticInteriorEntryBodySize(
+            window_plan,
+            target_index,
+            plan,
+        );
+    }
+
+    return layout;
+}
+
+pub fn supportsSemanticInteriorEntry(window_plan: WindowPlan, target_index: usize) bool {
+    return planSemanticInteriorEntryForTarget(window_plan, target_index) != null;
+}
+
+pub fn buildSemanticInteriorEntries(
+    allocator: std.mem.Allocator,
+    window_plan: WindowPlan,
+    layout: SemanticInteriorEntryLayout,
+    base_address: u64,
+    trampoline_address: u64,
+    site_address: u64,
+    enable_bti: bool,
+) ![]u8 {
+    var bytes = try allocator.alloc(u8, layout.total_size);
+    errdefer allocator.free(bytes);
+    @memset(bytes, 0);
+
+    for (layout.entries[0..layout.count]) |entry| {
+        const replay_plan = switch (window_plan.step(entry.target_index)) {
+            .semantic => |plan| plan,
+            .raw => unreachable,
+        };
+        var cursor = entry.offset;
+        if (enable_bti) {
+            writeU32(bytes[cursor .. cursor + 4], bti_jc_instruction);
+            cursor += 4;
+        }
+
+        switch (entry.kind) {
+            .terminal_control => {
+                const branch_instruction_address = base_address + cursor;
+                const fallthrough_detour_offset = cursor + @sizeOf(u32);
+                const taken_detour_offset = fallthrough_detour_offset + long_detour_size;
+                const taken_detour_address = base_address + taken_detour_offset;
+                const fallthrough_target = try semanticInteriorFallthroughTarget(
+                    window_plan,
+                    entry.fallthrough_index,
+                    trampoline_address,
+                    site_address,
+                    enable_bti,
+                );
+
+                writeU32(
+                    bytes[cursor .. cursor + 4],
+                    try encodeSemanticInteriorTerminalBranch(
+                        replay_plan,
+                        branch_instruction_address,
+                        taken_detour_address,
+                    ),
+                );
+                try writeResumeDetour(
+                    bytes[fallthrough_detour_offset .. fallthrough_detour_offset + long_detour_size],
+                    base_address + fallthrough_detour_offset,
+                    fallthrough_target,
+                );
+                try writeResumeDetour(
+                    bytes[taken_detour_offset .. taken_detour_offset + long_detour_size],
+                    base_address + taken_detour_offset,
+                    semanticTerminalTakenTarget(replay_plan),
+                );
+            },
+            .linear_semantic_slice => {
+                for (entry.target_index..entry.fallthrough_index) |step_index| {
+                    const step_plan = switch (window_plan.step(step_index)) {
+                        .semantic => |plan| plan,
+                        .raw => unreachable,
+                    };
+                    try emitDirectSemanticReplay(
+                        bytes,
+                        &cursor,
+                        base_address,
+                        step_plan,
+                    );
+                }
+
+                try writeResumeDetour(
+                    bytes[cursor .. cursor + long_detour_size],
+                    base_address + cursor,
+                    try semanticInteriorFallthroughTarget(
+                        window_plan,
+                        entry.fallthrough_index,
+                        trampoline_address,
+                        site_address,
+                        enable_bti,
+                    ),
+                );
+            },
+        }
+    }
+
+    return bytes;
+}
+
+pub fn semanticInteriorTargetAddress(
+    layout: SemanticInteriorEntryLayout,
+    base_address: u64,
+    target_index: usize,
+) ?u64 {
+    return layout.addressForTargetIndex(base_address, target_index);
 }
 
 fn trampolineEntryPrefixSize(enable_bti: bool) usize {
@@ -452,7 +639,13 @@ pub fn buildInstrumentStub(options: InstrumentStubOptions) ![]u8 {
         options.enable_bti,
     );
     if (message_literal_index) |literal_index| {
-        try emitDebugWrite(&builder, layout, literal_index, options.log_message.len);
+        try emitDebugWrite(
+            &builder,
+            layout,
+            literal_index,
+            options.log_message.len,
+            options.debug_write_abi,
+        );
     }
     try emitCallbackInvocation(&builder, layout, options.callback_address, options.stub_address);
 
@@ -589,19 +782,44 @@ fn emitDebugWrite(
     layout: HookLayout,
     message_literal_index: u32,
     log_message_len: usize,
+    abi: DebugWriteAbi,
 ) !void {
+    // The bridge-level log helper intentionally avoids any high-level runtime
+    // dependency: it emits one raw `write(2, message, len)` system call.
+    //
+    // This tiny fast path is useful for bring-up / smoke tests, but it also
+    // means the stub must speak the *target* OS syscall ABI exactly. The Mach-O
+    // ImHex stress case exposed this the hard way: using Linux's `x8 + svc #0`
+    // sequence on macOS/arm64 made the process exit as soon as the hook fired.
+    //
+    // Supported ABIs today:
+    // - Linux/AArch64:  x8 = syscall number, `svc #0`
+    // - Darwin/arm64:   x16 = syscall number, `svc #0x80`
+    const encoding = switch (abi) {
+        .linux_aarch64 => DebugWriteEncoding{
+            .number_register = 8,
+            .write_syscall_number = 64,
+            .svc_immediate = 0,
+        },
+        .darwin_arm64 => DebugWriteEncoding{
+            .number_register = 16,
+            .write_syscall_number = 4,
+            .svc_immediate = 0x80,
+        },
+    };
 
-    // Linux/AArch64 raw syscall ABI:
-    // - x0: fd
-    // - x1: buffer
-    // - x2: length
-    // - x8: syscall number
     _ = try builder.emitU32(encodeMovZ(0, 1));
     try emitLoadRuntimeAddressFromLiteralIndex(builder, layout, 1, message_literal_index, 9);
     _ = try builder.emitU32(encodeMovZ(2, @intCast(log_message_len)));
-    _ = try builder.emitU32(encodeMovZ(8, 64));
-    _ = try builder.emitU32(svc_0);
+    _ = try builder.emitU32(encodeMovZ(encoding.number_register, encoding.write_syscall_number));
+    _ = try builder.emitU32(encodeSvcImmediate(encoding.svc_immediate));
 }
+
+const DebugWriteEncoding = struct {
+    number_register: u5,
+    write_syscall_number: u16,
+    svc_immediate: u16,
+};
 
 fn emitCallbackInvocation(
     builder: *InstrumentStubBuilder,
@@ -632,6 +850,319 @@ fn emitReplayBypassGuard(
     _ = try builder.emitU32(encodeLdrUnsigned64(17, 31, layout.runtime_site_runtime_address_offset));
     _ = try builder.emitU32(encodeCmpRegister64(16, 17));
     return builder.emitU32(0);
+}
+
+fn semanticInteriorEntryBodySize(
+    window_plan: WindowPlan,
+    target_index: usize,
+    plan: SemanticInteriorEntryPlan,
+) usize {
+    return switch (plan.kind) {
+        .terminal_control => semantic_terminal_entry_body_size,
+        .linear_semantic_slice => blk: {
+            var total: usize = long_detour_size;
+            for (target_index..plan.fallthrough_index) |step_index| {
+                const replay_plan = switch (window_plan.step(step_index)) {
+                    .semantic => |value| value,
+                    .raw => unreachable,
+                };
+                total += directSemanticReplaySize(replay_plan) orelse unreachable;
+            }
+            break :blk total;
+        },
+    };
+}
+
+/// Plans a dedicated semantic interior-entry trampoline for one widened-window
+/// step, if that step may safely receive retargeted incoming branches.
+///
+/// The generated entrypoint runs on live architectural machine state. It does
+/// not reconstruct a `HookContext` and it does not tail-call back into the
+/// main instrument bridge. That keeps the runtime small, but it also means the
+/// planner must reject any interior target whose remaining suffix cannot be
+/// reproduced directly in the injected executable region.
+fn planSemanticInteriorEntryForTarget(
+    window_plan: WindowPlan,
+    target_index: usize,
+) ?SemanticInteriorEntryPlan {
+    if (target_index == 0 or target_index >= window_plan.count) return null;
+
+    const replay_plan = switch (window_plan.step(target_index)) {
+        .semantic => |plan| plan,
+        .raw => return null,
+    };
+
+    switch (replay_plan) {
+        .conditional_branch,
+        .compare_and_branch,
+        .test_bit_and_branch,
+        => return planTerminalSemanticInteriorEntry(window_plan, target_index),
+        else => {},
+    }
+
+    return planLinearSemanticInteriorEntry(window_plan, target_index);
+}
+
+/// Plans the "semantic terminal branch" interior-entry shape.
+///
+/// This form is used when the interior target itself is a control-flow step
+/// (`b.cond`, `cbz`, `tbz`) and every later displaced instruction is either
+/// raw or absent. The generated entry can therefore:
+/// - evaluate the semantic branch directly on live machine state
+/// - jump to the original taken edge
+/// - or fall through into the relocated raw trampoline suffix
+fn planTerminalSemanticInteriorEntry(
+    window_plan: WindowPlan,
+    target_index: usize,
+) ?SemanticInteriorEntryPlan {
+    for (window_plan.steps[target_index + 1 .. window_plan.count]) |step| {
+        if (step.usesSemanticReplay()) return null;
+    }
+    return .{
+        .kind = .terminal_control,
+        .fallthrough_index = @min(target_index + 1, window_plan.count),
+    };
+}
+
+/// Plans the "direct semantic slice" interior-entry shape.
+///
+/// We walk forward from the targeted semantic step and consume a contiguous
+/// fallthrough-only semantic suffix. Each step in that slice must have a tiny
+/// direct-execution lowering that operates on the live CPU register file.
+///
+/// Planning stops at the first raw step, which becomes the relocated
+/// fallthrough target inside the ordinary trampoline. If no raw step remains,
+/// fallthrough resumes after the widened patch window.
+fn planLinearSemanticInteriorEntry(
+    window_plan: WindowPlan,
+    target_index: usize,
+) ?SemanticInteriorEntryPlan {
+    var cursor = target_index;
+    while (cursor < window_plan.count) : (cursor += 1) {
+        const replay_plan = switch (window_plan.step(cursor)) {
+            .semantic => |plan| plan,
+            .raw => break,
+        };
+        if (windowStepTerminatesControlFlow(replay_plan)) return null;
+        _ = directSemanticReplaySize(replay_plan) orelse return null;
+    }
+    if (cursor == target_index) return null;
+
+    for (window_plan.steps[cursor..window_plan.count]) |step| {
+        if (step.usesSemanticReplay()) return null;
+    }
+    return .{
+        .kind = .linear_semantic_slice,
+        .fallthrough_index = cursor,
+    };
+}
+
+fn semanticInteriorFallthroughTarget(
+    window_plan: WindowPlan,
+    fallthrough_index: usize,
+    trampoline_address: u64,
+    site_address: u64,
+    enable_bti: bool,
+) !u64 {
+    if (fallthrough_index == 0 or fallthrough_index > window_plan.count) {
+        return error.InvalidAddress;
+    }
+
+    // `fallthrough_index == window_plan.count` means the interior entry
+    // replayed the whole remaining semantic suffix itself, so control resumes
+    // at the first instruction after the stolen window.
+    if (fallthrough_index == window_plan.count) {
+        return site_address + window_plan.count * 4;
+    }
+
+    if (trampoline_address == 0) return error.MissingTrampolineAddress;
+    return trampoline_address +
+        trampolineEntryPrefixSize(enable_bti) +
+        fallthrough_index * 4;
+}
+
+fn directSemanticReplaySize(replay_plan: ReplayPlan) ?usize {
+    return switch (replay_plan) {
+        .adr => |op| if (op.rd == 31) 4 else 8,
+        .adrp => 4,
+        .ldr_literal_w => |op| if (op.rt == 31) null else 8,
+        .ldr_literal_x => |op| if (op.rt == 31) null else 8,
+        .ldrsw_literal => |op| if (op.rt == 31) null else 8,
+        .ldr_unsigned_w,
+        .ldr_unsigned_x,
+        .ldrsw_unsigned,
+        .prfm_literal,
+        .compare_immediate,
+        .compare_register,
+        .add_sub_immediate,
+        => 4,
+        else => null,
+    };
+}
+
+fn windowStepTerminatesControlFlow(replay_plan: ReplayPlan) bool {
+    return switch (replay_plan) {
+        .branch,
+        .branch_with_link,
+        .conditional_branch,
+        .compare_and_branch,
+        .test_bit_and_branch,
+        => true,
+        else => false,
+    };
+}
+
+/// Emits one directly executable semantic replay step into a semantic
+/// interior-entry trampoline.
+///
+/// Unlike the main bridge replay helpers, this code runs directly on the live
+/// CPU register file instead of mutating a `HookContext`. That lets incoming
+/// branches land inside widened semantic windows without paying the full stub
+/// setup cost, but only for instructions whose semantics can be expressed as a
+/// small fixed instruction sequence at the new location.
+fn emitDirectSemanticReplay(
+    bytes: []u8,
+    cursor: *usize,
+    base_address: u64,
+    replay_plan: ReplayPlan,
+) !void {
+    switch (replay_plan) {
+        .adr => |op| {
+            if (op.rd == 31) {
+                writeU32(bytes[cursor.* .. cursor.* + 4], nop);
+                cursor.* += 4;
+                return;
+            }
+            writeU32(
+                bytes[cursor.* .. cursor.* + 4],
+                try encodeAdrpTarget(op.rd, base_address + cursor.*, op.absolute),
+            );
+            cursor.* += 4;
+            writeU32(
+                bytes[cursor.* .. cursor.* + 4],
+                encodeAddLo12Immediate(op.rd, op.rd, op.absolute),
+            );
+            cursor.* += 4;
+        },
+        .adrp => |op| {
+            const opcode = if (op.rd == 31)
+                nop
+            else
+                try encodeAdrpTarget(op.rd, base_address + cursor.*, op.page_base);
+            writeU32(bytes[cursor.* .. cursor.* + 4], opcode);
+            cursor.* += 4;
+        },
+        .ldr_literal_w => |op| {
+            writeU32(
+                bytes[cursor.* .. cursor.* + 4],
+                try encodeAdrpTarget(op.rt, base_address + cursor.*, op.literal_address),
+            );
+            cursor.* += 4;
+            writeU32(
+                bytes[cursor.* .. cursor.* + 4],
+                encodeLdrUnsigned32(op.rt, op.rt, @intCast(op.literal_address & 0xFFF)),
+            );
+            cursor.* += 4;
+        },
+        .ldr_literal_x => |op| {
+            writeU32(
+                bytes[cursor.* .. cursor.* + 4],
+                try encodeAdrpTarget(op.rt, base_address + cursor.*, op.literal_address),
+            );
+            cursor.* += 4;
+            writeU32(
+                bytes[cursor.* .. cursor.* + 4],
+                encodeLdrUnsigned64(op.rt, op.rt, @intCast(op.literal_address & 0xFFF)),
+            );
+            cursor.* += 4;
+        },
+        .ldrsw_literal => |op| {
+            writeU32(
+                bytes[cursor.* .. cursor.* + 4],
+                try encodeAdrpTarget(op.rt, base_address + cursor.*, op.literal_address),
+            );
+            cursor.* += 4;
+            writeU32(
+                bytes[cursor.* .. cursor.* + 4],
+                encodeLdrswUnsigned(op.rt, op.rt, @intCast(op.literal_address & 0xFFF)),
+            );
+            cursor.* += 4;
+        },
+        .ldr_unsigned_w => |op| {
+            writeU32(bytes[cursor.* .. cursor.* + 4], encodeLdrUnsigned32(op.rt, op.rn, op.byte_offset));
+            cursor.* += 4;
+        },
+        .ldr_unsigned_x => |op| {
+            writeU32(bytes[cursor.* .. cursor.* + 4], encodeLdrUnsigned64(op.rt, op.rn, op.byte_offset));
+            cursor.* += 4;
+        },
+        .ldrsw_unsigned => |op| {
+            writeU32(bytes[cursor.* .. cursor.* + 4], encodeLdrswUnsigned(op.rt, op.rn, op.byte_offset));
+            cursor.* += 4;
+        },
+        .prfm_literal => {
+            writeU32(bytes[cursor.* .. cursor.* + 4], nop);
+            cursor.* += 4;
+        },
+        .compare_immediate => |op| {
+            writeU32(bytes[cursor.* .. cursor.* + 4], encodeCmpImmediate(op.rn, op.immediate, op.is_64bit));
+            cursor.* += 4;
+        },
+        .compare_register => |op| {
+            writeU32(
+                bytes[cursor.* .. cursor.* + 4],
+                encodeCmpShiftedRegister(op.rn, op.rm, op.shift, op.shift_amount, op.is_64bit),
+            );
+            cursor.* += 4;
+        },
+        .add_sub_immediate => |op| {
+            writeU32(
+                bytes[cursor.* .. cursor.* + 4],
+                encodeAddSubImmediate(op.rd, op.rn, op.immediate, op.is_64bit, op.is_sub),
+            );
+            cursor.* += 4;
+        },
+        else => return error.UnsupportedMultiInstructionPatchWindow,
+    }
+}
+
+/// Extracts the architectural taken target for a terminal semantic branch step.
+fn semanticTerminalTakenTarget(replay_plan: ReplayPlan) u64 {
+    return switch (replay_plan) {
+        .conditional_branch => |op| op.target,
+        .compare_and_branch => |op| op.target,
+        .test_bit_and_branch => |op| op.target,
+        else => unreachable,
+    };
+}
+
+/// Encodes the small in-stub branch that dispatches to the taken detour of one
+/// semantic interior-entry trampoline.
+///
+/// The branch always targets another instruction inside the same generated
+/// entry blob, so the immediate is expected to stay comfortably in range.
+fn encodeSemanticInteriorTerminalBranch(
+    replay_plan: ReplayPlan,
+    from_address: u64,
+    taken_detour_address: u64,
+) !u32 {
+    const delta = @as(i64, @intCast(taken_detour_address)) - @as(i64, @intCast(from_address));
+    return switch (replay_plan) {
+        .conditional_branch => |op| try encodeConditionalBranchDelta(op.cond, delta),
+        .compare_and_branch => |op| try encodeCompareAndBranchDelta(
+            op.rt,
+            delta,
+            !op.branch_on_zero,
+            op.is_64bit,
+        ),
+        .test_bit_and_branch => |op| try encodeTestBitAndBranchDelta(
+            op.rt,
+            op.bit_index,
+            delta,
+            !op.branch_on_zero,
+        ),
+        else => unreachable,
+    };
 }
 
 fn emitReplaySequence(
@@ -682,6 +1213,40 @@ fn emitReplaySequence(
         return;
     }
 
+    if (window_plan.supportsTerminalControlToRawSuffixReplay()) {
+        const semantic_prefix_len = window_plan.leadingSemanticStepCount();
+        std.debug.assert(semantic_prefix_len >= 1);
+        std.debug.assert(semantic_prefix_len < window_plan.count);
+
+        for (0..semantic_prefix_len - 1) |index| {
+            switch (window_plan.step(index)) {
+                .semantic => |plan| try emitSemanticReplayPlanAt(
+                    builder,
+                    layout,
+                    options.site_address + index * 4,
+                    plan,
+                ),
+                .raw => unreachable,
+            }
+        }
+
+        const raw_suffix_target =
+            options.trampoline_address +
+            trampolineEntryPrefixSize(options.enable_bti) +
+            semantic_prefix_len * 4;
+
+        switch (window_plan.step(semantic_prefix_len - 1)) {
+            .semantic => |plan| try emitTerminalControlReplayToRawSuffix(
+                builder,
+                layout,
+                plan,
+                raw_suffix_target,
+            ),
+            .raw => unreachable,
+        }
+        return;
+    }
+
     if (window_plan.supportsSequentialSemanticReplay()) {
         for (0..window_plan.count) |index| {
             switch (window_plan.step(index)) {
@@ -698,6 +1263,105 @@ fn emitReplaySequence(
     }
 
     return error.UnsupportedMultiInstructionPatchWindow;
+}
+
+/// Emits the last semantic control-flow instruction of a widened window whose
+/// fallthrough path continues in a copied raw trampoline suffix.
+///
+/// Why this helper exists instead of reusing `emitSemanticReplayPlanAt(...)`:
+/// - the ordinary semantic branch helpers treat fallthrough as "resume at the
+///   original next linked instruction"
+/// - once a widened patch window has displaced additional instructions after
+///   that branch, the original fallthrough address now lies inside the patched
+///   detour site and can no longer execute in place
+/// - the correct fallthrough therefore becomes "resume at the matching
+///   mid-trampoline entry" while the taken path still jumps to the branch's
+///   original linked target
+fn emitTerminalControlReplayToRawSuffix(
+    builder: *InstrumentStubBuilder,
+    layout: HookLayout,
+    replay_plan: ReplayPlan,
+    raw_suffix_linked_address: u64,
+) !void {
+    switch (replay_plan) {
+        .conditional_branch => |op| {
+            _ = try builder.emitU32(encodeLdrUnsigned32(9, 31, layout.cpsr_offset));
+            _ = try builder.emitU32(encodeMsrNzcv(9));
+            const branch_to_taken = try builder.emitU32(0);
+            try emitStoreContextPcLinkedAddress(builder, layout, raw_suffix_linked_address);
+            const branch_to_done = try builder.emitU32(0);
+            const taken_offset = builder.code.items.len;
+            builder.patchU32(
+                branch_to_taken,
+                try encodeConditionalBranchDelta(
+                    op.cond,
+                    @as(i64, @intCast(taken_offset)) - @as(i64, @intCast(branch_to_taken)),
+                ),
+            );
+            try emitStoreContextPcLinkedAddress(builder, layout, op.target);
+            const done_offset = builder.code.items.len;
+            builder.patchU32(
+                branch_to_done,
+                try encodeBranchDelta(
+                    @as(i64, @intCast(done_offset)) - @as(i64, @intCast(branch_to_done)),
+                ),
+            );
+        },
+        .compare_and_branch => |op| {
+            if (op.is_64bit) {
+                _ = try builder.emitU32(encodeLdrUnsigned64(9, 31, xRegisterOffset(layout, op.rt)));
+            } else {
+                _ = try builder.emitU32(encodeLdrUnsigned32(9, 31, xRegisterOffset(layout, op.rt)));
+            }
+            const branch_to_taken = try builder.emitU32(0);
+            try emitStoreContextPcLinkedAddress(builder, layout, raw_suffix_linked_address);
+            const branch_to_done = try builder.emitU32(0);
+            const taken_offset = builder.code.items.len;
+            builder.patchU32(
+                branch_to_taken,
+                try encodeCompareAndBranchDelta(
+                    9,
+                    @as(i64, @intCast(taken_offset)) - @as(i64, @intCast(branch_to_taken)),
+                    !op.branch_on_zero,
+                    op.is_64bit,
+                ),
+            );
+            try emitStoreContextPcLinkedAddress(builder, layout, op.target);
+            const done_offset = builder.code.items.len;
+            builder.patchU32(
+                branch_to_done,
+                try encodeBranchDelta(
+                    @as(i64, @intCast(done_offset)) - @as(i64, @intCast(branch_to_done)),
+                ),
+            );
+        },
+        .test_bit_and_branch => |op| {
+            _ = try builder.emitU32(encodeLdrUnsigned64(9, 31, xRegisterOffset(layout, op.rt)));
+            const branch_to_taken = try builder.emitU32(0);
+            try emitStoreContextPcLinkedAddress(builder, layout, raw_suffix_linked_address);
+            const branch_to_done = try builder.emitU32(0);
+            const taken_offset = builder.code.items.len;
+            builder.patchU32(
+                branch_to_taken,
+                try encodeTestBitAndBranchDelta(
+                    9,
+                    op.bit_index,
+                    @as(i64, @intCast(taken_offset)) - @as(i64, @intCast(branch_to_taken)),
+                    !op.branch_on_zero,
+                ),
+            );
+            try emitStoreContextPcLinkedAddress(builder, layout, op.target);
+            const done_offset = builder.code.items.len;
+            builder.patchU32(
+                branch_to_done,
+                try encodeBranchDelta(
+                    @as(i64, @intCast(done_offset)) - @as(i64, @intCast(branch_to_done)),
+                ),
+            );
+        },
+        .add_sub_immediate => return error.UnsupportedMultiInstructionPatchWindow,
+        else => return error.UnsupportedMultiInstructionPatchWindow,
+    }
 }
 
 /// Emits semantic replay for one displaced instruction at its original linked
@@ -739,6 +1403,18 @@ fn emitSemanticReplayPlanAt(
             _ = try builder.emitU32(encodeStrUnsigned64(10, 31, xRegisterOffset(layout, op.rt)));
             try emitStoreContextPcLinkedAddress(builder, layout, next_pc);
         },
+        .ldr_unsigned_w => |op| {
+            try emitLoadContextBaseRegister(builder, layout, 9, op.rn);
+            _ = try builder.emitU32(encodeLdrUnsigned32(10, 9, op.byte_offset));
+            _ = try builder.emitU32(encodeStrUnsigned64(10, 31, xRegisterOffset(layout, op.rt)));
+            try emitStoreContextPcLinkedAddress(builder, layout, next_pc);
+        },
+        .ldr_unsigned_x => |op| {
+            try emitLoadContextBaseRegister(builder, layout, 9, op.rn);
+            _ = try builder.emitU32(encodeLdrUnsigned64(10, 9, op.byte_offset));
+            _ = try builder.emitU32(encodeStrUnsigned64(10, 31, xRegisterOffset(layout, op.rt)));
+            try emitStoreContextPcLinkedAddress(builder, layout, next_pc);
+        },
         .ldr_literal_s => |op| {
             const fp_offset = fpRegisterOffset(layout, op.rt);
             try emitLoadRuntimeAddress(builder, layout, 9, op.literal_address, 11);
@@ -769,6 +1445,22 @@ fn emitSemanticReplayPlanAt(
             try emitLoadRuntimeAddress(builder, layout, 9, op.literal_address, 11);
             _ = try builder.emitU32(encodeLdrswUnsigned(10, 9, 0));
             _ = try builder.emitU32(encodeStrUnsigned64(10, 31, xRegisterOffset(layout, op.rt)));
+            try emitStoreContextPcLinkedAddress(builder, layout, next_pc);
+        },
+        .ldrsw_unsigned => |op| {
+            try emitLoadContextBaseRegister(builder, layout, 9, op.rn);
+            _ = try builder.emitU32(encodeLdrswUnsigned(10, 9, op.byte_offset));
+            _ = try builder.emitU32(encodeStrUnsigned64(10, 31, xRegisterOffset(layout, op.rt)));
+            try emitStoreContextPcLinkedAddress(builder, layout, next_pc);
+        },
+        .add_sub_immediate => |op| {
+            if (op.is_64bit) {
+                _ = try builder.emitU32(encodeLdrUnsigned64(9, 31, xRegisterOffset(layout, op.rn)));
+            } else {
+                _ = try builder.emitU32(encodeLdrUnsigned32(9, 31, xRegisterOffset(layout, op.rn)));
+            }
+            _ = try builder.emitU32(encodeAddSubImmediate(9, 9, op.immediate, op.is_64bit, op.is_sub));
+            _ = try builder.emitU32(encodeStrUnsigned64(9, 31, xRegisterOffset(layout, op.rd)));
             try emitStoreContextPcLinkedAddress(builder, layout, next_pc);
         },
         .prfm_literal => {
@@ -932,6 +1624,23 @@ fn collectDirectResumeTargets(options: InstrumentStubOptions) DirectResumeTarget
             return targets;
         }
 
+        if (window_plan.supportsTerminalControlToRawSuffixReplay()) {
+            const semantic_prefix_len = window_plan.leadingSemanticStepCount();
+            const raw_suffix_target = options.trampoline_address +
+                trampolineEntryPrefixSize(options.enable_bti) +
+                semantic_prefix_len * 4;
+
+            appendTerminalControlResumeTargets(
+                &targets,
+                raw_suffix_target,
+                switch (window_plan.step(semantic_prefix_len - 1)) {
+                    .semantic => |plan| plan,
+                    .raw => unreachable,
+                },
+            );
+            return targets;
+        }
+
         if (window_plan.supportsSequentialSemanticReplay()) {
             appendSemanticResumeTargets(
                 &targets,
@@ -965,13 +1674,17 @@ fn appendSemanticResumeTargets(
         .adrp,
         .ldr_literal_w,
         .ldr_literal_x,
+        .ldr_unsigned_w,
+        .ldr_unsigned_x,
         .ldr_literal_s,
         .ldr_literal_d,
         .ldr_literal_q,
         .ldrsw_literal,
+        .ldrsw_unsigned,
         .prfm_literal,
         .compare_immediate,
         .compare_register,
+        .add_sub_immediate,
         => targets.appendUnique(next_pc),
         .branch => |op| targets.appendUnique(op.target),
         .branch_with_link => |op| targets.appendUnique(op.target),
@@ -987,6 +1700,28 @@ fn appendSemanticResumeTargets(
             targets.appendUnique(next_pc);
             targets.appendUnique(op.target);
         },
+    }
+}
+
+fn appendTerminalControlResumeTargets(
+    targets: *DirectResumeTargets,
+    raw_suffix_target: u64,
+    replay_plan: ReplayPlan,
+) void {
+    switch (replay_plan) {
+        .conditional_branch => |op| {
+            targets.appendUnique(raw_suffix_target);
+            targets.appendUnique(op.target);
+        },
+        .compare_and_branch => |op| {
+            targets.appendUnique(raw_suffix_target);
+            targets.appendUnique(op.target);
+        },
+        .test_bit_and_branch => |op| {
+            targets.appendUnique(raw_suffix_target);
+            targets.appendUnique(op.target);
+        },
+        else => unreachable,
     }
 }
 
@@ -1201,6 +1936,29 @@ fn emitStoreContextRegisterLinkedAddress(
     _ = try builder.emitU32(encodeStrUnsigned64(9, 31, xRegisterOffset(layout, reg)));
 }
 
+/// Loads the base register used by a semanticized memory operand.
+///
+/// AArch64 uses register 31 as two different architectural entities depending
+/// on the instruction class:
+/// - arithmetic / compare decode it as XZR/WZR
+/// - load/store addressing decodes it as SP
+///
+/// Widened semantic replay therefore cannot blindly reuse `xRegisterOffset()`
+/// here. The planner records the original `rn`, and this helper reconstructs
+/// the correct runtime base by selecting either `ctx.sp` or `ctx.regs.x[rn]`.
+fn emitLoadContextBaseRegister(
+    builder: *InstrumentStubBuilder,
+    layout: HookLayout,
+    dst: u5,
+    rn: u5,
+) !void {
+    if (rn == 31) {
+        _ = try builder.emitU32(encodeLdrUnsigned64(dst, 31, layout.sp_offset));
+        return;
+    }
+    _ = try builder.emitU32(encodeLdrUnsigned64(dst, 31, xRegisterOffset(layout, rn)));
+}
+
 fn xRegisterOffset(layout: HookLayout, reg: u5) usize {
     return layout.regs_offset + @as(usize, reg) * @sizeOf(u64);
 }
@@ -1363,6 +2121,32 @@ fn encodeCmpShiftedRegister(rn: u5, rm: u5, shift: u2, shift_amount: u6, is_64bi
         (@as(u32, rn) << 5);
 }
 
+/// Encodes `add/sub (immediate)` without flag writes.
+///
+/// This helper intentionally supports only the immediate shapes already proven
+/// by the planner:
+/// - unshifted 12-bit immediates
+/// - or `imm12 << 12` via `sh == 1`
+///
+/// That matches the common address-adjust and loop-index patterns we promote
+/// into semantic replay today.
+fn encodeAddSubImmediate(rd: u5, rn: u5, immediate: u64, is_64bit: bool, is_sub: bool) u32 {
+    const shifted = (immediate & 0xFFF) == 0 and immediate <= 0xFFF000;
+    const imm12: u12 = @intCast(if (shifted) immediate >> 12 else immediate);
+    std.debug.assert(@as(u64, imm12) << @as(u6, if (shifted) 12 else 0) == immediate);
+
+    const sf: u32 = if (is_64bit) 1 else 0;
+    const op: u32 = if (is_sub) 1 else 0;
+    const sh: u32 = if (shifted) 1 else 0;
+    return (sf << 31) |
+        (op << 30) |
+        0x1100_0000 |
+        (sh << 22) |
+        (@as(u32, imm12) << 10) |
+        (@as(u32, rn) << 5) |
+        rd;
+}
+
 fn encodeLdrLiteralDelta(rt: u5, byte_offset: usize) u32 {
     std.debug.assert((byte_offset & 0x3) == 0);
     const imm19: u19 = @intCast(byte_offset / 4);
@@ -1480,7 +2264,10 @@ fn signExtend(comptime bit_count: comptime_int, value: u64) i64 {
 }
 
 const nop: u32 = nop_instruction;
-const svc_0: u32 = 0xD400_0001;
+
+fn encodeSvcImmediate(immediate: u16) u32 {
+    return 0xD400_0001 | (@as(u32, immediate) << 5);
+}
 
 test "original trampoline resumes with a direct branch" {
     const trampoline_address: u64 = 0x1122_3344_5566_0000;
@@ -1511,6 +2298,63 @@ test "page-relative long detour stays stable across a PIE load bias" {
     try std.testing.expectEqual(encodeAddLo12Immediate(17, 17, linked_target), std.mem.readInt(u32, linked[4..8], .little));
     try std.testing.expectEqual(encodeBr(17), std.mem.readInt(u32, linked[8..12], .little));
     try std.testing.expectEqual(nop, std.mem.readInt(u32, linked[12..16], .little));
+}
+
+test "svc immediate encoder covers Linux and Darwin trap forms" {
+    try std.testing.expectEqual(@as(u32, 0xD400_0001), encodeSvcImmediate(0));
+    try std.testing.expectEqual(@as(u32, 0xD400_1001), encodeSvcImmediate(0x80));
+}
+
+test "terminal semantic branch to raw suffix exposes trampoline fallthrough target" {
+    const window = try planWindow(0x1000, &.{
+        0x7100_0A9F, // cmp w20, #2
+        0x5400_008B, // b.lt 0x1014
+        0xAA14_03E0, // mov x0, x20
+        0xAA13_03E1, // mov x1, x19
+    });
+
+    const targets = collectDirectResumeTargets(.{
+        .allocator = std.testing.allocator,
+        .site_address = 0x1000,
+        .callback_address = 0,
+        .trampoline_address = 0x8000,
+        .stub_address = 0,
+        .replay_plan = .{ .trampoline = {} },
+        .window_plan = window,
+        .enable_bti = false,
+        .debug_write_abi = .linux_aarch64,
+        .log_message = "",
+    });
+
+    try std.testing.expectEqual(@as(usize, 2), targets.count);
+    try std.testing.expectEqual(@as(u64, 0x8008), targets.values[0]);
+    try std.testing.expectEqual(@as(u64, 0x1014), targets.values[1]);
+}
+
+test "load plus terminal branch to raw suffix exposes trampoline fallthrough target" {
+    const window = try planWindow(0x1000, &.{
+        0xF940_13F3, // ldr x19, [sp, #0x20]
+        0xB400_0513, // cbz x19, 0x10a4
+        0xF940_17F4, // ldr x20, [sp, #0x28]
+        0xAA13_03E0, // mov x0, x19
+    });
+
+    const targets = collectDirectResumeTargets(.{
+        .allocator = std.testing.allocator,
+        .site_address = 0x1000,
+        .callback_address = 0,
+        .trampoline_address = 0x8000,
+        .stub_address = 0,
+        .replay_plan = .{ .trampoline = {} },
+        .window_plan = window,
+        .enable_bti = false,
+        .debug_write_abi = .linux_aarch64,
+        .log_message = "",
+    });
+
+    try std.testing.expectEqual(@as(usize, 2), targets.count);
+    try std.testing.expectEqual(@as(u64, 0x8008), targets.values[0]);
+    try std.testing.expectEqual(@as(u64, 0x10a4), targets.values[1]);
 }
 
 test "legacy absolute detour helper stores a literal 64-bit target" {

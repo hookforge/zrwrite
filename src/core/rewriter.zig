@@ -147,6 +147,19 @@ const ImageInjectionPlan = union(enum) {
     }
 };
 
+const SharedMachOPayloadState = struct {
+    /// File offset of the shared executable/read-only payload image.
+    primary_injection_offset: usize,
+    /// Size of the executable/read-only payload image.
+    primary_image_size: usize,
+    /// File offset of the writable payload image, when present.
+    writable_injection_offset: ?usize = null,
+    /// Size of the writable payload image.
+    writable_image_size: usize = 0,
+    /// Current linked base address of the writable payload image, when present.
+    writable_base_address: ?u64 = null,
+};
+
 /// Cache entry for the "inject once, attach many instrument hooks" model.
 ///
 /// User expectation is that one payload object behaves like one module:
@@ -161,6 +174,7 @@ const SharedInstrumentPayload = struct {
     binary_format: bundle.BinaryFormat,
     object_bytes: []u8,
     primary_base_address: u64,
+    macho: ?SharedMachOPayloadState = null,
 
     fn deinit(self: *SharedInstrumentPayload, allocator: std.mem.Allocator) void {
         allocator.free(self.object_bytes);
@@ -367,7 +381,8 @@ pub const Rewriter = struct {
         // Repeated instrument attachments of the same payload object should
         // look like multiple entry points into one payload module, not like N
         // silently duplicated modules with isolated global state.
-        const shared_payload = self.findSharedInstrumentPayload(binary_format, spec.payload_object_bytes);
+        const shared_payload_index = self.findSharedInstrumentPayloadIndex(binary_format, spec.payload_object_bytes);
+        const shared_payload = if (shared_payload_index) |index| self.shared_instrument_payloads.items[index] else null;
         return switch (input_view) {
             .elf => |view| self.addInstrumentHookObjectElf(
                 view,
@@ -380,6 +395,7 @@ pub const Rewriter = struct {
                 original_input_view.macho,
                 spec,
                 shared_payload,
+                shared_payload_index,
             ),
         };
     }
@@ -428,6 +444,7 @@ pub const Rewriter = struct {
         const needs_raw_trampoline = windowNeedsRawTrampoline(window_plan);
         const enable_bti = target_view.hasAarch64BtiProperty();
         const bti_prefix_size: usize = if (enable_bti) @sizeOf(u32) else 0;
+        const semantic_entry_layout = aarch64.planSemanticInteriorEntryLayout(window_plan, enable_bti);
         const payload_layout = try payload.analyzeObjectBytesForFormat(
             self.allocator,
             .elf,
@@ -444,7 +461,12 @@ pub const Rewriter = struct {
                 stolen_window_size + aarch64.long_detour_size + bti_prefix_size
         else
             0;
-        const stub_offset = std.mem.alignForward(usize, trampoline_offset + trampoline_size, 8);
+        const semantic_entry_offset = std.mem.alignForward(usize, trampoline_offset + trampoline_size, 8);
+        const stub_offset = std.mem.alignForward(
+            usize,
+            semantic_entry_offset + semantic_entry_layout.total_size,
+            8,
+        );
 
         const stub = try aarch64.buildInstrumentStub(.{
             .allocator = self.allocator,
@@ -455,6 +477,7 @@ pub const Rewriter = struct {
             .replay_plan = replay_plan,
             .window_plan = window_plan,
             .enable_bti = enable_bti,
+            .debug_write_abi = .linux_aarch64,
             .log_message = spec.log_message,
         });
         const stub_size = stub.len;
@@ -471,6 +494,10 @@ pub const Rewriter = struct {
             plan.payloadBaseAddress() + trampoline_offset
         else
             0;
+        const semantic_entry_address = if (semantic_entry_layout.total_size != 0)
+            plan.payloadBaseAddress() + semantic_entry_offset
+        else
+            0;
         const stub_address = plan.payloadBaseAddress() + stub_offset;
 
         const fixed_stub = try aarch64.buildInstrumentStub(.{
@@ -482,6 +509,7 @@ pub const Rewriter = struct {
             .replay_plan = replay_plan,
             .window_plan = window_plan,
             .enable_bti = enable_bti,
+            .debug_write_abi = .linux_aarch64,
             .log_message = spec.log_message,
         });
         defer self.allocator.free(fixed_stub);
@@ -541,6 +569,23 @@ pub const Rewriter = struct {
             }
         }
 
+        if (semantic_entry_layout.total_size != 0) {
+            const semantic_entries = try aarch64.buildSemanticInteriorEntries(
+                self.allocator,
+                window_plan,
+                semantic_entry_layout,
+                semantic_entry_address,
+                trampoline_address,
+                target.address,
+                enable_bti,
+            );
+            defer self.allocator.free(semantic_entries);
+            @memcpy(
+                output[plan.injectionOffset() + semantic_entry_offset .. plan.injectionOffset() + semantic_entry_offset + semantic_entries.len],
+                semantic_entries,
+            );
+        }
+
         @memcpy(output[plan.injectionOffset() + stub_offset .. plan.injectionOffset() + stub_offset + fixed_stub.len], fixed_stub);
 
         output = try finalizeInjectedOutput(self.allocator, target_view, output, plan, true);
@@ -558,6 +603,8 @@ pub const Rewriter = struct {
                 incoming_branches,
                 window_plan,
                 trampoline_address,
+                semantic_entry_address,
+                semantic_entry_layout,
                 enable_bti,
             );
         }
@@ -588,6 +635,7 @@ pub const Rewriter = struct {
         original_input_view: MachOView,
         spec: InstrumentObjectSpec,
         shared_payload: ?SharedInstrumentPayload,
+        shared_payload_index: ?usize,
     ) !InstrumentRewriteReport {
         const target_view: image_backend.View = .{ .macho = input_view };
         const original_target_view: image_backend.View = .{ .macho = original_input_view };
@@ -626,6 +674,10 @@ pub const Rewriter = struct {
         const needs_raw_trampoline = windowNeedsRawTrampoline(preliminary_window_plan);
         const enable_bti = target_view.hasAarch64BtiProperty();
         const bti_prefix_size: usize = if (enable_bti) @sizeOf(u32) else 0;
+        const preliminary_semantic_entry_layout = aarch64.planSemanticInteriorEntryLayout(
+            preliminary_window_plan,
+            enable_bti,
+        );
 
         const payload_layout = try payload.analyzeObjectBytesForFormat(
             self.allocator,
@@ -644,7 +696,12 @@ pub const Rewriter = struct {
                 stolen_window_size + aarch64.long_detour_size + bti_prefix_size
         else
             0;
-        const stub_offset = std.mem.alignForward(usize, trampoline_offset + trampoline_size, 8);
+        const semantic_entry_offset = std.mem.alignForward(usize, trampoline_offset + trampoline_size, 8);
+        const stub_offset = std.mem.alignForward(
+            usize,
+            semantic_entry_offset + preliminary_semantic_entry_layout.total_size,
+            8,
+        );
 
         const stub = try aarch64.buildInstrumentStub(.{
             .allocator = self.allocator,
@@ -655,6 +712,7 @@ pub const Rewriter = struct {
             .replay_plan = preliminary_replay_plan,
             .window_plan = preliminary_window_plan,
             .enable_bti = enable_bti,
+            .debug_write_abi = .darwin_arm64,
             .log_message = spec.log_message,
         });
         const stub_size = stub.len;
@@ -668,12 +726,19 @@ pub const Rewriter = struct {
             writable_image_size,
             16,
         );
+        if (shared_payload_index) |index| {
+            try self.validateSharedMachOPayloadPlanCompatibility(split_plan, index);
+        }
         const callback_address = if (shared_payload) |entry|
             entry.primary_base_address + payload_layout.entry_offset
         else
             split_plan.executable.payload_base_address + payload_layout.entry_offset;
         const trampoline_address = if (needs_raw_trampoline)
             split_plan.executable.payload_base_address + trampoline_offset
+        else
+            0;
+        const semantic_entry_address = if (preliminary_semantic_entry_layout.total_size != 0)
+            split_plan.executable.payload_base_address + semantic_entry_offset
         else
             0;
         const stub_address = split_plan.executable.payload_base_address + stub_offset;
@@ -695,6 +760,10 @@ pub const Rewriter = struct {
         );
         const finalized_replay_plan = finalized_window_plan.singleReplayPlan() orelse aarch64.ReplayPlan{ .trampoline = {} };
         const finalized_needs_raw_trampoline = windowNeedsRawTrampoline(finalized_window_plan);
+        const finalized_semantic_entry_layout = aarch64.planSemanticInteriorEntryLayout(
+            finalized_window_plan,
+            enable_bti,
+        );
 
         if (finalized_needs_raw_trampoline != needs_raw_trampoline) {
             recordRewriteDiagnostic(
@@ -703,6 +772,17 @@ pub const Rewriter = struct {
                     target.address,
                     if (needs_raw_trampoline) "true" else "false",
                     if (finalized_needs_raw_trampoline) "true" else "false",
+                },
+            );
+            return error.UnsupportedRelocatedPatchWindow;
+        }
+        if (finalized_semantic_entry_layout.total_size > preliminary_semantic_entry_layout.total_size) {
+            recordRewriteDiagnostic(
+                "Mach-O relocated patch window at 0x{x} needs larger semantic interior entries after segment-shift fixups ({d} bytes > reserved {d})",
+                .{
+                    target.address,
+                    finalized_semantic_entry_layout.total_size,
+                    preliminary_semantic_entry_layout.total_size,
                 },
             );
             return error.UnsupportedRelocatedPatchWindow;
@@ -717,6 +797,7 @@ pub const Rewriter = struct {
             .replay_plan = finalized_replay_plan,
             .window_plan = finalized_window_plan,
             .enable_bti = enable_bti,
+            .debug_write_abi = .darwin_arm64,
             .log_message = spec.log_message,
         });
         defer self.allocator.free(finalized_stub);
@@ -796,6 +877,23 @@ pub const Rewriter = struct {
             }
         }
 
+        if (finalized_semantic_entry_layout.total_size != 0) {
+            const semantic_entries = try aarch64.buildSemanticInteriorEntries(
+                self.allocator,
+                finalized_window_plan,
+                finalized_semantic_entry_layout,
+                semantic_entry_address,
+                trampoline_address,
+                finalized_target.address,
+                enable_bti,
+            );
+            defer self.allocator.free(semantic_entries);
+            @memcpy(
+                output[split_plan.executable.injection_offset + semantic_entry_offset .. split_plan.executable.injection_offset + semantic_entry_offset + semantic_entries.len],
+                semantic_entries,
+            );
+        }
+
         @memcpy(
             output[split_plan.executable.injection_offset + stub_offset .. split_plan.executable.injection_offset + stub_offset + finalized_stub.len],
             finalized_stub,
@@ -823,15 +921,34 @@ pub const Rewriter = struct {
                 incoming_branches,
                 finalized_window_plan,
                 trampoline_address,
+                semantic_entry_address,
+                finalized_semantic_entry_layout,
                 enable_bti,
             );
         }
 
+        if (shared_payload_index) |index| {
+            try self.refreshSharedMachOPayloadAfterPlan(
+                output,
+                finalized_target_view,
+                split_plan,
+                index,
+                spec.handler_symbol,
+            );
+        }
+
         if (shared_payload == null) {
-            try self.rememberSharedInstrumentPayload(
+            try self.rememberSharedInstrumentPayloadMachO(
                 .macho,
                 spec.payload_object_bytes,
                 split_plan.executable.payload_base_address,
+                .{
+                    .primary_injection_offset = split_plan.executable.injection_offset,
+                    .primary_image_size = payload_layout.image_size,
+                    .writable_injection_offset = if (split_plan.writable) |region| region.injection_offset else null,
+                    .writable_image_size = payload_layout.writable_image_size,
+                    .writable_base_address = if (split_plan.writable) |region| region.payload_base_address else null,
+                },
             );
         }
         try self.rememberMachOSplitOccupancy(split_plan);
@@ -848,15 +965,15 @@ pub const Rewriter = struct {
         };
     }
 
-    fn findSharedInstrumentPayload(
+    fn findSharedInstrumentPayloadIndex(
         self: *const Rewriter,
         binary_format: bundle.BinaryFormat,
         object_bytes: []const u8,
-    ) ?SharedInstrumentPayload {
-        for (self.shared_instrument_payloads.items) |entry| {
+    ) ?usize {
+        for (self.shared_instrument_payloads.items, 0..) |entry, index| {
             if (entry.binary_format != binary_format) continue;
             if (!std.mem.eql(u8, entry.object_bytes, object_bytes)) continue;
-            return entry;
+            return index;
         }
         return null;
     }
@@ -872,7 +989,7 @@ pub const Rewriter = struct {
         // Later hooks only need their own local detour/trampoline/stub pieces;
         // their callback address is recovered as:
         //   shared primary base + handler entry offset
-        if (self.findSharedInstrumentPayload(binary_format, object_bytes) != null) return;
+        if (self.findSharedInstrumentPayloadIndex(binary_format, object_bytes) != null) return;
 
         const owned_bytes = try self.allocator.dupe(u8, object_bytes);
         errdefer self.allocator.free(owned_bytes);
@@ -882,6 +999,152 @@ pub const Rewriter = struct {
             .object_bytes = owned_bytes,
             .primary_base_address = primary_base_address,
         });
+    }
+
+    fn rememberSharedInstrumentPayloadMachO(
+        self: *Rewriter,
+        binary_format: bundle.BinaryFormat,
+        object_bytes: []const u8,
+        primary_base_address: u64,
+        macho_state: SharedMachOPayloadState,
+    ) !void {
+        if (self.findSharedInstrumentPayloadIndex(binary_format, object_bytes) != null) return;
+
+        const owned_bytes = try self.allocator.dupe(u8, object_bytes);
+        errdefer self.allocator.free(owned_bytes);
+
+        try self.shared_instrument_payloads.append(self.allocator, .{
+            .binary_format = binary_format,
+            .object_bytes = owned_bytes,
+            .primary_base_address = primary_base_address,
+            .macho = macho_state,
+        });
+    }
+
+    /// Shared Mach-O payload reuse is only safe while the previously emitted
+    /// executable payload image remains at the same linked address.
+    ///
+    /// If a later rewrite were to move that shared executable image, every
+    /// already-installed detour would still branch to the stale callback
+    /// address embedded in its older stub. The framework does not yet carry a
+    /// "rewrite old stubs and retarget their patch sites" pass, so such plans
+    /// must be rejected explicitly instead of silently emitting a corrupted
+    /// binary.
+    ///
+    /// Writable-image movement is narrower in scope and is handled later by
+    /// `refreshSharedMachOPayloadAfterPlan`, which re-links the shared payload
+    /// object against the new writable base and overwrites the shared payload
+    /// bytes in place.
+    fn validateSharedMachOPayloadPlanCompatibility(
+        self: *const Rewriter,
+        split_plan: MachOSplitInjectionPlan,
+        shared_payload_index: usize,
+    ) !void {
+        const entry = self.shared_instrument_payloads.items[shared_payload_index];
+        const macho_state = entry.macho orelse return;
+
+        if (split_plan.usesSyntheticSegments()) {
+            recordRewriteDiagnostic(
+                "shared Mach-O payload reuse for this object would require a later synthetic-segment relayout; rewriting already-installed hook stubs after synthetic shared-payload movement is not implemented yet",
+                .{},
+            );
+            return error.UnsupportedSharedMachOPayloadRelayout;
+        }
+
+        const shifted_primary_offset = shiftMachOOffsetAfterSplitPlan(
+            macho_state.primary_injection_offset,
+            split_plan,
+        );
+        if (shifted_primary_offset != macho_state.primary_injection_offset) {
+            recordRewriteDiagnostic(
+                "shared Mach-O payload reuse would move the already-injected executable image from file offset 0x{x} to 0x{x}; refreshing older hook stubs for moved shared payloads is not implemented yet",
+                .{
+                    macho_state.primary_injection_offset,
+                    shifted_primary_offset,
+                },
+            );
+            return error.UnsupportedSharedMachOPayloadRelayout;
+        }
+    }
+
+    fn refreshSharedMachOPayloadAfterPlan(
+        self: *Rewriter,
+        output: []u8,
+        finalized_target_view: image_backend.View,
+        split_plan: MachOSplitInjectionPlan,
+        shared_payload_index: usize,
+        handler_symbol: []const u8,
+    ) !void {
+        if (split_plan.usesSyntheticSegments()) return error.UnsupportedSharedMachOPayloadRelayout;
+
+        var entry = &self.shared_instrument_payloads.items[shared_payload_index];
+        var macho_state = entry.macho orelse return;
+
+        const shifted_primary_offset = shiftMachOOffsetAfterSplitPlan(
+            macho_state.primary_injection_offset,
+            split_plan,
+        );
+        const shifted_writable_offset = if (macho_state.writable_injection_offset) |offset|
+            shiftMachOOffsetAfterSplitPlan(offset, split_plan)
+        else
+            null;
+
+        const new_primary_base = try finalized_target_view.offsetToAddress(shifted_primary_offset);
+        const new_writable_base = if (shifted_writable_offset) |offset|
+            try finalized_target_view.offsetToAddress(offset)
+        else
+            null;
+
+        const primary_changed = new_primary_base != entry.primary_base_address;
+        const writable_changed = new_writable_base != macho_state.writable_base_address;
+        const offset_changed = shifted_primary_offset != macho_state.primary_injection_offset or
+            shifted_writable_offset != macho_state.writable_injection_offset;
+        if (!primary_changed and !writable_changed and !offset_changed) return;
+
+        if (primary_changed) {
+            recordRewriteDiagnostic(
+                "shared Mach-O payload reuse changed executable base from 0x{x} to 0x{x}; executable shared-image retargeting is not implemented yet",
+                .{ entry.primary_base_address, new_primary_base },
+            );
+            return error.UnsupportedSharedMachOPayloadRelayout;
+        }
+
+        var relinked_payload = try payload.linkObjectBytesForFormatWithImageBases(
+            self.allocator,
+            .macho,
+            entry.object_bytes,
+            handler_symbol,
+            .{
+                .primary = new_primary_base,
+                .writable = new_writable_base,
+            },
+            finalized_target_view,
+        );
+        defer relinked_payload.deinit(self.allocator);
+
+        std.debug.assert(relinked_payload.image.len == macho_state.primary_image_size);
+        @memcpy(
+            output[shifted_primary_offset .. shifted_primary_offset + relinked_payload.image.len],
+            relinked_payload.image,
+        );
+
+        if (macho_state.writable_image_size == 0) {
+            std.debug.assert(relinked_payload.writable_image == null);
+        } else {
+            const writable_offset = shifted_writable_offset orelse return error.MissingWritablePayloadImageBase;
+            const writable_image = relinked_payload.writable_image orelse return error.MissingWritablePayloadImage;
+            std.debug.assert(writable_image.len == macho_state.writable_image_size);
+            @memcpy(
+                output[writable_offset .. writable_offset + writable_image.len],
+                writable_image,
+            );
+        }
+
+        entry.primary_base_address = new_primary_base;
+        macho_state.primary_injection_offset = shifted_primary_offset;
+        macho_state.writable_injection_offset = shifted_writable_offset;
+        macho_state.writable_base_address = new_writable_base;
+        entry.macho = macho_state;
     }
 
     pub fn addReplaceHookObject(self: *Rewriter, spec: ReplaceObjectSpec) !ReplaceRewriteReport {
@@ -1319,6 +1582,7 @@ fn analyzeInstrumentWindowPlan(
 
     if (window_plan.isFullyRawTrampolineSafe()) return window_plan;
     if (window_plan.supportsLinearSemanticPrefixReplay()) return window_plan;
+    if (window_plan.supportsTerminalControlToRawSuffixReplay()) return window_plan;
     if (window_plan.supportsSequentialSemanticReplay()) return window_plan;
 
     for (window_plan.steps[0..window_plan.count], 0..) |step, index| {
@@ -1413,7 +1677,10 @@ fn collectIncomingBranchRetargets(
 fn windowStepSupportsInteriorRetarget(window_plan: aarch64.WindowPlan, index: usize) bool {
     return switch (window_plan.step(index)) {
         .raw => true,
-        .semantic => false,
+        // Raw interior targets can keep using the relocated trampoline bytes.
+        // Semantic interior targets need a dedicated direct-execution entry
+        // trampoline generated by the ISA backend.
+        .semantic => aarch64.supportsSemanticInteriorEntry(window_plan, index),
     };
 }
 
@@ -1422,6 +1689,8 @@ fn retargetIncomingBranches(
     incoming_branches: []const IncomingBranchRetarget,
     window_plan: aarch64.WindowPlan,
     trampoline_address: u64,
+    semantic_entry_base_address: u64,
+    semantic_entry_layout: aarch64.SemanticInteriorEntryLayout,
     enable_bti: bool,
 ) !void {
     const trampoline_prefix_size: u64 = if (enable_bti) @sizeOf(u32) else 0;
@@ -1429,7 +1698,11 @@ fn retargetIncomingBranches(
     for (incoming_branches) |incoming_branch| {
         const new_target_address = switch (window_plan.step(incoming_branch.target_index)) {
             .raw => trampoline_address + trampoline_prefix_size + incoming_branch.target_index * 4,
-            .semantic => unreachable,
+            .semantic => aarch64.semanticInteriorTargetAddress(
+                semantic_entry_layout,
+                semantic_entry_base_address,
+                incoming_branch.target_index,
+            ) orelse return error.UnsupportedIncomingBranchRetarget,
         };
 
         const replacement_opcode = encodeRetargetedBranch(
@@ -1697,6 +1970,27 @@ fn finalizeMachOSplitOutput(
 
     if (final_size == output.len) return output;
     return try allocator.realloc(output, final_size);
+}
+
+fn shiftOffsetAtOrAfter(value: usize, threshold: usize, delta: usize) usize {
+    if (delta == 0) return value;
+    if (value < threshold) return value;
+    return value + delta;
+}
+
+fn shiftMachOOffsetAfterSplitPlan(
+    original_offset: usize,
+    plan: MachOSplitInjectionPlan,
+) usize {
+    if (plan.usesSyntheticSegments()) {
+        return shiftOffsetAtOrAfter(original_offset, plan.synthetic_tail_offset, plan.synthetic_tail_shift);
+    }
+
+    var shifted = shiftOffsetAtOrAfter(original_offset, plan.executable.tail_offset, plan.executable.tail_shift);
+    if (plan.writable) |region| {
+        shifted = shiftOffsetAtOrAfter(shifted, region.tail_offset, region.tail_shift);
+    }
+    return shifted;
 }
 
 /// Repairs ELF metadata after the new payload bytes have been inserted.

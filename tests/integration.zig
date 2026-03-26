@@ -1089,6 +1089,93 @@ test "Mach-O zig zrstd payload with multiple default placeholders can be ad-hoc 
     try std.testing.expect(std.mem.indexOf(u8, result.stdout, "<zrstd: formatted output truncated>") == null);
 }
 
+test "Mach-O zig zrstd payload can write rich stderr traces on macOS arm64" {
+    if (builtin.os.tag != .macos or builtin.cpu.arch != .aarch64) {
+        return error.SkipZigTest;
+    }
+
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const tmp_dir_path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(tmp_dir_path);
+
+    const input_path = try std.fs.path.join(allocator, &.{ tmp_dir_path, "compute_macho_zig_zrstd_stderr" });
+    defer allocator.free(input_path);
+    const payload_path = try std.fs.path.join(allocator, &.{ tmp_dir_path, "macho_zig_zrstd_stderr_runtime.o" });
+    defer allocator.free(payload_path);
+    const output_path = try std.fs.path.join(allocator, &.{ tmp_dir_path, "compute_macho_zig_zrstd_stderr_instrumented" });
+    defer allocator.free(output_path);
+
+    try runCommand(allocator, &.{
+        "zig",
+        "cc",
+        "-target",
+        "aarch64-macos",
+        "-O0",
+        "-g0",
+        "-fno-sanitize=undefined",
+        "-fno-stack-protector",
+        "-fno-asynchronous-unwind-tables",
+        "tests/fixtures/compute.c",
+        "-o",
+        input_path,
+    });
+
+    const emit_bin_arg = try std.fmt.allocPrint(allocator, "-femit-bin={s}", .{payload_path});
+    defer allocator.free(emit_bin_arg);
+
+    try runCommand(allocator, &.{
+        "zig",
+        "build-obj",
+        "-target",
+        "aarch64-macos",
+        "-O",
+        "ReleaseSmall",
+        "-fstrip",
+        "--dep",
+        "zrwrite",
+        "--dep",
+        "zrstd",
+        "-Mroot=tests/fixtures/macho_zrstd_stderr_runtime.zig",
+        "-Mzrwrite=src/root.zig",
+        "-Mzrstd=src/zrstd/root.zig",
+        emit_bin_arg,
+    });
+
+    const payload_bytes = try std.fs.cwd().readFileAlloc(allocator, payload_path, std.math.maxInt(usize));
+    defer allocator.free(payload_bytes);
+
+    var rw = try zrwrite.Rewriter.initPath(allocator, input_path);
+    defer rw.deinit();
+
+    _ = try rw.addInstrumentHookObjectForFormat(.macho, .{
+        .payload_object_bytes = payload_bytes,
+        .target = zrwrite.bundle.HookLocator.fromSymbol("compute"),
+        .handler_symbol = "on_hit",
+    });
+    try rw.writeToPath(output_path);
+
+    try runCommand(allocator, &.{ "codesign", "-f", "-s", "-", output_path });
+
+    const result = try std.process.Child.run(.{
+        .allocator = allocator,
+        .argv = &.{output_path},
+    });
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+
+    switch (result.term) {
+        .Exited => |code| try std.testing.expectEqual(@as(u8, 53), code),
+        else => return error.CommandFailed,
+    }
+
+    try std.testing.expect(std.mem.indexOf(u8, result.stderr, "stderr hit=1 stage=darwin ok=true\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.stderr, "<zrstd: formatted output truncated>") == null);
+}
+
 test "Mach-O replace output can be ad-hoc codesigned and executed on macOS arm64" {
     if (builtin.os.tag != .macos or builtin.cpu.arch != .aarch64) {
         return error.SkipZigTest;
@@ -2634,6 +2721,109 @@ test "bundle -> apply supports O2 terminal-branch samples through virtual-addres
     try std.testing.expect(std.mem.indexOf(u8, output_bytes, "zrwrite O2 terminal branch replay hit\n") != null);
 }
 
+test "bundle -> apply replays widened add-immediate terminal-branch windows" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const tmp_dir_path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(tmp_dir_path);
+
+    const input_path = try std.fs.path.join(allocator, &.{ tmp_dir_path, "add_terminal_branch_target" });
+    defer allocator.free(input_path);
+    const payload_path = try std.fs.path.join(allocator, &.{ tmp_dir_path, "add_terminal_branch_payload.o" });
+    defer allocator.free(payload_path);
+    const bundle_path = try std.fs.path.join(allocator, &.{ tmp_dir_path, "add_terminal_branch_payload.zrpb" });
+    defer allocator.free(bundle_path);
+    const output_path = try std.fs.path.join(allocator, &.{ tmp_dir_path, "add_terminal_branch_target.patched" });
+    defer allocator.free(output_path);
+
+    try runCommand(allocator, &.{
+        "zig",
+        "cc",
+        "-target",
+        "aarch64-linux-musl",
+        "-O0",
+        "-g0",
+        "-static",
+        "-fno-pic",
+        "-no-pie",
+        "-fno-stack-protector",
+        "-fno-sanitize=undefined",
+        "-fno-asynchronous-unwind-tables",
+        "tests/fixtures/add_terminal_branch_target.S",
+        "tests/fixtures/add_terminal_branch_main.c",
+        "-o",
+        input_path,
+    });
+
+    try runCommand(allocator, &.{
+        "zig",
+        "cc",
+        "-target",
+        "aarch64-linux-musl",
+        "-c",
+        "-fPIC",
+        "-g0",
+        "-fno-stack-protector",
+        "-fno-sanitize=undefined",
+        "-fno-asynchronous-unwind-tables",
+        "-I",
+        "include",
+        "tests/fixtures/noop_payload.c",
+        "-o",
+        payload_path,
+    });
+
+    try zrwrite.bundle.writeToPath(allocator, bundle_path, .{
+        .target = .{
+            .arch = .aarch64,
+            .os = .linux,
+            .binary_format = .elf,
+        },
+        .payload_object_path = payload_path,
+        .payload_object_format = .elf,
+        .hooks = &.{
+            .{
+                .kind = .instrument,
+                .target = zrwrite.bundle.HookLocator.fromSymbol("add_terminal_branch_patchpoint"),
+                .handler_symbol = "on_hit",
+                .log_message = "zrwrite add terminal branch replay hit\n",
+                .stolen_instruction_count = 4,
+            },
+        },
+    });
+
+    const report = try zrwrite.apply.applyBundleFileToPath(allocator, bundle_path, input_path, output_path);
+
+    const output_bytes = try std.fs.cwd().readFileAlloc(allocator, output_path, std.math.maxInt(usize));
+    defer allocator.free(output_bytes);
+    const input_bytes = try std.fs.cwd().readFileAlloc(allocator, input_path, std.math.maxInt(usize));
+    defer allocator.free(input_bytes);
+    const input_view = try zrwrite.elf.View.parse(@constCast(input_bytes));
+    const target_address = try input_view.resolveSymbolAddress("add_terminal_branch_patchpoint");
+    const target_file_offset = try input_view.addressToOffset(target_address);
+    const branch_opcode = try readLeU32(output_bytes, target_file_offset);
+    const branch_target = try zrwrite.aarch64.decodeBranchTarget(branch_opcode, target_address);
+
+    try std.testing.expectEqual(report.stub_address.?, branch_target);
+    try std.testing.expect(report.trampoline_address != null);
+    try std.testing.expectEqual(
+        zrwrite.aarch64.nop_instruction,
+        try readLeU32(output_bytes, target_file_offset + 4),
+    );
+    try std.testing.expectEqual(
+        zrwrite.aarch64.nop_instruction,
+        try readLeU32(output_bytes, target_file_offset + 8),
+    );
+    try std.testing.expectEqual(
+        zrwrite.aarch64.nop_instruction,
+        try readLeU32(output_bytes, target_file_offset + 12),
+    );
+    try std.testing.expect(std.mem.indexOf(u8, output_bytes, "zrwrite add terminal branch replay hit\n") != null);
+}
+
 test "bundle -> apply supports executable pattern locators" {
     const allocator = std.testing.allocator;
 
@@ -2997,7 +3187,7 @@ test "bundle -> apply retargets incoming branches into widened raw windows" {
     );
 }
 
-test "bundle -> apply still rejects incoming branches into semantic-only interior steps" {
+test "bundle -> apply retargets incoming branches into semantic terminal-branch interior steps" {
     const allocator = std.testing.allocator;
 
     var tmp = std.testing.tmpDir(.{});
@@ -3070,10 +3260,21 @@ test "bundle -> apply still rejects incoming branches into semantic-only interio
         },
     });
 
-    try std.testing.expectError(
-        error.IncomingBranchIntoPatchWindow,
-        zrwrite.apply.applyBundleFileToPath(allocator, bundle_path, input_path, output_path),
-    );
+    const report = try zrwrite.apply.applyBundleFileToPath(allocator, bundle_path, input_path, output_path);
+    const output_bytes = try std.fs.cwd().readFileAlloc(allocator, output_path, std.math.maxInt(usize));
+    defer allocator.free(output_bytes);
+    const input_bytes = try std.fs.cwd().readFileAlloc(allocator, input_path, std.math.maxInt(usize));
+    defer allocator.free(input_bytes);
+    const input_view = try zrwrite.elf.View.parse(@constCast(input_bytes));
+    const branch_source_address = try input_view.resolveSymbolAddress("branch_to_terminal_branch_mid");
+    const branch_source_file_offset = try input_view.addressToOffset(branch_source_address);
+    const retargeted_opcode = try readLeU32(output_bytes, branch_source_file_offset);
+    const retargeted_target = try zrwrite.aarch64.decodeBranchTarget(retargeted_opcode, branch_source_address);
+    const original_mid_address = try input_view.resolveSymbolAddress("terminal_branch_interior_patchpoint") + 4;
+
+    try std.testing.expectEqual(@as(?u64, null), report.trampoline_address);
+    try std.testing.expect(retargeted_target != original_mid_address);
+    try std.testing.expect(retargeted_target != report.stub_address.?);
 }
 
 test "bundle -> apply retargets incoming branches into widened semantic-prefix raw tails" {
@@ -3166,6 +3367,175 @@ test "bundle -> apply retargets incoming branches into widened semantic-prefix r
         retargeted_target,
     );
     try std.testing.expect(std.mem.indexOf(u8, output_bytes, "zrwrite semantic interior hit\n") != null);
+}
+
+test "bundle -> apply retargets incoming branches into semantic-prefix interior steps" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const tmp_dir_path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(tmp_dir_path);
+
+    const input_path = try std.fs.path.join(allocator, &.{ tmp_dir_path, "semantic_prefix_interior_target" });
+    defer allocator.free(input_path);
+    const payload_path = try std.fs.path.join(allocator, &.{ tmp_dir_path, "semantic_prefix_interior_payload.o" });
+    defer allocator.free(payload_path);
+    const bundle_path = try std.fs.path.join(allocator, &.{ tmp_dir_path, "semantic_prefix_interior_payload.zrpb" });
+    defer allocator.free(bundle_path);
+    const output_path = try std.fs.path.join(allocator, &.{ tmp_dir_path, "semantic_prefix_interior_target.patched" });
+    defer allocator.free(output_path);
+
+    try runCommand(allocator, &.{
+        "zig",
+        "cc",
+        "-target",
+        "aarch64-linux-musl",
+        "-O0",
+        "-g0",
+        "-static",
+        "-fno-pic",
+        "-no-pie",
+        "-fno-stack-protector",
+        "-fno-sanitize=undefined",
+        "-fno-asynchronous-unwind-tables",
+        "tests/fixtures/semantic_prefix_interior_target.S",
+        "tests/fixtures/semantic_prefix_interior_main.c",
+        "-o",
+        input_path,
+    });
+
+    try runCommand(allocator, &.{
+        "zig",
+        "cc",
+        "-target",
+        "aarch64-linux-musl",
+        "-c",
+        "-fPIC",
+        "-g0",
+        "-fno-stack-protector",
+        "-fno-sanitize=undefined",
+        "-fno-asynchronous-unwind-tables",
+        "-I",
+        "include",
+        "tests/fixtures/noop_payload.c",
+        "-o",
+        payload_path,
+    });
+
+    try zrwrite.bundle.writeToPath(allocator, bundle_path, .{
+        .target = .{
+            .arch = .aarch64,
+            .os = .linux,
+            .binary_format = .elf,
+        },
+        .payload_object_path = payload_path,
+        .payload_object_format = .elf,
+        .hooks = &.{
+            .{
+                .kind = .instrument,
+                .target = zrwrite.bundle.HookLocator.fromSymbol("semantic_prefix_interior_patchpoint"),
+                .handler_symbol = "on_hit",
+                .stolen_instruction_count = 4,
+            },
+        },
+    });
+
+    const report = try zrwrite.apply.applyBundleFileToPath(allocator, bundle_path, input_path, output_path);
+    const output_bytes = try std.fs.cwd().readFileAlloc(allocator, output_path, std.math.maxInt(usize));
+    defer allocator.free(output_bytes);
+    const input_bytes = try std.fs.cwd().readFileAlloc(allocator, input_path, std.math.maxInt(usize));
+    defer allocator.free(input_bytes);
+    const input_view = try zrwrite.elf.View.parse(@constCast(input_bytes));
+    const branch_source_address = try input_view.resolveSymbolAddress("branch_to_semantic_prefix_interior_mid");
+    const branch_source_file_offset = try input_view.addressToOffset(branch_source_address);
+    const retargeted_opcode = try readLeU32(output_bytes, branch_source_file_offset);
+    const retargeted_target = try zrwrite.aarch64.decodeBranchTarget(retargeted_opcode, branch_source_address);
+    const original_mid_address = try input_view.resolveSymbolAddress("semantic_prefix_interior_patchpoint") + 4;
+
+    try std.testing.expect(retargeted_target != original_mid_address);
+    try std.testing.expect(retargeted_target > report.trampoline_address.?);
+    try std.testing.expect(retargeted_target < report.stub_address.?);
+}
+
+test "bundle -> apply still rejects unsupported semantic-prefix interior steps" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const tmp_dir_path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(tmp_dir_path);
+
+    const input_path = try std.fs.path.join(allocator, &.{ tmp_dir_path, "unsupported_semantic_interior_target" });
+    defer allocator.free(input_path);
+    const payload_path = try std.fs.path.join(allocator, &.{ tmp_dir_path, "unsupported_semantic_interior_payload.o" });
+    defer allocator.free(payload_path);
+    const bundle_path = try std.fs.path.join(allocator, &.{ tmp_dir_path, "unsupported_semantic_interior_payload.zrpb" });
+    defer allocator.free(bundle_path);
+    const output_path = try std.fs.path.join(allocator, &.{ tmp_dir_path, "unsupported_semantic_interior_target.patched" });
+    defer allocator.free(output_path);
+
+    try runCommand(allocator, &.{
+        "zig",
+        "cc",
+        "-target",
+        "aarch64-linux-musl",
+        "-O0",
+        "-g0",
+        "-static",
+        "-fno-pic",
+        "-no-pie",
+        "-fno-stack-protector",
+        "-fno-sanitize=undefined",
+        "-fno-asynchronous-unwind-tables",
+        "tests/fixtures/unsupported_semantic_interior_target.S",
+        "tests/fixtures/unsupported_semantic_interior_main.c",
+        "-o",
+        input_path,
+    });
+
+    try runCommand(allocator, &.{
+        "zig",
+        "cc",
+        "-target",
+        "aarch64-linux-musl",
+        "-c",
+        "-fPIC",
+        "-g0",
+        "-fno-stack-protector",
+        "-fno-sanitize=undefined",
+        "-fno-asynchronous-unwind-tables",
+        "-I",
+        "include",
+        "tests/fixtures/noop_payload.c",
+        "-o",
+        payload_path,
+    });
+
+    try zrwrite.bundle.writeToPath(allocator, bundle_path, .{
+        .target = .{
+            .arch = .aarch64,
+            .os = .linux,
+            .binary_format = .elf,
+        },
+        .payload_object_path = payload_path,
+        .payload_object_format = .elf,
+        .hooks = &.{
+            .{
+                .kind = .instrument,
+                .target = zrwrite.bundle.HookLocator.fromSymbol("unsupported_semantic_interior_patchpoint"),
+                .handler_symbol = "on_hit",
+                .stolen_instruction_count = 3,
+            },
+        },
+    });
+
+    try std.testing.expectError(
+        error.IncomingBranchIntoPatchWindow,
+        zrwrite.apply.applyBundleFileToPath(allocator, bundle_path, input_path, output_path),
+    );
 }
 
 test "bundle -> apply falls back to a PIE-safe long detour when stub is out of branch range" {

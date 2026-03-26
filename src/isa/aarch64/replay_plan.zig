@@ -63,6 +63,32 @@ pub const ReplayPlan = union(enum) {
         literal_address: u64,
     },
 
+    /// `ldr wt, [xn|sp, #imm]`
+    ///
+    /// This family is not PC-relative, so it could execute from a raw
+    /// trampoline. We still model it semantically because widened interior
+    /// hooks often need the planner to "promote" a stack/register load that
+    /// appears before a semantic branch such as `cbz`.
+    ldr_unsigned_w: struct {
+        rt: u5,
+        rn: u5,
+        byte_offset: u16,
+    },
+
+    /// `ldr xt, [xn|sp, #imm]`
+    ldr_unsigned_x: struct {
+        rt: u5,
+        rn: u5,
+        byte_offset: u16,
+    },
+
+    /// `ldrsw xt, [xn|sp, #imm]`
+    ldrsw_unsigned: struct {
+        rt: u5,
+        rn: u5,
+        byte_offset: u16,
+    },
+
     /// `ldr st, label`
     ///
     /// Scalar FP literal loads target the architectural `vN` register bank. The
@@ -130,6 +156,20 @@ pub const ReplayPlan = union(enum) {
         bit_index: u6,
         target: u64,
         branch_on_zero: bool,
+    },
+
+    /// `add` / `sub` (immediate) without flags.
+    ///
+    /// These instructions are architecturally simple but still useful as
+    /// semanticized prefix steps. Optimized code frequently materializes an
+    /// address or loop cursor with `add #imm` immediately before a semantic
+    /// control-flow instruction that cannot be copied verbatim.
+    add_sub_immediate: struct {
+        rd: u5,
+        rn: u5,
+        immediate: u64,
+        is_64bit: bool,
+        is_sub: bool,
     },
 
     /// `cmp wn/xn, #imm`
@@ -306,6 +346,50 @@ pub const WindowPlan = struct {
         return true;
     }
 
+    /// Returns `true` when a semantic control-flow terminator is followed only
+    /// by a raw trampoline suffix.
+    ///
+    /// This is the next widened replay shape after pure semantic blocks and
+    /// straight-line semantic prefixes. Real optimized functions often look
+    /// like:
+    ///
+    /// - `cmp + b.cond + <fallthrough body...>`
+    /// - `cbz + <fallthrough body...>`
+    /// - `tbz + <fallthrough body...>`
+    ///
+    /// The terminal branch itself must still execute semantically because its
+    /// target may leave the window entirely, but the fallthrough path can
+    /// resume inside the copied raw suffix trampoline at the first still-raw
+    /// instruction after that branch.
+    pub fn supportsTerminalControlToRawSuffixReplay(self: *const WindowPlan) bool {
+        if (!self.hasSemanticReplay()) return false;
+
+        const prefix_len = self.leadingSemanticStepCount();
+        if (prefix_len == 0 or prefix_len == self.count) return false;
+
+        for (self.steps[0 .. prefix_len - 1]) |window_step| {
+            if (window_step.isControlFlow()) return false;
+        }
+
+        const terminal_step = self.steps[prefix_len - 1];
+        const terminal_plan = switch (terminal_step) {
+            .raw => return false,
+            .semantic => |plan| plan,
+        };
+        switch (terminal_plan) {
+            .conditional_branch,
+            .compare_and_branch,
+            .test_bit_and_branch,
+            => {},
+            else => return false,
+        }
+
+        for (self.steps[prefix_len..self.count]) |window_step| {
+            if (window_step.usesSemanticReplay()) return false;
+        }
+        return true;
+    }
+
     pub fn singleReplayPlan(self: *const WindowPlan) ?ReplayPlan {
         if (self.count != 1) return null;
         return switch (self.steps[0]) {
@@ -395,6 +479,8 @@ pub fn planWindow(start_address: u64, opcodes: []const u32) !WindowPlan {
         const address = start_address + index * 4;
         try window.appendDecoded(address, opcode, try planReplay(address, opcode));
     }
+
+    promoteLeadingRawSemanticPrefix(&window, start_address, opcodes);
     return window;
 }
 
@@ -405,10 +491,13 @@ pub fn replayPlanName(plan: ReplayPlan) []const u8 {
         .adrp => "adrp",
         .ldr_literal_w => "ldr_literal_w",
         .ldr_literal_x => "ldr_literal_x",
+        .ldr_unsigned_w => "ldr_unsigned_w",
+        .ldr_unsigned_x => "ldr_unsigned_x",
         .ldr_literal_s => "ldr_literal_s",
         .ldr_literal_d => "ldr_literal_d",
         .ldr_literal_q => "ldr_literal_q",
         .ldrsw_literal => "ldrsw_literal",
+        .ldrsw_unsigned => "ldrsw_unsigned",
         .prfm_literal => "prfm_literal",
         .branch => "branch",
         .branch_with_link => "branch_with_link",
@@ -417,6 +506,7 @@ pub fn replayPlanName(plan: ReplayPlan) []const u8 {
         .compare_immediate => "compare_immediate",
         .compare_register => "compare_register",
         .test_bit_and_branch => "test_bit_and_branch",
+        .add_sub_immediate => "add_sub_immediate",
     };
 }
 
@@ -463,6 +553,18 @@ pub fn applyReplay(plan: ReplayPlan, address: u64, ctx: *HookContext) !void {
             writeXRegister(ctx, op.rt, std.mem.readInt(u64, buffer[0..], .little));
             ctx.pc = next_pc;
         },
+        .ldr_unsigned_w => |op| {
+            var buffer: [4]u8 = undefined;
+            readMemoryInto(try computeUnsignedAddress(ctx, op.rn, op.byte_offset), buffer[0..]);
+            writeWRegister(ctx, op.rt, std.mem.readInt(u32, buffer[0..], .little));
+            ctx.pc = next_pc;
+        },
+        .ldr_unsigned_x => |op| {
+            var buffer: [8]u8 = undefined;
+            readMemoryInto(try computeUnsignedAddress(ctx, op.rn, op.byte_offset), buffer[0..]);
+            writeXRegister(ctx, op.rt, std.mem.readInt(u64, buffer[0..], .little));
+            ctx.pc = next_pc;
+        },
         .ldr_literal_s => |op| {
             var buffer: [4]u8 = undefined;
             readMemoryInto(op.literal_address, buffer[0..]);
@@ -484,6 +586,13 @@ pub fn applyReplay(plan: ReplayPlan, address: u64, ctx: *HookContext) !void {
         .ldrsw_literal => |op| {
             var buffer: [4]u8 = undefined;
             readMemoryInto(op.literal_address, buffer[0..]);
+            const signed = std.mem.readInt(i32, buffer[0..], .little);
+            writeXRegister(ctx, op.rt, @as(u64, @bitCast(@as(i64, signed))));
+            ctx.pc = next_pc;
+        },
+        .ldrsw_unsigned => |op| {
+            var buffer: [4]u8 = undefined;
+            readMemoryInto(try computeUnsignedAddress(ctx, op.rn, op.byte_offset), buffer[0..]);
             const signed = std.mem.readInt(i32, buffer[0..], .little);
             writeXRegister(ctx, op.rt, @as(u64, @bitCast(@as(i64, signed))));
             ctx.pc = next_pc;
@@ -539,6 +648,25 @@ pub fn applyReplay(plan: ReplayPlan, address: u64, ctx: *HookContext) !void {
             const bit_is_zero = ((register_value >> op.bit_index) & 1) == 0;
             const should_branch = if (op.branch_on_zero) bit_is_zero else !bit_is_zero;
             ctx.pc = if (should_branch) op.target else next_pc;
+        },
+        .add_sub_immediate => |op| {
+            const lhs = readAddSubOperand(ctx, op.rn, op.is_64bit);
+            if (op.is_64bit) {
+                const result = if (op.is_sub)
+                    lhs -% op.immediate
+                else
+                    lhs +% op.immediate;
+                writeXRegister(ctx, op.rd, result);
+            } else {
+                const narrowed_lhs: u32 = @truncate(lhs);
+                const narrowed_imm: u32 = @truncate(op.immediate);
+                const result = if (op.is_sub)
+                    narrowed_lhs -% narrowed_imm
+                else
+                    narrowed_lhs +% narrowed_imm;
+                writeWRegister(ctx, op.rd, result);
+            }
+            ctx.pc = next_pc;
         },
     }
 }
@@ -622,6 +750,20 @@ const TestBitAndBranchInstruction = packed struct(u32) {
     b5: u1,
 };
 
+/// `LDR/STR (unsigned immediate)` / `LDRSW (unsigned immediate)` encoding
+/// family.
+///
+/// We intentionally decode this class with bit masks instead of a packed view
+/// because only a tiny semantic subset is needed today:
+/// - integer loads into W/X registers
+/// - `ldrsw`
+/// - base register or SP
+///
+/// Everything else in the same broad family can keep using raw trampoline
+/// replay until widened support needs it.
+const unsigned_immediate_load_store_mask: u32 = 0x3B00_0000;
+const unsigned_immediate_load_store_fixed: u32 = 0x3900_0000;
+
 fn assertInstructionWordLayout(comptime T: type, comptime type_name: []const u8) void {
     if (@bitSizeOf(T) != 32) {
         @compileError(type_name ++ " must remain a 32-bit packed view.");
@@ -691,6 +833,116 @@ fn planLiteralLoad(address: u64, instr: LiteralLoadInstruction) !ReplayPlan {
         2 => .{ .ldrsw_literal = .{ .rt = instr.rt, .literal_address = literal_address } },
         3 => .{ .prfm_literal = .{ .literal_address = literal_address } },
     };
+}
+
+fn planOptionalRawPromotion(address: u64, opcode: u32) ?ReplayPlan {
+    _ = address;
+    return planUnsignedImmediateLoadStore(opcode) orelse
+        planAddSubImmediate(opcode);
+}
+
+fn planUnsignedImmediateLoadStore(opcode: u32) ?ReplayPlan {
+    if ((opcode & unsigned_immediate_load_store_mask) != unsigned_immediate_load_store_fixed) {
+        return null;
+    }
+
+    // `V == 1` selects SIMD/FP loads/stores. Those are still safe as raw
+    // trampolines today and can be promoted later once widened demand appears.
+    if (((opcode >> 26) & 1) != 0) return null;
+
+    const size: u2 = @truncate(opcode >> 30);
+    const opc: u2 = @truncate((opcode >> 22) & 0x3);
+    const imm12: u12 = @truncate((opcode >> 10) & 0xFFF);
+    const rn: u5 = @truncate((opcode >> 5) & 0x1F);
+    const rt: u5 = @truncate(opcode & 0x1F);
+
+    return switch (opc) {
+        // Stores remain raw-trampoline safe and do not yet need semantic
+        // promotion for the widened shapes under active development.
+        0 => null,
+        1 => switch (size) {
+            0b10 => .{
+                .ldr_unsigned_w = .{
+                    .rt = rt,
+                    .rn = rn,
+                    .byte_offset = @as(u16, imm12) << 2,
+                },
+            },
+            0b11 => .{
+                .ldr_unsigned_x = .{
+                    .rt = rt,
+                    .rn = rn,
+                    .byte_offset = @as(u16, imm12) << 3,
+                },
+            },
+            else => null,
+        },
+        2 => switch (size) {
+            0b10 => .{
+                .ldrsw_unsigned = .{
+                    .rt = rt,
+                    .rn = rn,
+                    .byte_offset = @as(u16, imm12) << 2,
+                },
+            },
+            else => null,
+        },
+        else => null,
+    };
+}
+
+fn planAddSubImmediate(opcode: u32) ?ReplayPlan {
+    const instr: AddSubImmediateInstruction = @bitCast(opcode);
+    if (instr.fixed_op != add_sub_immediate_fixed_op) return null;
+    if (instr.s != 0) return null;
+
+    // SP forms are deferred for now. They require semantic replay to write
+    // back into `ctx.sp` rather than the GPR bank, while the immediate need is
+    // the common `add xN, xN, #imm` style prefix used before semantic branch
+    // instructions.
+    if (instr.rn == 31 or instr.rd == 31) return null;
+
+    return .{
+        .add_sub_immediate = .{
+            .rd = instr.rd,
+            .rn = instr.rn,
+            .immediate = @as(u64, instr.imm12) << @as(u6, if (instr.sh == 1) 12 else 0),
+            .is_64bit = instr.sf == 1,
+            .is_sub = instr.op == 1,
+        },
+    };
+}
+
+/// Promotes a leading raw prefix into semantic replay when a later window step
+/// already forced widened replay anyway.
+///
+/// Why this exists instead of classifying these instructions as semantic in
+/// `planReplay(...)`:
+/// - unsigned-immediate integer loads are fully relocatable and therefore
+///   still ideal raw trampoline candidates in the common case
+/// - globally reclassifying them as semantic would collapse existing
+///   `semantic-prefix + raw-tail` windows into all-semantic blocks, which in
+///   turn breaks current interior-entry retarget support that only understands
+///   relocated raw steps
+/// - the immediate need is narrower: make a raw prefix in front of a semantic
+///   control-flow step replayable without changing the semantics of unrelated
+///   windows
+fn promoteLeadingRawSemanticPrefix(
+    window: *WindowPlan,
+    start_address: u64,
+    opcodes: []const u32,
+) void {
+    if (!window.hasSemanticReplay()) return;
+
+    var semantic_start: usize = 0;
+    while (semantic_start < window.count and !window.steps[semantic_start].usesSemanticReplay()) : (semantic_start += 1) {}
+    if (semantic_start == 0 or semantic_start == window.count) return;
+
+    for (0..semantic_start) |index| {
+        const address = start_address + index * 4;
+        const promoted = planOptionalRawPromotion(address, opcodes[index]) orelse return;
+        window.steps[index] = .{ .semantic = promoted };
+    }
 }
 
 fn planImmediateBranch(address: u64, instr: UnconditionalImmediateBranchInstruction) !ReplayPlan {
@@ -786,9 +1038,30 @@ fn readCompareOperand(ctx: *HookContext, reg: u5, is_64bit: bool) u64 {
     return if (is_64bit) value else @as(u64, @truncate(value));
 }
 
+fn readAddSubOperand(ctx: *HookContext, reg: u5, is_64bit: bool) u64 {
+    return if (is_64bit)
+        readXRegister(ctx, reg)
+    else
+        @as(u64, @truncate(readXRegister(ctx, reg)));
+}
+
+fn computeUnsignedAddress(ctx: *HookContext, rn: u5, byte_offset: u16) !u64 {
+    return addUnsignedOffset(readBaseRegister(ctx, rn), byte_offset);
+}
+
+fn readBaseRegister(ctx: *HookContext, reg: u5) u64 {
+    // In load/store addressing mode register 31 denotes SP, not XZR.
+    if (reg == 31) return ctx.sp;
+    return ctx.regs.x[reg];
+}
+
 fn readXRegister(ctx: *HookContext, reg: u5) u64 {
     if (reg == 31) return 0;
     return ctx.regs.x[reg];
+}
+
+fn addUnsignedOffset(base: u64, offset: u16) !u64 {
+    return std.math.add(u64, base, offset);
 }
 
 fn writeXRegister(ctx: *HookContext, reg: u5, value: u64) void {
@@ -1037,6 +1310,14 @@ test "ordinary non PC-relative instructions remain raw-trampoline safe" {
     ); // stp x3, x4, [x5]
     try std.testing.expectEqualDeep(
         ReplayPlan{ .trampoline = {} },
+        try planReplay(0x8, 0xF940_13F3),
+    ); // ldr x19, [sp, #0x20]
+    try std.testing.expectEqualDeep(
+        ReplayPlan{ .trampoline = {} },
+        try planReplay(0xC, 0xB980_0000),
+    ); // ldrsw x0, [x0]
+    try std.testing.expectEqualDeep(
+        ReplayPlan{ .trampoline = {} },
         try planReplay(0x8, 0x9104_8CE6),
     ); // add x6, x7, #0x123
 }
@@ -1067,6 +1348,113 @@ test "window planner tracks mixed raw and semantic steps" {
     try std.testing.expectEqualStrings("raw", window.step(1).replayName());
     try std.testing.expectEqual(@as(usize, 1), window.leadingSemanticStepCount());
     try std.testing.expect(window.supportsLinearSemanticPrefixReplay());
+}
+
+test "window planner recognizes terminal branch to raw suffix replay shape" {
+    const window = try planWindow(0x1000, &.{
+        0x7100_0A9F, // cmp w20, #2
+        0x5400_008B, // b.lt 0x1014
+        0xAA14_03E0, // mov x0, x20
+        0xAA13_03E1, // mov x1, x19
+    });
+
+    try std.testing.expectEqual(@as(usize, 4), window.count);
+    try std.testing.expect(window.hasSemanticReplay());
+    try std.testing.expect(window.hasControlFlow());
+    try std.testing.expectEqual(@as(usize, 2), window.leadingSemanticStepCount());
+    try std.testing.expect(!window.supportsLinearSemanticPrefixReplay());
+    try std.testing.expect(!window.supportsSequentialSemanticReplay());
+    try std.testing.expect(window.supportsTerminalControlToRawSuffixReplay());
+}
+
+test "window planner recognizes load plus terminal branch to raw suffix replay shape" {
+    const window = try planWindow(0x1000, &.{
+        0xF940_13F3, // ldr x19, [sp, #0x20]
+        0xB400_0513, // cbz x19, 0x10a4
+        0xF940_17F4, // ldr x20, [sp, #0x28]
+        0xAA13_03E0, // mov x0, x19
+    });
+
+    try std.testing.expectEqual(@as(usize, 4), window.count);
+    try std.testing.expect(window.hasSemanticReplay());
+    try std.testing.expect(window.hasControlFlow());
+    try std.testing.expectEqual(@as(usize, 2), window.leadingSemanticStepCount());
+    try std.testing.expect(window.supportsTerminalControlToRawSuffixReplay());
+}
+
+test "optional raw-promotion decoder recognizes unsigned immediate integer loads" {
+    try std.testing.expectEqualDeep(
+        ReplayPlan{
+            .ldr_unsigned_x = .{
+                .rt = 19,
+                .rn = 31,
+                .byte_offset = 0x20,
+            },
+        },
+        planOptionalRawPromotion(0x1000, 0xF940_13F3).?,
+    );
+    try std.testing.expectEqualDeep(
+        ReplayPlan{
+            .ldr_unsigned_w = .{
+                .rt = 2,
+                .rn = 10,
+                .byte_offset = 0,
+            },
+        },
+        planOptionalRawPromotion(0x1004, 0xB940_0142).?,
+    );
+    try std.testing.expectEqualDeep(
+        ReplayPlan{
+            .ldrsw_unsigned = .{
+                .rt = 0,
+                .rn = 0,
+                .byte_offset = 0,
+            },
+        },
+        planOptionalRawPromotion(0x1008, 0xB980_0000).?,
+    );
+}
+
+test "optional raw-promotion decoder recognizes add/sub immediate prefixes" {
+    try std.testing.expectEqualDeep(
+        ReplayPlan{
+            .add_sub_immediate = .{
+                .rd = 0,
+                .rn = 0,
+                .immediate = 0x100,
+                .is_64bit = true,
+                .is_sub = false,
+            },
+        },
+        planOptionalRawPromotion(0x1000, 0x9104_0000).?,
+    );
+    try std.testing.expectEqualDeep(
+        ReplayPlan{
+            .add_sub_immediate = .{
+                .rd = 1,
+                .rn = 2,
+                .immediate = 7,
+                .is_64bit = false,
+                .is_sub = true,
+            },
+        },
+        planOptionalRawPromotion(0x1004, 0x5100_1C41).?,
+    );
+}
+
+test "window planner recognizes add plus terminal branch to raw suffix replay shape" {
+    const window = try planWindow(0x1000, &.{
+        0x9104_0000, // add x0, x0, #0x100
+        0xB400_0080, // cbz x0, 0x1014
+        0xF940_17F4, // ldr x20, [sp, #0x28]
+        0xAA13_03E0, // mov x0, x19
+    });
+
+    try std.testing.expectEqual(@as(usize, 4), window.count);
+    try std.testing.expect(window.hasSemanticReplay());
+    try std.testing.expect(window.hasControlFlow());
+    try std.testing.expectEqual(@as(usize, 2), window.leadingSemanticStepCount());
+    try std.testing.expect(window.supportsTerminalControlToRawSuffixReplay());
 }
 
 test "condition evaluator matches common NZCV predicates" {
@@ -1154,4 +1542,82 @@ test "FP literal replay updates q registers with the correct scalar semantics" {
     );
     try std.testing.expectEqual(literal_q, ctx.fpregs.v[3]);
     try std.testing.expectEqual(@as(u64, 0x3004), ctx.pc);
+}
+
+test "unsigned immediate load replay reads GPR and SP based addresses" {
+    var stack_slots = [_]u64{
+        0x1111_2222_3333_4444,
+        0x5555_6666_7777_8888,
+        0x9999_AAAA_BBBB_CCCC,
+    };
+    var word_slots = [_]u32{
+        0x89AB_CDEF,
+        0xFFFF_FFFE,
+    };
+
+    var ctx = std.mem.zeroes(HookContext);
+    ctx.sp = @intFromPtr(&stack_slots[0]);
+    ctx.regs.x[4] = @intFromPtr(&word_slots[0]);
+
+    try applyReplay(
+        .{ .ldr_unsigned_x = .{ .rt = 1, .rn = 31, .byte_offset = 8 } },
+        0x1000,
+        &ctx,
+    );
+    try std.testing.expectEqual(stack_slots[1], ctx.regs.x[1]);
+    try std.testing.expectEqual(@as(u64, 0x1004), ctx.pc);
+
+    try applyReplay(
+        .{ .ldr_unsigned_w = .{ .rt = 2, .rn = 4, .byte_offset = 0 } },
+        0x2000,
+        &ctx,
+    );
+    try std.testing.expectEqual(@as(u64, word_slots[0]), ctx.regs.x[2]);
+    try std.testing.expectEqual(@as(u64, 0x2004), ctx.pc);
+
+    try applyReplay(
+        .{ .ldrsw_unsigned = .{ .rt = 3, .rn = 4, .byte_offset = 4 } },
+        0x3000,
+        &ctx,
+    );
+    try std.testing.expectEqual(@as(u64, @bitCast(@as(i64, -2))), ctx.regs.x[3]);
+    try std.testing.expectEqual(@as(u64, 0x3004), ctx.pc);
+}
+
+test "add/sub immediate replay updates GPR state" {
+    var ctx = std.mem.zeroes(HookContext);
+    ctx.regs.x[0] = 0x1000;
+    ctx.regs.x[2] = 10;
+
+    try applyReplay(
+        .{
+            .add_sub_immediate = .{
+                .rd = 1,
+                .rn = 0,
+                .immediate = 0x40,
+                .is_64bit = true,
+                .is_sub = false,
+            },
+        },
+        0x4000,
+        &ctx,
+    );
+    try std.testing.expectEqual(@as(u64, 0x1040), ctx.regs.x[1]);
+    try std.testing.expectEqual(@as(u64, 0x4004), ctx.pc);
+
+    try applyReplay(
+        .{
+            .add_sub_immediate = .{
+                .rd = 3,
+                .rn = 2,
+                .immediate = 7,
+                .is_64bit = false,
+                .is_sub = true,
+            },
+        },
+        0x4004,
+        &ctx,
+    );
+    try std.testing.expectEqual(@as(u64, 3), ctx.regs.x[3]);
+    try std.testing.expectEqual(@as(u64, 0x4008), ctx.pc);
 }

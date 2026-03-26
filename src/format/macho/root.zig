@@ -892,11 +892,7 @@ pub const View = struct {
         clearLastDiagnostic();
 
         const carrier = try self.segmentAtLoadCommandIndex(plan.carrier_segment_index);
-        const existing_segment_size: usize = @intCast(@max(carrier.command.filesize, carrier.command.vmsize));
-        const required_segment_size = plan.injection_end_offset - @as(usize, @intCast(carrier.command.fileoff));
-        const new_segment_size = @max(existing_segment_size, required_segment_size);
-        carrier.command.filesize = @intCast(new_segment_size);
-        carrier.command.vmsize = @intCast(new_segment_size);
+        try growCarrierSegmentForInjectedRange(carrier.command, plan.injection_end_offset);
         if (make_executable) {
             carrier.command.initprot |= macho.PROT.EXEC;
             carrier.command.maxprot |= macho.PROT.EXEC;
@@ -1218,31 +1214,30 @@ pub const View = struct {
         return error.InvalidSegmentLoadCommandIndex;
     }
 
-    /// Returns the first free file offset at the tail of an existing carrier
+    /// Returns the first safe file offset at the tail of an existing carrier
     /// segment.
     ///
-    /// Many real Mach-O binaries leave page-tail slack between the last mapped
-    /// section and the end of the segment. Reusing that already-owned space is
-    /// much cheaper than growing the segment and shifting every later segment,
-    /// because it avoids large cascades of metadata rewrites.
+    /// Important Mach-O nuance:
+    /// - the last file-backed bytes are *not* always the end of live segment
+    ///   state
+    /// - writable segments commonly continue with `__bss` / `__common`
+    ///   zerofill sections whose bytes are absent on disk but whose virtual
+    ///   addresses are still owned by the original program
+    /// - injecting payload data immediately after the last file-backed section
+    ///   would therefore overlap the target binary's live zerofill globals
+    ///
+    /// The carrier planner must treat both families as occupied:
+    /// - file-backed sections consume their on-disk byte range directly
+    /// - zerofill sections consume the corresponding mapped VM range, which we
+    ///   project back into the segment's file-offset space using the segment's
+    ///   `fileoff <-> vmaddr` delta
+    ///
+    /// This still preserves the original "reuse already-owned tail slack when
+    /// possible" policy, but only for space that is truly unused by the target
+    /// image.
     pub fn segmentUsedEndFileOffset(self: View, segment: SegmentRef) !usize {
         _ = self;
-
-        const segment_end = try std.math.add(u64, segment.command.fileoff, segment.command.filesize);
-        var used_end = segment.command.fileoff;
-
-        if (segment.command.nsects == 0) return @intCast(segment_end);
-
-        for (segment.sections) |section| {
-            if (section.isZerofill()) continue;
-            if (section.size == 0) continue;
-
-            const section_end = try std.math.add(u64, section.offset, section.size);
-            if (section_end > segment_end) return error.InvalidMachOSegmentCommand;
-            used_end = @max(used_end, section_end);
-        }
-
-        return @intCast(used_end);
+        return segmentUsedEndFileOffsetForSections(segment.command.*, segment.sections);
     }
 
     /// Returns the first file offset occupied by mapped image content.
@@ -1332,11 +1327,7 @@ pub const View = struct {
 
     fn applyRegionInjectionMetadataRaw(self: View, region: RegionInjectionPlan) !void {
         const carrier = try self.segmentAtLoadCommandIndex(region.carrier_segment_index);
-        const existing_segment_size: usize = @intCast(@max(carrier.command.filesize, carrier.command.vmsize));
-        const required_segment_size = region.injection_end_offset - @as(usize, @intCast(carrier.command.fileoff));
-        const new_segment_size = @max(existing_segment_size, required_segment_size);
-        carrier.command.filesize = @intCast(new_segment_size);
-        carrier.command.vmsize = @intCast(new_segment_size);
+        try growCarrierSegmentForInjectedRange(carrier.command, region.injection_end_offset);
         if (region.make_executable) {
             carrier.command.initprot |= macho.PROT.EXEC;
             carrier.command.maxprot |= macho.PROT.EXEC;
@@ -1348,6 +1339,44 @@ pub const View = struct {
     fn applyRegionInjectionMetadata(self: View, region: RegionInjectionPlan) !void {
         try self.applyRegionInjectionMetadataRaw(region);
         try self.applyMetadataFixupsAfterSegmentShift(region.tail_offset, region.tail_shift);
+    }
+
+    fn segmentUsedEndFileOffsetForSections(
+        command: macho.segment_command_64,
+        sections: []align(1) const macho.section_64,
+    ) !usize {
+        const segment_file_end = try std.math.add(u64, command.fileoff, command.filesize);
+        const segment_vm_end = try std.math.add(u64, command.vmaddr, command.vmsize);
+
+        if (sections.len == 0) {
+            return @intCast(command.fileoff + @max(command.filesize, command.vmsize));
+        }
+
+        var used_end = command.fileoff;
+        for (sections) |section| {
+            if (section.size == 0) continue;
+
+            if (section.isZerofill()) {
+                if (section.addr < command.vmaddr) return error.InvalidMachOSegmentCommand;
+
+                const section_vm_end = try std.math.add(u64, section.addr, section.size);
+                if (section_vm_end > segment_vm_end) return error.InvalidMachOSegmentCommand;
+
+                const mapped_file_end = try std.math.add(
+                    u64,
+                    command.fileoff,
+                    section_vm_end - command.vmaddr,
+                );
+                used_end = @max(used_end, mapped_file_end);
+                continue;
+            }
+
+            const section_end = try std.math.add(u64, section.offset, section.size);
+            if (section_end > segment_file_end) return error.InvalidMachOSegmentCommand;
+            used_end = @max(used_end, section_end);
+        }
+
+        return @intCast(used_end);
     }
 
     fn loadCommandBytes(self: View) []u8 {
@@ -1996,9 +2025,15 @@ pub const View = struct {
     /// Current scope:
     /// - patch section-backed executable code only, so injected payload bytes
     ///   are left untouched
-    /// - currently rewrite `adr` and `adrp`, which is already enough for the
-    ///   real Mach-O/ObjC smoke and the common local-address materialization
-    ///   patterns produced by Apple's toolchain
+    /// - rewrite `adr`, `adrp`, and AArch64 literal loads (`ldr/ldrsw/prfm
+    ///   (literal)`)
+    ///
+    /// Literal loads matter on real macOS apps because Apple toolchains often
+    /// use them to fetch addresses such as `___stack_chk_guard`,
+    /// vtables, or other local metadata from a nearby literal pool. Once
+    /// `__DATA_CONST` or `__DATA` moves, those literal-pool slots move too; if
+    /// we only repair `adr`/`adrp`, startup still crashes before our hook
+    /// payload runs.
     fn rewriteAarch64PcRelativeTargetsAfterSegmentShift(self: View, threshold: usize, delta: usize) !void {
         if (delta == 0) return;
 
@@ -2041,6 +2076,16 @@ pub const View = struct {
                         const new_target = try self.adjustChainedTargetVmAddress(old_target, threshold, delta);
                         if (new_target != old_target) {
                             opcode = try encodeAdrLikeTarget(@intCast(opcode & 0x1F), site_address, new_target, false);
+                            writeLittleU32(self.bytes[site_offset .. site_offset + @sizeOf(u32)], opcode);
+                        }
+                        continue;
+                    }
+
+                    if (isLiteralLoadOpcode(opcode)) {
+                        const old_target = try decodeLiteralLoadTarget(opcode, site_address);
+                        const new_target = try self.adjustChainedTargetVmAddress(old_target, threshold, delta);
+                        if (new_target != old_target) {
+                            opcode = try encodeLiteralLoadTarget(opcode, site_address, new_target);
                             writeLittleU32(self.bytes[site_offset .. site_offset + @sizeOf(u32)], opcode);
                         }
                     }
@@ -2364,6 +2409,35 @@ fn applyMaterializedRegion(output: []u8, current_len: usize, region: RegionInjec
     @memset(output[region.injection_offset..region.injection_end_offset], 0);
 }
 
+/// Extends a carrier segment so the injected file-backed bytes become mapped,
+/// without accidentally materializing unrelated zerofill tail pages.
+///
+/// Why this split matters:
+/// - Mach-O data segments often have `filesize < vmsize` because `__bss` and
+///   `__common` live in the virtual tail as zerofill
+/// - if we blindly promote `filesize` to `max(filesize, vmsize)` during
+///   payload injection, the rewritten image starts claiming those zerofill
+///   pages are now file-backed
+/// - dyld then sees `__DATA` physically overlapping the following
+///   `__LINKEDIT` segment, which is exactly the runtime failure mode exposed by
+///   large real-world app smoke tests such as ImHex
+///
+/// The correct policy is therefore:
+/// - grow `filesize` only as far as the injected bytes actually extend
+/// - grow `vmsize` only when the injected bytes spill past the original mapped
+///   extent
+fn growCarrierSegmentForInjectedRange(
+    command: *align(1) macho.segment_command_64,
+    injection_end_offset: usize,
+) !void {
+    const fileoff: usize = @intCast(command.fileoff);
+    const required_file_size = try std.math.sub(usize, injection_end_offset, fileoff);
+    const new_filesize = @max(@as(usize, @intCast(command.filesize)), required_file_size);
+    const new_vmsize = @max(@as(usize, @intCast(command.vmsize)), required_file_size);
+    command.filesize = @intCast(new_filesize);
+    command.vmsize = @intCast(new_vmsize);
+}
+
 fn shiftAmountAtOrAfter(value: u64, threshold: usize, delta: usize) u64 {
     if (delta == 0) return 0;
     if (value < threshold) return 0;
@@ -2504,6 +2578,10 @@ fn isAdrpOpcode(opcode: u32) bool {
     return (opcode & 0x9F00_0000) == 0x9000_0000;
 }
 
+fn isLiteralLoadOpcode(opcode: u32) bool {
+    return (opcode & 0x3B00_0000) == 0x1800_0000;
+}
+
 fn decodeAdrLikeTarget(opcode: u32, site_address: u64, page_relative: bool) !u64 {
     const immlo = (opcode >> 29) & 0x3;
     const immhi = (opcode >> 5) & 0x7FFFF;
@@ -2527,20 +2605,40 @@ fn encodeAdrLikeTarget(rd: u5, site_address: u64, target_address: u64, page_rela
         rd;
 }
 
+fn decodeLiteralLoadTarget(opcode: u32, site_address: u64) !u64 {
+    const imm19 = (opcode >> 5) & 0x7FFFF;
+    const signed_offset = signExtend(19, imm19) << 2;
+    return addSignedOffset(site_address, signed_offset);
+}
+
+fn encodeLiteralLoadTarget(opcode: u32, site_address: u64, target_address: u64) !u32 {
+    const delta = @as(i128, @intCast(target_address)) - @as(i128, @intCast(site_address));
+    if (delta < std.math.minInt(i64) or delta > std.math.maxInt(i64)) {
+        return error.BranchOutOfRange;
+    }
+
+    const imm19 = try encodeSignedScaledImmediate(@intCast(delta), 19, 2);
+    return (opcode & ~(@as(u32, 0x7FFFF) << 5)) | (imm19 << 5);
+}
+
 fn encodeSignedPcImmediate(byte_offset: i64, shift: u6) !u32 {
+    return encodeSignedScaledImmediate(byte_offset, 21, shift);
+}
+
+fn encodeSignedScaledImmediate(byte_offset: i64, bit_count: u6, shift: u6) !u32 {
     if (shift != 0) {
         const alignment_mask = (@as(i64, 1) << shift) - 1;
         if ((byte_offset & alignment_mask) != 0) return error.UnalignedBranchTarget;
     }
 
     const scaled = byte_offset >> shift;
-    const min = -(@as(i64, 1) << 20);
-    const max = (@as(i64, 1) << 20) - 1;
+    const min = -(@as(i64, 1) << (bit_count - 1));
+    const max = (@as(i64, 1) << (bit_count - 1)) - 1;
     if (scaled < min or scaled > max) return error.BranchOutOfRange;
 
     const signed: i32 = @intCast(scaled);
     const raw: u32 = @bitCast(signed);
-    return raw & ((@as(u32, 1) << 21) - 1);
+    return raw & ((@as(u32, 1) << @as(u5, @intCast(bit_count))) - 1);
 }
 
 fn addSignedOffset(base: u64, signed_offset: i64) !u64 {
@@ -2607,4 +2705,91 @@ fn readMagic(bytes: []const u8) u32 {
 
 pub fn notImplemented() error.NotImplemented {
     return error.NotImplemented;
+}
+
+test "growCarrierSegmentForInjectedRange preserves zerofill-only vm tail when possible" {
+    var segment = std.mem.zeroInit(macho.segment_command_64, .{
+        .fileoff = 0x1000,
+        .filesize = 0x2000,
+        .vmsize = 0x3000,
+    });
+
+    try growCarrierSegmentForInjectedRange(&segment, 0x3500);
+    try std.testing.expectEqual(@as(u64, 0x2500), segment.filesize);
+    try std.testing.expectEqual(@as(u64, 0x3000), segment.vmsize);
+}
+
+test "growCarrierSegmentForInjectedRange expands vm size only when injection exceeds it" {
+    var segment = std.mem.zeroInit(macho.segment_command_64, .{
+        .fileoff = 0x2000,
+        .filesize = 0x1000,
+        .vmsize = 0x1800,
+    });
+
+    try growCarrierSegmentForInjectedRange(&segment, 0x4200);
+    try std.testing.expectEqual(@as(u64, 0x2200), segment.filesize);
+    try std.testing.expectEqual(@as(u64, 0x2200), segment.vmsize);
+}
+
+test "segmentUsedEndFileOffsetForSections treats zerofill sections as occupied payload space" {
+    const segment = std.mem.zeroInit(macho.segment_command_64, .{
+        .fileoff = 0x98000,
+        .filesize = 0x28000,
+        .vmaddr = 0x100098000,
+        .vmsize = 0x2c000,
+    });
+
+    const sections = [_]macho.section_64{
+        std.mem.zeroInit(macho.section_64, .{
+            .addr = 0x100098000,
+            .size = 0x27d98,
+            .offset = 0x98000,
+            .flags = macho.S_REGULAR,
+        }),
+        std.mem.zeroInit(macho.section_64, .{
+            .addr = 0x1000bfd98,
+            .size = 0x1b60,
+            .offset = 0,
+            .flags = macho.S_ZEROFILL,
+        }),
+        std.mem.zeroInit(macho.section_64, .{
+            .addr = 0x1000c18f8,
+            .size = 0x20,
+            .offset = 0,
+            .flags = macho.S_GB_ZEROFILL,
+        }),
+    };
+
+    try std.testing.expectEqual(
+        @as(usize, 0xc1918),
+        try View.segmentUsedEndFileOffsetForSections(segment, &sections),
+    );
+}
+
+test "segmentUsedEndFileOffsetForSections falls back to full mapped span for sectionless segments" {
+    const segment = std.mem.zeroInit(macho.segment_command_64, .{
+        .fileoff = 0x4000,
+        .filesize = 0x1800,
+        .vmaddr = 0x100004000,
+        .vmsize = 0x3000,
+    });
+
+    try std.testing.expectEqual(
+        @as(usize, 0x7000),
+        try View.segmentUsedEndFileOffsetForSections(segment, &.{}),
+    );
+}
+
+test "literal load target helpers round-trip a moved literal pool slot" {
+    const original_opcode: u32 = 0x5800_0011; // ldr x17, <literal>
+    const site_address: u64 = 0x1000;
+    const original_target: u64 = 0x1100;
+    const moved_target: u64 = 0x2100;
+
+    const encoded = try encodeLiteralLoadTarget(original_opcode, site_address, original_target);
+    try std.testing.expect(isLiteralLoadOpcode(encoded));
+    try std.testing.expectEqual(original_target, try decodeLiteralLoadTarget(encoded, site_address));
+
+    const reencoded = try encodeLiteralLoadTarget(encoded, site_address, moved_target);
+    try std.testing.expectEqual(moved_target, try decodeLiteralLoadTarget(reencoded, site_address));
 }
