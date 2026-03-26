@@ -1,36 +1,99 @@
 # ZRWRITE
-## YinMo19
 
-> What is this?
->
-> It is a framework for patching AArch64 binaries on macOS and Linux. Android and iOS support is currently under development.
+`zrwrite` is a static binary patching framework focused on AArch64 targets.
 
-So, what can you do with this library? Imagine you have a binary—whether it is stripped or not, optimized or not—you can simply use this library to hook it.
+Today it targets:
 
-### What can we do and what we have done?
-zrwrite supports both function entry detours and instrumentation of almost any opcode.
+- Linux ELF64
+- macOS thin Mach-O arm64
 
-Function Detours: If the original function contains more than 4 opcodes, detouring is straightforward; otherwise, it becomes more challenging.
+The main use case is: you have a stripped or optimized binary, you know a
+useful patch site, and you want to inject new logic without rebuilding the
+original program.
 
-Instruction Instrumentation: This is the most complex part of development. You must consider several edge cases:
+## What zrwrite does
 
-- What if you select a point that uses a PC-relative opcode?
-- What if a branch target falls within the patched opcodes' window?
-- What if you want to write TLS (Thread Local Storage) code in your patch? (Note: This is not yet supported).
+`zrwrite` currently supports two main hook styles:
 
-We have already solved the most difficult technical hurdles. For you, the user, you only need to focus on writing your patch code and selecting the specific hook point. (If you ensure it is our wrong, please report an issue to us, we will fix it as soon as possible.)
+- `replace`
+- `instrument`
 
-### How to use that?
-Thanks to Zig, you can write your patch code in either Zig or C. While C support is provided, we recommend using Zig because it is more powerful and easier to write for this purpose.
+`replace` is for full detours:
 
-We have introduced that our libirary supports replace function and instruction, so you should decide which to use. If you want to change a function with a totally different way or just force a function to return a simple value., you can choose replace mode, other case like a very very large function (automatically inlined by compiler) you want to make some log or just make a register some change, instuction is what you want.
+- replace a function entry
+- force a return value
+- redirect execution into a new implementation
 
-And out libirary is used in 3 steps. 
-1. write patch code and build into a o file, 
-2. pack o file with a metadata json, 
-3. patch the original binary.
+`instrument` is for patch-site logic injection:
 
-A metadata json is like this:
+- log or inspect registers
+- modify arguments or return values
+- early-return by editing `ctx.pc`
+- instrument interior instructions inside large optimized functions
+
+The design goal is deliberately low-level:
+
+- `zrwrite` guarantees architectural control over registers / PC / SP /
+  replayed instructions
+- language ABI meaning is owned by the payload author
+
+If you patch an Objective-C, C++, Rust, Swift, or custom ABI boundary, you must
+write the payload with the correct calling convention and runtime layout in
+mind.
+
+## Supported target model
+
+Current public scope:
+
+- AArch64 only
+- static patching, not runtime injection
+- Zig-authored payload objects are the primary path
+- C payload objects can also work when they stay within the supported payload
+  model
+- payload sections:
+  - `.text`
+  - `.rodata`
+  - `.data`
+  - `.bss`
+
+Explicitly not a goal right now:
+
+- "arbitrary normal Zig executable" support inside payloads
+- TLS-heavy payload code
+- full C++ exception / unwind interoperability
+- fat / universal Mach-O handling
+- iOS / arm64e / PAC-specific support
+
+## Basic workflow
+
+The normal workflow has three steps:
+
+1. Write a payload and build it into an object file.
+2. Describe the hook(s) in a meta JSON or pass them through CLI flags.
+3. Build a `.zrpb` bundle and apply it to the target binary.
+
+Typical commands:
+
+```bash
+zig build-obj -target aarch64-macos -O ReleaseSmall -fstrip \
+  -Mroot=payload.zig \
+  -femit-bin=payload.o
+
+zrwrite bundle --output patch.zrpb --meta hook.meta.json
+
+zrwrite apply --bundle patch.zrpb --input target.bin --output target.patched
+```
+
+On macOS you must ad-hoc sign the patched output before running it:
+
+```bash
+codesign -f -s - target.patched
+```
+
+## Meta JSON format
+
+The human-authored meta JSON format is:
+
 ```json
 {
   "target": {
@@ -39,7 +102,7 @@ A metadata json is like this:
     "binary_format": "macho"
   },
   "payload": {
-    "object_path": "payload_tokio_trace.o",
+    "object_path": "payload.o",
     "object_format": "macho"
   },
   "hooks": [
@@ -50,185 +113,118 @@ A metadata json is like this:
         "virtual_address": "0x1000038bc"
       },
       "expected_bytes": "4810001208150011",
-      "handler_symbol": "on_tokio_mix"
+      "handler_symbol": "on_hit"
     }
   ]
 }
 ```
-The metadata does NOT specify which binary you are patching. It only defines how and where to patch using specific handlers.
 
-When writing patch code, you must match the ABI of the specific language (e.g., Objective-C's `objc_msgSend` or C++'s `std::vector`). Our library does not guarantee ABI correctness; you are responsible for ensuring the signatures match.
+Important details:
 
-### Replaced mode
-Suppose you want to intercept an HTTP request to httpbin and modify the output in Objective-C. You might have code like this:
+- `payload.object_path` is resolved relative to the meta file path
+- the meta file does not name the target binary
+- it only describes how to build the bundle and where the hook should land
+- one meta file can describe multiple hooks
+
+Hook targets can currently be located by:
+
+- symbol
+- linked virtual address
+- file offset
+- exact byte pattern plus optional offset
+
+## How to choose a hook style
+
+Use `replace` when:
+
+- you want a different implementation
+- you want to intercept a clean function entry
+- you do not need to preserve the original body
+
+Use `instrument` when:
+
+- the original function is too large or inlined
+- you only want to tweak state at a specific instruction
+- you want to log, gate, or rewrite control flow locally
+
+`instrument` is the more important mode for stripped / optimized binaries.
+
+## Replace example
+
+Suppose the original Objective-C method is:
+
 ```objc
-#import <Foundation/Foundation.h>
-
-@interface ArHttpClient : NSObject {
-    NSString *_lastBody;
-}
 - (const char *)fetchBodyCString;
-@end
-
-@implementation ArHttpClient
-
-- (const char *)fetchBodyCString {
-    NSURL *url = [NSURL URLWithString:@"https://httpbin.org/get"];
-    NSError *error = nil;
-    NSString *body = [NSString stringWithContentsOfURL:url
-                                              encoding:NSUTF8StringEncoding
-                                                 error:&error];
-    if (body == nil) {
-        body = [NSString stringWithFormat:@"request failed: %@", error.localizedDescription];
-    }
-
-    // Keep the fetched string alive after this method returns so the returned
-    // UTF-8 pointer remains valid for the immediate `puts()` call in `main`.
-    _lastBody = body;
-    return _lastBody.UTF8String;
-}
-
-@end
-
-int main(void) {
-    @autoreleasepool {
-        ArHttpClient *client = [[ArHttpClient alloc] init];
-        puts([client fetchBodyCString]);
-    }
-    return 0;
-}
 ```
-So build with commands like
-```sh
-xcrun --sdk macosx clang -arch arm64 -O2 -g -fobjc-arc main.m -framework Foundation -o objc_httpbin_demo
-```
-To replace the response with your own string, you can write the following in Zig:
+
+You can replace it with a Zig payload that matches the AArch64 C ABI view of
+that method:
+
 ```zig
 const hooked = "[artest] hooked.";
 
-/// Zig replacement function that matches the Objective-C IMP calling shape for:
-/// `- (const char *)fetchBodyCString`.
-///
-/// From the patcher's point of view this is just an AArch64 C ABI function:
-/// - x0 = self
-/// - x1 = _cmd
-/// - x0 return value = replacement `const char *`
-export fn replacement_fetchBodyCString(self: ?*anyopaque, cmd: ?*anyopaque) callconv(.c) [*:0]const u8 {
+export fn replacement_fetchBodyCString(
+    self: ?*anyopaque,
+    cmd: ?*anyopaque,
+) callconv(.c) [*:0]const u8 {
     _ = self;
     _ = cmd;
     return hooked.ptr;
 }
 ```
-yeah, you should keep the abi for function calling, using ida to know what should you write to match the original function's signature.
 
-To patch the binary, you should build an O file and write a meta json like
+Matching meta JSON:
+
 ```json
-// replace.meta.json
 {
   "target": {
     "arch": "aarch64",
     "os": "macos",
     "binary_format": "macho"
   },
-  "payload_object_path": "payload_replace.o",
-  "payload_object_format": "macho",
+  "payload": {
+    "object_path": "payload_replace.o",
+    "object_format": "macho"
+  },
   "hooks": [
     {
       "kind": "replace",
       "target": {
         "kind": "symbol",
-        "symbol": "-[ArHttpClient fetchBodyCString]" // in original binary, what you inspect just now.
+        "symbol": "-[ArHttpClient fetchBodyCString]"
       },
-      "handler_symbol": "replacement_fetchBodyCString" // defined in your zig code
+      "handler_symbol": "replacement_fetchBodyCString"
     }
   ]
 }
 ```
-And 
-```sh
-zig build-obj -target aarch64-macos -O ReleaseSmall -fstrip \
-  -Mroot=payload_replace.zig \
-  -femit-bin=payload_replace_zig.o
-```
-So far, the first step is done.
 
-We recommend you to inspect the binary with 
-```sh
-zrwrite inspect \
-  --input objc_httpbin_demo \
-  --symbol '-[ArHttpClient fetchBodyCString]'
-```
-to make sure the symbol is exists. After prepatch check, generate a zrpb bundle file with 
-```sh 
-zrwrite bundle --output zig_replace.zrpb --meta replace.meta.json
-```
-Or without the metadata, just using cli params is accepted.
-```sh
-zrwrite bundle \
-  --output zig_replace.zrpb \
-  --payload payload_replace_zig.o \
-  --handler-symbol replacement_fetchBodyCString \
-  --hook-kind replace \
-  --target-symbol '-[ArHttpClient fetchBodyCString]' \
-  --target-os macos \
-  --target-format macho \
-  --target-arch aarch64 \
-  --payload-format macho
-```
+## Instrument example
 
-The last one is 
-```sh 
-zrwrite apply --bundle zig_instrument.zrpb --input objc_httpbin_demo --output objc_httpbin_demo_patched
-```
-apply the zrpb bundle for binary input and generate a new file. On macos, you should codesign a ad-hoc sign, else you will get a "operation not permitted" error when execute the patched binary.
-```sh
-codesign -f -s - objc_httpbin_demo_patched
-./objc_httpbin_demo_patched
-# output is `[artest] hooked.`
-```
+You can achieve an early return entirely at the register / PC layer:
 
-### instruction mode
-Instrument mode allows you to inject logic (like logging) at a specific offset. To achieve the same result as the example above using instrumentation:
 ```zig
 const zrwrite = @import("zrwrite");
 
 const hooked = "[artest] hooked.";
 
-/// Early-return the Objective-C method by editing machine state only.
-///
-/// We intentionally keep this payload at the register/PC layer:
-/// - x0 = `self`
-/// - x1 = `_cmd`
-/// - x30 = caller return address
-///
-/// Returning a `const char *` from an ObjC method is therefore just:
-/// 1. place the replacement pointer into x0
-/// 2. branch directly to the caller by setting `pc = x30`
 export fn on_hit(address: u64, ctx: *zrwrite.HookContext) callconv(.c) void {
     _ = address;
 
-    // Touch the canonical Objective-C argument registers explicitly so the
-    // fixture documents which architectural values the payload is relying on.
-    _ = ctx.regs.named.x0; // self
-    _ = ctx.regs.named.x1; // _cmd / selector
+    // Objective-C method call ABI on AArch64:
+    // x0 = self
+    // x1 = _cmd
+    // x30 = caller return address
+    _ = ctx.regs.named.x0;
+    _ = ctx.regs.named.x1;
 
     ctx.regs.named.x0 = @intFromPtr(hooked.ptr);
     ctx.pc = ctx.regs.named.x30;
 }
 ```
-after build, using 
-```sh
-zrwrite bundle \
-  --output zig_instrument.zrpb \
-  --payload payload_instrument.o \
-  --handler-symbol on_hit \
-  --target-symbol '-[ArHttpClient fetchBodyCString]' \
-  --target-os macos \
-  --target-format macho \
-  --target-arch aarch64 \
-  --payload-format macho
-```
-and same with before. If you just want to hack in a file offset, write json like
+
+Matching meta JSON:
+
 ```json
 {
   "target": {
@@ -245,18 +241,328 @@ and same with before. If you just want to hack in a file offset, write json like
       "kind": "instrument",
       "target": {
         "kind": "virtual_address",
-        "virtual_address": "0x100000d50" // you should determine the offset in ida.
+        "virtual_address": "0x100000d50"
       },
-      // Why use expected_bytes? Compilers don't guarantee 
-      // the same output every time. expected_bytes acts as 
-      // a safety check to ensure you are patching the correct instructions. 
-      // 
-      // If the binary changes, zrwrite will catch the mismatch. 
-      // You can use zrwrite inspect to verify the bytes
-      // at a specific offset before patching.
-      "expected_bytes": "680a00f9", 
+      "expected_bytes": "680a00f9",
       "handler_symbol": "on_hit"
     }
   ]
 }
 ```
+
+## Why `expected_bytes` matters
+
+`expected_bytes` is strongly recommended for any real patch.
+
+It is the first safety guard against:
+
+- binary version drift
+- compiler changes
+- wrong IDA address recovery
+- accidental patching of the wrong build
+
+If the bytes at the target location do not match, `zrwrite` fails closed
+instead of silently patching the wrong code.
+
+Use `inspect` to recover a stable hook snippet:
+
+```bash
+zrwrite inspect \
+  --input target.bin \
+  --symbol some_symbol
+```
+
+Or:
+
+```bash
+zrwrite inspect \
+  --input target.bin \
+  --vaddr 0x100000d50
+```
+
+`inspect` prints:
+
+- linked virtual address
+- file offset
+- recommended `expected_bytes`
+- an exact pattern snippet you can paste into meta JSON for stripped binaries
+
+## Internal execution model
+
+At a high level, `instrument` works like this:
+
+1. Resolve the hook site from symbol / vaddr / file offset / pattern.
+2. Validate the bytes at that site.
+3. Determine how many instructions must be stolen from the original binary.
+4. Build a bridge / trampoline path.
+5. Inject the payload object and relocate its code/data.
+6. Redirect execution at the patch site into the bridge.
+7. Save architectural state into `HookContext`.
+8. Call your payload callback.
+9. Resume according to the selected hook mode.
+
+That resume step is the hard part.
+
+If an overwritten instruction is safe to replay in a raw trampoline, `zrwrite`
+can execute it out-of-line. If it is PC-relative or otherwise relocation
+sensitive, the patcher must either:
+
+- apply an explicit semantic replay strategy, or
+- reject the patch
+
+The core rule is: if `zrwrite` cannot prove the rewritten control flow is safe,
+it should fail closed.
+
+## Widened windows and multi-instruction steal
+
+For interior instrumentation, one instruction is not always enough.
+
+`stolen_instruction_count` tells `zrwrite` to steal a wider patch window. This
+is useful when:
+
+- the hook site must be widened to install a long detour
+- the displaced sequence must be replayed as a small group
+- you are instrumenting inside a large optimized / inlined function
+
+This is not "copy arbitrary bytes and hope".
+
+Wide windows only work when `zrwrite` can prove the displaced instructions are
+handled correctly. Otherwise the patch is rejected.
+
+Two important consequences:
+
+- incoming branches into the middle of the stolen window are a special case
+- PC-relative instructions require explicit replay support
+
+If you care about the exact replay policy, read
+[`docs/replay-policy.md`](docs/replay-policy.md).
+
+## Address model: linked vs runtime addresses
+
+One of the easiest ways to write a wrong payload is mixing file offsets,
+linked addresses, and runtime pointers.
+
+`zrwrite` uses three address domains:
+
+- file offset
+- linked virtual address
+- runtime virtual address
+
+Payload rule:
+
+- register values, `ctx.pc`, `ctx.sp`, and pointers read from target memory are
+  already runtime addresses
+- addresses copied from IDA / Ghidra / `objdump` should be treated as linked
+  addresses
+
+For PIE / ASLR-safe payload code, resolve recovered linked addresses through
+`ctx.target()`:
+
+```zig
+const img = ctx.target();
+const fn_ptr = img.fnPtr(*const fn () callconv(.c) void, 0x100012340);
+```
+
+Do not manually scatter `+ load_bias` math across payload code.
+
+Read:
+
+- [`docs/address-model.md`](docs/address-model.md)
+- [`docs/pie-api.md`](docs/pie-api.md)
+
+## HookContext and payload ABI
+
+The long-term payload callback shape is:
+
+```zig
+export fn on_hit(hit_address: u64, ctx: *zrwrite.HookContext) callconv(.c) void
+```
+
+`HookContext` is an architectural snapshot. Payloads are expected to:
+
+- read and write GPR state
+- read and write `pc`
+- read and write `sp`
+- reason about target image base / load bias through runtime metadata
+
+Important design rule:
+
+- `zrwrite` exposes architecture state
+- it does not understand the source-language semantics for you
+
+If you patch:
+
+- Objective-C message sends
+- Rust return slots
+- C++ object layouts
+- Swift reference semantics
+
+you must recover and respect that ABI yourself.
+
+## Shared payload state
+
+Within one rewrite session, repeated `instrument` hooks that point at the same
+payload object behave like different exported functions from one injected
+payload module.
+
+That means:
+
+- payload `.text` is injected once
+- payload `.data` / `.bss` are shared across those handlers
+- payload globals are shared between those instrument callbacks
+
+This is the user-facing "looks like one payload" model.
+
+This shared-state guarantee should currently be read as an `instrument`-hook
+rule. Do not assume `replace` hooks share runtime payload state in exactly the
+same way.
+
+## `zrstd` and payload authoring constraints
+
+A patch payload is not a normal hosted Zig executable.
+
+That is why `zrwrite` ships `zrstd`: a small payload-side helper layer for
+things like:
+
+- printing
+- bounded formatting
+- fixed-buffer assembly
+- explicit byte copy / move / fill helpers
+
+Use `zrstd` when possible instead of assuming `std.debug.print` or a large
+stdlib path is safe for payload code.
+
+Current payload authoring rules:
+
+- prefer explicit, boring code
+- avoid hidden runtime dependencies
+- avoid TLS-heavy features
+- avoid assuming libc or a process runtime exists just because the target
+  program links one
+
+Read:
+
+- [`docs/zrstd.md`](docs/zrstd.md)
+
+## Important user-side caveats
+
+These are the main things users should know before writing serious patches.
+
+### 1. A patch site is not a source-language boundary
+
+If you instrument the middle of a Rust, Objective-C, or C++ function, the
+register state only reflects the machine-level ABI at that instruction.
+
+You might be seeing:
+
+- a hidden return slot
+- inlined temporaries
+- compiler-owned scratch values
+- register allocation artifacts
+
+Reverse-engineering the real meaning of the site is your job.
+
+### 2. `replace` and `instrument` are different tools
+
+Do not use `replace` when you actually need local control-flow surgery inside a
+huge optimized function. Use `instrument`.
+
+Do not use `instrument` when a clean function-entry replacement is enough. Use
+`replace`.
+
+### 3. Prefer linked addresses in metadata
+
+`--target-vaddr` and meta JSON virtual addresses should use the linked image
+address seen in disassembly, not a runtime ASLR-shifted pointer.
+
+### 4. Prefer `expected_bytes`
+
+Treat `expected_bytes` as a default safety requirement, especially for:
+
+- stripped binaries
+- file-offset hooks
+- pattern-derived hooks
+- CI or repeatable patch pipelines
+
+### 5. Failures are often useful
+
+If `zrwrite` rejects a hook, that usually means it found a real correctness
+problem:
+
+- unsupported relocation family
+- unsupported replay case
+- multiple pattern matches
+- bytes mismatch
+- unsafe patch window
+
+A hard failure is better than a subtly broken binary.
+
+### 6. macOS runtime closure matters
+
+On macOS, structural patch success is not enough. The final output still needs
+to be codesign-clean enough for ad-hoc signing and runtime execution.
+
+### 7. TLS is still a boundary
+
+Payload code that implicitly pulls in TLS, thread-locals, or a large hosted
+runtime surface is still outside the intended safe subset.
+
+## Practical advice for writing payloads
+
+If you are authoring a new payload, the safest pattern is:
+
+1. Start with `inspect`.
+2. Patch one clean site first.
+3. Add `expected_bytes`.
+4. Keep the payload tiny until the hook is known-good.
+5. Only then start layering language-specific logic on top.
+
+For stripped binaries:
+
+- prefer pattern locators or linked VAs recovered from IDA
+- use exact bytes as a version guard
+- keep your own recovered addresses in linked form and resolve them through
+  `ctx.target()`
+
+## Testing and validation
+
+Local validation:
+
+```bash
+zig build
+zig build test
+```
+
+Linux/AArch64 runtime validation uses the Orb-hosted Ubuntu machine:
+
+```bash
+ssh ubuntu@orb
+```
+
+The current remote smoke coverage is documented in
+[`docs/testing.md`](docs/testing.md).
+
+## Further reading
+
+- [`docs/patch-abi.md`](docs/patch-abi.md)
+- [`docs/address-model.md`](docs/address-model.md)
+- [`docs/pie-api.md`](docs/pie-api.md)
+- [`docs/replay-policy.md`](docs/replay-policy.md)
+- [`docs/zrstd.md`](docs/zrstd.md)
+- [`docs/testing.md`](docs/testing.md)
+- [`docs/macho-reloc-status.md`](docs/macho-reloc-status.md)
+- [`docs/v1-scope.md`](docs/v1-scope.md)
+
+## Status summary
+
+The current project direction is:
+
+- static AArch64 patching first
+- fail-closed correctness over "best effort"
+- strong support for stripped / optimized binaries
+- enough payload runtime surface to write real Zig instrumentation
+
+If you find a hook site that should be valid but currently fails, that is a
+useful bug report. The intended model is not "only easy function entry hooks";
+the intended model is "real interior instrumentation for difficult binaries,
+with correctness checks instead of silent corruption."
