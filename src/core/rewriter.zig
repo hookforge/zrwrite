@@ -249,11 +249,33 @@ pub const Rewriter = struct {
         input_view: MachOView,
         carrier: macho_format.SegmentRef,
     ) !usize {
-        var used_end = try input_view.segmentUsedEndFileOffset(carrier);
+        var remembered_end: ?usize = null;
         for (self.macho_carrier_occupancy.items) |entry| {
             if (entry.segment_index != carrier.load_command_index) continue;
-            used_end = @max(used_end, entry.used_end_fileoff);
+            remembered_end = if (remembered_end) |best|
+                @max(best, entry.used_end_fileoff)
+            else
+                entry.used_end_fileoff;
         }
+
+        if (isReusableMachOSyntheticCarrier(carrier)) {
+            // Synthetic payload carriers (`__ZR_TEXT` / `__ZR_DATA`) are
+            // sectionless by design. The generic Mach-O "used end" helper
+            // therefore has no choice but to conservatively report the whole
+            // segment span as occupied.
+            //
+            // That is correct for arbitrary foreign sectionless segments, but
+            // it is too pessimistic for the synthetic segments that *we*
+            // created earlier in the same rewrite session. For those carriers
+            // we do know the true payload-watermark file offset, and later
+            // hooks must be able to append new stub/trampoline bytes into the
+            // remaining reserved slack without forcing another synthetic
+            // segment pair (which would move the shared payload image again).
+            if (remembered_end) |used_end| return @max(used_end, @as(usize, @intCast(carrier.command.fileoff)));
+        }
+
+        var used_end = try input_view.segmentUsedEndFileOffset(carrier);
+        if (remembered_end) |entry_end| used_end = @max(used_end, entry_end);
         return used_end;
     }
 
@@ -275,18 +297,34 @@ pub const Rewriter = struct {
 
     fn rememberMachORegionOccupancy(
         self: *Rewriter,
+        finalized_view: MachOView,
         region: macho_format.RegionInjectionPlan,
     ) !void {
-        if (region.usesSyntheticSegment()) return;
+        if (region.usesSyntheticSegment()) {
+            const carrier = try finalized_view.segmentContainingFileOffset(region.injection_offset);
+            try self.rememberMachOCarrierUsedEnd(carrier.load_command_index, region.injection_end_offset);
+            return;
+        }
+
         try self.rememberMachOCarrierUsedEnd(region.carrier_segment_index, region.injection_end_offset);
     }
 
     fn rememberMachOSplitOccupancy(
         self: *Rewriter,
+        finalized_view: MachOView,
         plan: MachOSplitInjectionPlan,
     ) !void {
-        try self.rememberMachORegionOccupancy(plan.executable);
-        if (plan.writable) |region| try self.rememberMachORegionOccupancy(region);
+        try self.rememberMachORegionOccupancy(finalized_view, plan.executable);
+        if (plan.writable) |region| try self.rememberMachORegionOccupancy(finalized_view, region);
+    }
+
+    fn shiftMachOCarrierOccupancyAfterSplitPlan(
+        self: *Rewriter,
+        plan: MachOSplitInjectionPlan,
+    ) void {
+        for (self.macho_carrier_occupancy.items) |*entry| {
+            entry.used_end_fileoff = shiftMachOOffsetAfterSplitPlan(entry.used_end_fileoff, plan);
+        }
     }
 
     fn planMachOInjectedImage(
@@ -951,7 +989,8 @@ pub const Rewriter = struct {
                 },
             );
         }
-        try self.rememberMachOSplitOccupancy(split_plan);
+        self.shiftMachOCarrierOccupancyAfterSplitPlan(split_plan);
+        try self.rememberMachOSplitOccupancy(finalized_view, split_plan);
         self.installOutput(output);
 
         return .{
@@ -1035,6 +1074,12 @@ pub const Rewriter = struct {
     /// `refreshSharedMachOPayloadAfterPlan`, which re-links the shared payload
     /// object against the new writable base and overwrites the shared payload
     /// bytes in place.
+    ///
+    /// Synthetic-segment plans are therefore not inherently unsafe:
+    /// - if the new synthetic span is appended *after* the already-installed
+    ///   shared payload image, earlier stubs keep their callback targets
+    /// - only plans that actually move the shared executable image must still
+    ///   be rejected
     fn validateSharedMachOPayloadPlanCompatibility(
         self: *const Rewriter,
         split_plan: MachOSplitInjectionPlan,
@@ -1042,14 +1087,6 @@ pub const Rewriter = struct {
     ) !void {
         const entry = self.shared_instrument_payloads.items[shared_payload_index];
         const macho_state = entry.macho orelse return;
-
-        if (split_plan.usesSyntheticSegments()) {
-            recordRewriteDiagnostic(
-                "shared Mach-O payload reuse for this object would require a later synthetic-segment relayout; rewriting already-installed hook stubs after synthetic shared-payload movement is not implemented yet",
-                .{},
-            );
-            return error.UnsupportedSharedMachOPayloadRelayout;
-        }
 
         const shifted_primary_offset = shiftMachOOffsetAfterSplitPlan(
             macho_state.primary_injection_offset,
@@ -1075,8 +1112,6 @@ pub const Rewriter = struct {
         shared_payload_index: usize,
         handler_symbol: []const u8,
     ) !void {
-        if (split_plan.usesSyntheticSegments()) return error.UnsupportedSharedMachOPayloadRelayout;
-
         var entry = &self.shared_instrument_payloads.items[shared_payload_index];
         var macho_state = entry.macho orelse return;
 
@@ -1314,6 +1349,7 @@ pub const Rewriter = struct {
         }
 
         output = try finalizeMachOSplitOutput(self.allocator, output, split_plan);
+        const finalized_output_view = try MachOView.parse(output);
 
         const branch_opcode = aarch64.encodeBranchImmediate(target.address, payload_entry_address) catch |err| {
             if (err == error.BranchOutOfRange) {
@@ -1326,7 +1362,8 @@ pub const Rewriter = struct {
         };
         writeU32(output[target.file_offset .. target.file_offset + 4], branch_opcode);
 
-        try self.rememberMachOSplitOccupancy(split_plan);
+        self.shiftMachOCarrierOccupancyAfterSplitPlan(split_plan);
+        try self.rememberMachOSplitOccupancy(finalized_output_view, split_plan);
         self.installOutput(output);
 
         return .{
@@ -1978,6 +2015,11 @@ fn shiftOffsetAtOrAfter(value: usize, threshold: usize, delta: usize) usize {
     return value + delta;
 }
 
+fn isReusableMachOSyntheticCarrier(carrier: macho_format.SegmentRef) bool {
+    const name = carrier.segName();
+    return std.mem.eql(u8, name, "__ZR_TEXT") or std.mem.eql(u8, name, "__ZR_DATA");
+}
+
 fn shiftMachOOffsetAfterSplitPlan(
     original_offset: usize,
     plan: MachOSplitInjectionPlan,
@@ -1991,6 +2033,101 @@ fn shiftMachOOffsetAfterSplitPlan(
         shifted = shiftOffsetAtOrAfter(shifted, region.tail_offset, region.tail_shift);
     }
     return shifted;
+}
+
+test "shared Mach-O payload validation allows synthetic spans appended after the shared image" {
+    const allocator = std.testing.allocator;
+    const input_bytes = try allocator.alloc(u8, 0);
+
+    var rewriter = Rewriter{
+        .allocator = allocator,
+        .input_bytes = input_bytes,
+        .input_mode = 0,
+    };
+    defer rewriter.deinit();
+
+    try rewriter.rememberSharedInstrumentPayloadMachO(
+        .macho,
+        "obj",
+        0x1000_0000,
+        .{
+            .primary_injection_offset = 0xc0000,
+            .primary_image_size = 0x1200,
+            .writable_injection_offset = 0xc4000,
+            .writable_image_size = 0x100,
+            .writable_base_address = 0x1000_4000,
+        },
+    );
+
+    const plan = MachOSplitInjectionPlan{
+        .placement = .synthetic_segments,
+        .executable = .{
+            .placement = .synthetic_segment,
+            .carrier_segment_index = 0,
+            .segment_span_size = 0x4000,
+            .injection_offset = 0xc8000,
+            .injection_end_offset = 0xc9000,
+            .tail_offset = 0xc8000,
+            .tail_shift = 0x4000,
+            .payload_base_address = 0x1000_c8000,
+            .make_executable = true,
+        },
+        .writable = null,
+        .total_len = 0,
+        .synthetic_tail_offset = 0xc8000,
+        .synthetic_tail_shift = 0x4000,
+    };
+
+    try rewriter.validateSharedMachOPayloadPlanCompatibility(plan, 0);
+}
+
+test "shared Mach-O payload validation rejects synthetic spans that move the shared image" {
+    const allocator = std.testing.allocator;
+    const input_bytes = try allocator.alloc(u8, 0);
+
+    var rewriter = Rewriter{
+        .allocator = allocator,
+        .input_bytes = input_bytes,
+        .input_mode = 0,
+    };
+    defer rewriter.deinit();
+
+    try rewriter.rememberSharedInstrumentPayloadMachO(
+        .macho,
+        "obj",
+        0x1000_0000,
+        .{
+            .primary_injection_offset = 0xc0000,
+            .primary_image_size = 0x1200,
+            .writable_injection_offset = null,
+            .writable_image_size = 0,
+            .writable_base_address = null,
+        },
+    );
+
+    const plan = MachOSplitInjectionPlan{
+        .placement = .synthetic_segments,
+        .executable = .{
+            .placement = .synthetic_segment,
+            .carrier_segment_index = 0,
+            .segment_span_size = 0x4000,
+            .injection_offset = 0xb8000,
+            .injection_end_offset = 0xb9000,
+            .tail_offset = 0xb8000,
+            .tail_shift = 0x4000,
+            .payload_base_address = 0x1000_b8000,
+            .make_executable = true,
+        },
+        .writable = null,
+        .total_len = 0,
+        .synthetic_tail_offset = 0xb8000,
+        .synthetic_tail_shift = 0x4000,
+    };
+
+    try std.testing.expectError(
+        error.UnsupportedSharedMachOPayloadRelayout,
+        rewriter.validateSharedMachOPayloadPlanCompatibility(plan, 0),
+    );
 }
 
 /// Repairs ELF metadata after the new payload bytes have been inserted.

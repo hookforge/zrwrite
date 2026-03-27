@@ -342,6 +342,34 @@ pub const View = struct {
         return error.SegmentNotFound;
     }
 
+    /// Returns the file-backed segment that owns `file_offset`.
+    ///
+    /// This is stricter than a name lookup and is therefore the right primitive
+    /// for post-finalization bookkeeping of injected synthetic segments:
+    /// multiple `__ZR_TEXT` / `__ZR_DATA` segments may exist after a long
+    /// rewrite session, but the payload bytes for one concrete region always
+    /// map back to exactly one file-backed segment span.
+    pub fn segmentContainingFileOffset(self: View, file_offset: usize) !SegmentRef {
+        var cursor = loadCommandCursor(self);
+        while (try cursor.next()) |command| {
+            if (command.cmd != .SEGMENT_64) continue;
+
+            const segment = command.segment64();
+            if (segment.filesize == 0) continue;
+
+            const start: usize = @intCast(segment.fileoff);
+            const end: usize = @intCast(segment.fileoff + segment.filesize);
+            if (file_offset < start or file_offset >= end) continue;
+
+            return .{
+                .load_command_index = command.index,
+                .command = segment,
+                .sections = command.sections64(),
+            };
+        }
+        return error.SegmentNotFound;
+    }
+
     /// Returns the highest-addressed file-backed segment that precedes
     /// `__LINKEDIT`.
     ///
@@ -446,7 +474,24 @@ pub const View = struct {
         };
 
         if (carrier_plan) |plan| {
-            if (plan.executable.fitsExistingSlack()) return plan;
+            const writable_fits_existing_slack = if (plan.writable) |region|
+                region.fitsExistingSlack()
+            else
+                true;
+
+            // Prefer the pure carrier-extension path only when *every* region
+            // fits the original file slack.
+            //
+            // Why this stricter gate matters:
+            // - for writable payloads, "executable fits but writable does not"
+            //   is exactly the shape that pushes us into fragile `__DATA`
+            //   growth and an extra `__LINKEDIT` move
+            // - if a synthetic or mixed plan is available, keeping writable
+            //   state off the original carrier is materially more robust for
+            //   real Objective-C / C++ app binaries
+            if (plan.executable.fitsExistingSlack() and writable_fits_existing_slack) {
+                return plan;
+            }
         }
 
         if (try self.planHybridSplitInjection(
@@ -580,9 +625,10 @@ pub const View = struct {
     /// - require enough existing load-command slack to append one or two
     ///   `LC_SEGMENT_64` commands
     /// - require `__LINKEDIT` to start on the normal 16 KiB arm64 segment page
-    /// - currently skip binaries that use `LC_DYLD_CHAINED_FIXUPS`, because the
-    ///   chained-fixups segment-count table would need an additional resize
-    ///   pass once new segments are introduced
+    /// - binaries that use `LC_DYLD_CHAINED_FIXUPS` are also allowed here
+    ///   because app smoke tests showed dyld accepts appended synthetic
+    ///   segments as long as the original fixup-bearing segments themselves do
+    ///   not move
     fn planSyntheticSplitInjection(
         self: View,
         executable_size: usize,
@@ -590,8 +636,6 @@ pub const View = struct {
         alignment: usize,
     ) !?SplitInjectionPlan {
         _ = alignment;
-
-        if ((try self.dyldChainedFixupsCommand()) != null) return null;
 
         const linkedit = try self.segmentByName("__LINKEDIT");
         const page_size: usize = @intCast(machOSegmentPageSize());
@@ -672,8 +716,9 @@ pub const View = struct {
     /// Current policy:
     /// - only useful when the payload actually has writable state
     /// - require the writable carrier plan to stay within existing slack
-    /// - still skip chained-fixups images for now because the extra segment
-    ///   count changes dyld's segment table semantics
+    /// - chained-fixups images are likewise allowed here so writable payload
+    ///   state can move onto a synthetic carrier instead of forcing fragile
+    ///   `__DATA` growth on modern app binaries
     fn planHybridSplitInjection(
         self: View,
         executable_size: usize,
@@ -683,7 +728,6 @@ pub const View = struct {
         writable_used_end_override: ?usize,
     ) !?SplitInjectionPlan {
         if (writable_size == 0) return null;
-        if ((try self.dyldChainedFixupsCommand()) != null) return null;
 
         const linkedit = try self.segmentByName("__LINKEDIT");
         const page_size: usize = @intCast(machOSegmentPageSize());
