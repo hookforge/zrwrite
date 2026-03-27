@@ -26,8 +26,8 @@ zig cc \
   -fno-stack-protector \
   -fno-sanitize=undefined \
   -fno-asynchronous-unwind-tables \
-  "$ROOT_DIR/tests/fixtures/zig_composite_target.S" \
-  "$ROOT_DIR/tests/fixtures/zig_composite_main.c" \
+  "$ROOT_DIR/tests/fixtures/elf/zig/zig_composite_target.S" \
+  "$ROOT_DIR/tests/fixtures/elf/zig/zig_composite_main.c" \
   -o "$WORK_DIR/zig_composite_target"
 
 zig build-obj \
@@ -36,7 +36,7 @@ zig build-obj \
   -fstrip \
   -I "$ROOT_DIR/include" \
   -femit-bin="$WORK_DIR/zig_composite_runtime.o" \
-  "$ROOT_DIR/tests/fixtures/zig_composite_runtime.zig"
+  "$ROOT_DIR/tests/fixtures/elf/zig/zig_composite_runtime.zig"
 
 echo "[3/6] building instrument bundle from composite Zig payload"
 "$ROOT_DIR/zig-out/bin/zrwrite" bundle \

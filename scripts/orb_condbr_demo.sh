@@ -26,8 +26,8 @@ zig cc \
   -fno-stack-protector \
   -fno-sanitize=undefined \
   -fno-asynchronous-unwind-tables \
-  "$ROOT_DIR/tests/fixtures/condbr_target.S" \
-  "$ROOT_DIR/tests/fixtures/condbr_main.c" \
+  "$ROOT_DIR/tests/fixtures/elf/payload/condbr_target.S" \
+  "$ROOT_DIR/tests/fixtures/elf/payload/condbr_main.c" \
   -o "$WORK_DIR/condbr_target"
 
 zig cc \
@@ -38,7 +38,7 @@ zig cc \
   -fno-stack-protector \
   -fno-sanitize=undefined \
   -fno-asynchronous-unwind-tables \
-  "$ROOT_DIR/tests/fixtures/condbr_payload.S" \
+  "$ROOT_DIR/tests/fixtures/elf/payload/condbr_payload.S" \
   -o "$WORK_DIR/condbr_payload.o"
 
 echo "[3/6] building instrument bundle"

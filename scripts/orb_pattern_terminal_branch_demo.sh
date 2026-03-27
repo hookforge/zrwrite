@@ -30,7 +30,7 @@ zig cc \
   -fno-stack-protector \
   -fno-sanitize=undefined \
   -fno-asynchronous-unwind-tables \
-  "$ROOT_DIR/tests/fixtures/terminal_branch_o2.c" \
+  "$ROOT_DIR/tests/fixtures/elf/replay/terminal_branch_o2.c" \
   -o "$UNSTRIPPED_BIN"
 
 zig cc \
@@ -42,7 +42,7 @@ zig cc \
   -fno-sanitize=undefined \
   -fno-asynchronous-unwind-tables \
   -I "$ROOT_DIR/include" \
-  "$ROOT_DIR/tests/fixtures/noop_payload.c" \
+  "$ROOT_DIR/tests/fixtures/shared/noop_payload.c" \
   -o "$WORK_DIR/noop_payload.o"
 
 echo "[3/8] using inspect to generate an exact pattern snippet"

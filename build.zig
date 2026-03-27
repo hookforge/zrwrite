@@ -1,5 +1,30 @@
 const std = @import("std");
 
+const IntegrationSuite = struct {
+    step_name: []const u8,
+    description: []const u8,
+    path: []const u8,
+};
+
+fn addIntegrationSuite(
+    b: *std.Build,
+    mod: *std.Build.Module,
+    optimize: std.builtin.OptimizeMode,
+    suite: IntegrationSuite,
+) *std.Build.Step.Run {
+    const tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path(suite.path),
+            .target = b.graph.host,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "zrwrite", .module = mod },
+            },
+        }),
+    });
+    return b.addRunArtifact(tests);
+}
+
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
@@ -49,20 +74,45 @@ pub fn build(b: *std.Build) void {
     });
     const run_zrstd_tests = b.addRunArtifact(zrstd_tests);
 
-    const integration_tests = b.addTest(.{
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("tests/integration.zig"),
-            .target = b.graph.host,
-            .optimize = optimize,
-            .imports = &.{
-                .{ .name = "zrwrite", .module = mod },
-            },
-        }),
-    });
-    const run_integration_tests = b.addRunArtifact(integration_tests);
+    const integration_suites = [_]IntegrationSuite{
+        .{
+            .step_name = "test-integration-elf-workflow",
+            .description = "Run ELF workflow integration tests",
+            .path = "tests/integration/elf_workflow.zig",
+        },
+        .{
+            .step_name = "test-integration-elf-replay",
+            .description = "Run AArch64 replay integration tests",
+            .path = "tests/integration/elf_replay.zig",
+        },
+        .{
+            .step_name = "test-integration-payload-linker",
+            .description = "Run payload linker integration tests",
+            .path = "tests/integration/payload_linker.zig",
+        },
+        .{
+            .step_name = "test-integration-macho-layout",
+            .description = "Run Mach-O layout integration tests",
+            .path = "tests/integration/macho_layout.zig",
+        },
+        .{
+            .step_name = "test-integration-macho-runtime",
+            .description = "Run Mach-O runtime integration tests",
+            .path = "tests/integration/macho_runtime.zig",
+        },
+    };
+
+    const integration_step = b.step("test-integration", "Run integration test suites");
+    inline for (integration_suites) |suite| {
+        const run_suite = addIntegrationSuite(b, mod, optimize, suite);
+        integration_step.dependOn(&run_suite.step);
+
+        const suite_step = b.step(suite.step_name, suite.description);
+        suite_step.dependOn(&run_suite.step);
+    }
 
     const test_step = b.step("test", "Run unit and integration tests");
     test_step.dependOn(&run_mod_tests.step);
     test_step.dependOn(&run_zrstd_tests.step);
-    test_step.dependOn(&run_integration_tests.step);
+    test_step.dependOn(integration_step);
 }

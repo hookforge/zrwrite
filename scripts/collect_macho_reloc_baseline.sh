@@ -42,7 +42,7 @@ zig build-obj \
   -fstrip \
   -I include \
   -femit-bin="$out_dir/zig_external_data_runtime.o" \
-  tests/fixtures/zig_external_data_runtime.zig
+  tests/fixtures/elf/zig/zig_external_data_runtime.zig
 
 emit_bin_arg="-femit-bin=$out_dir/macho_zrstd_multi_default_runtime.o"
 zig build-obj \
@@ -51,7 +51,7 @@ zig build-obj \
   -fstrip \
   --dep zrwrite \
   --dep zrstd \
-  -Mroot=tests/fixtures/macho_zrstd_multi_default_runtime.zig \
+  -Mroot=tests/fixtures/macho/runtime/macho_zrstd_multi_default_runtime.zig \
   -Mzrwrite=src/root.zig \
   -Mzrstd=src/zrstd/root.zig \
   "$emit_bin_arg"

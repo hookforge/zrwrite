@@ -26,8 +26,8 @@ zig cc \
   -fno-stack-protector \
   -fno-sanitize=undefined \
   -fno-asynchronous-unwind-tables \
-  "$ROOT_DIR/tests/fixtures/terminal_branch_target.S" \
-  "$ROOT_DIR/tests/fixtures/terminal_branch_main.c" \
+  "$ROOT_DIR/tests/fixtures/elf/replay/terminal_branch_target.S" \
+  "$ROOT_DIR/tests/fixtures/elf/replay/terminal_branch_main.c" \
   -o "$WORK_DIR/terminal_branch_target"
 
 zig cc \
@@ -39,7 +39,7 @@ zig cc \
   -fno-sanitize=undefined \
   -fno-asynchronous-unwind-tables \
   -I "$ROOT_DIR/include" \
-  "$ROOT_DIR/tests/fixtures/noop_payload.c" \
+  "$ROOT_DIR/tests/fixtures/shared/noop_payload.c" \
   -o "$WORK_DIR/noop_payload.o"
 
 echo "[3/6] building widened terminal-branch bundle"

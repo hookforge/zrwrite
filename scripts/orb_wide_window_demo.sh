@@ -26,8 +26,8 @@ zig cc \
   -fno-stack-protector \
   -fno-sanitize=undefined \
   -fno-asynchronous-unwind-tables \
-  "$ROOT_DIR/tests/fixtures/wide_window_target.S" \
-  "$ROOT_DIR/tests/fixtures/wide_window_main.c" \
+  "$ROOT_DIR/tests/fixtures/elf/replay/wide_window_target.S" \
+  "$ROOT_DIR/tests/fixtures/elf/replay/wide_window_main.c" \
   -o "$WORK_DIR/wide_window_target"
 
 zig cc \
@@ -39,7 +39,7 @@ zig cc \
   -fno-sanitize=undefined \
   -fno-asynchronous-unwind-tables \
   -I "$ROOT_DIR/include" \
-  "$ROOT_DIR/tests/fixtures/payload.c" \
+  "$ROOT_DIR/tests/fixtures/shared/payload.c" \
   -o "$WORK_DIR/wide_window_payload.o"
 
 echo "[3/6] building widened instrument bundle"

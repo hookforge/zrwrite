@@ -26,8 +26,8 @@ zig cc \
   -fno-stack-protector \
   -fno-sanitize=undefined \
   -fno-asynchronous-unwind-tables \
-  "$ROOT_DIR/tests/fixtures/x16_resume_target.S" \
-  "$ROOT_DIR/tests/fixtures/x16_resume_main.c" \
+  "$ROOT_DIR/tests/fixtures/elf/replay/x16_resume_target.S" \
+  "$ROOT_DIR/tests/fixtures/elf/replay/x16_resume_main.c" \
   -o "$WORK_DIR/x16_resume"
 
 zig cc \
@@ -39,7 +39,7 @@ zig cc \
   -fno-sanitize=undefined \
   -fno-asynchronous-unwind-tables \
   -I "$ROOT_DIR/include" \
-  "$ROOT_DIR/tests/fixtures/x16_resume_payload.c" \
+  "$ROOT_DIR/tests/fixtures/elf/replay/x16_resume_payload.c" \
   -o "$WORK_DIR/x16_resume_payload.o"
 
 echo "[3/6] building x16 instrument bundle"
